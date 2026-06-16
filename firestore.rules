@@ -1,0 +1,27 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isBlogAdmin() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email in [
+          "david@brothersrestoration.org",
+          "chaim@brothersrestoration.org"
+        ];
+    }
+
+    match /blogPosts/{slug} {
+      allow read: if resource.data.status == "published" || isBlogAdmin();
+      allow create, update, delete: if isBlogAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

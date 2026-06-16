@@ -1,0 +1,11 @@
+node_modules
+.next
+out
+.vercel
+.env
+.env.development
+.env.production
+.env*.local
+*.log
+Thumbs.db
+Desktop.ini
