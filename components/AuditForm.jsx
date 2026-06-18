@@ -8,7 +8,8 @@ const emptyForm = {
   phone: "",
   company: "",
   package: "AI Sales Agent",
-  message: ""
+  message: "",
+  website: ""
 };
 
 export default function AuditForm() {
@@ -83,6 +84,16 @@ export default function AuditForm() {
         What do you want AI to handle first?
         <textarea name="message" value={form.message} onChange={updateField} rows={4} />
       </label>
+      <input
+        type="text"
+        name="website"
+        value={form.website}
+        onChange={updateField}
+        autoComplete="off"
+        tabIndex={-1}
+        aria-hidden="true"
+        className="sr-only"
+      />
       <button className="btn primary" type="submit" disabled={status === "loading"}>
         {status === "loading" ? "Sending..." : "Schedule AI Audit"}
       </button>

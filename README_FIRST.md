@@ -49,6 +49,11 @@ Do not commit Firebase config values to GitHub. Add them in Vercel Project Setti
 - `NEXT_PUBLIC_FIREBASE_APP_ID`
 - `NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID`
 - `NEXT_PUBLIC_ADMIN_EMAILS`
+- `RESEND_API_KEY`
+- `LEAD_NOTIFICATION_FROM`
+
+Lead notifications from the AI audit form are sent only to `david@brothersrestoration.org`.
+Use `RESEND_API_KEY` for server-side email delivery. `LEAD_NOTIFICATION_FROM` should be a verified sender in Resend, for example `Brothers.ad <leads@brothers.ad>`.
 
 ## Namecheap DNS
 

@@ -9,10 +9,7 @@ service cloud.firestore {
     function isBlogAdmin() {
       return signedIn()
         && request.auth.token.email_verified == true
-        && request.auth.token.email in [
-          "david@brothersrestoration.org",
-          "chaim@brothersrestoration.org"
-        ];
+        && request.auth.token.email == "david@brothersrestoration.org";
     }
 
     match /blogPosts/{slug} {
