@@ -11,13 +11,14 @@ import {
   loginWithFirebasePassword,
   logoutFirebaseSession
 } from "./firebase-client.js";
+import { brothersLogoDataUrl } from "./logo-data.js";
 
 const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES : [];
 const storageKey = "brothers-os-workspace-v2";
 const workerAccessCode = "BROS-TIME";
 const adminAccessCode = "Issued by Super Admin";
 const employeeAllowedModuleKeys = ["time", "drylogs", "jobs", "photos", "equipment"];
-const brandLogoPath = "/assets/brothers-logo.png";
+const brandLogoPath = brothersLogoDataUrl;
 const insuranceStatuses = ["all", "new", "reviewed", "in-progress", "completed", "rejected"];
 const rbacActionKeys = [
   "manageUsers",
