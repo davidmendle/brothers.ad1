@@ -1,4 +1,5 @@
 import fs from "fs";
+import crypto from "crypto";
 import os from "os";
 import path from "path";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
@@ -66,6 +67,104 @@ const validPayload = {
   damageDescription: "Water damage in kitchen and hallway."
 };
 
+function hashSecret(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function hashPortalCode(value) {
+  return hashSecret(
+    String(value || "")
+      .trim()
+      .toUpperCase()
+      .replace(/[\s-]+/g, "")
+  );
+}
+
+function createFakeFirestore(seed = {}) {
+  const store = new Map(
+    Object.entries(seed).map(([collectionName, docs]) => [
+      collectionName,
+      new Map(Object.entries(docs))
+    ])
+  );
+  const ensureCollection = (collectionName) => {
+    if (!store.has(collectionName)) store.set(collectionName, new Map());
+    return store.get(collectionName);
+  };
+  const snap = (id, data) => ({
+    id,
+    exists: Boolean(data),
+    data: () => data
+  });
+  const querySnap = (docs) => ({
+    docs,
+    empty: docs.length === 0
+  });
+  const docsFromCollection = (collectionMap) => Array.from(collectionMap.entries()).map(([id, data]) => snap(id, data));
+  const makeDocRef = (collectionName, id) => {
+    const collectionMap = ensureCollection(collectionName);
+    return {
+      id,
+      get: async () => snap(id, collectionMap.get(id)),
+      set: async (data, options = {}) => {
+        const current = collectionMap.get(id) || {};
+        collectionMap.set(id, options.merge ? { ...current, ...data } : data);
+      },
+      delete: async () => {
+        collectionMap.delete(id);
+      }
+    };
+  };
+  const makeQuery = (docs) => ({
+    limit(count) {
+      return makeQuery(docs.slice(0, count));
+    },
+    orderBy() {
+      return makeQuery(docs);
+    },
+    get: async () => querySnap(docs)
+  });
+  return {
+    collection(collectionName) {
+      const collectionMap = ensureCollection(collectionName);
+      return {
+        doc(id) {
+          return makeDocRef(collectionName, id);
+        },
+        add: async (data) => {
+          const id = `doc-${collectionMap.size + 1}`;
+          collectionMap.set(id, data);
+          return { id };
+        },
+        get: async () => querySnap(docsFromCollection(collectionMap)),
+        limit(count) {
+          return makeQuery(docsFromCollection(collectionMap).slice(0, count));
+        },
+        orderBy() {
+          return makeQuery(docsFromCollection(collectionMap));
+        },
+        where(field, _operator, value) {
+          return makeQuery(docsFromCollection(collectionMap).filter((doc) => doc.data()?.[field] === value));
+        }
+      };
+    },
+    batch() {
+      const operations = [];
+      return {
+        set(ref, data, options) {
+          operations.push(() => ref.set(data, options));
+        },
+        commit: async () => {
+          for (const operation of operations) await operation();
+        }
+      };
+    },
+    dump(collectionName) {
+      return Object.fromEntries(ensureCollection(collectionName).entries());
+    }
+  };
+}
+
 beforeEach(() => {
   db.exec("DELETE FROM insurance_submissions");
   global.fetch = originalFetch;
@@ -82,7 +181,8 @@ beforeEach(() => {
     "ADMIN_EMAIL",
     "BLOB_READ_WRITE_TOKEN",
     "FIREBASE_ALLOWED_LOGIN_EMAILS",
-    "FIREBASE_OWNER_ONLY_LOGIN"
+    "FIREBASE_OWNER_ONLY_LOGIN",
+    "SUPER_ADMIN_EMAILS"
   ].forEach((key) => {
     delete process.env[key];
   });
@@ -365,11 +465,10 @@ describe("insurance intake logic", () => {
     });
   });
 
-  it("rejects non-owner Firebase Google sessions before Firestore access", async () => {
+  it("rejects non-owner Firebase Google sessions when server-side access storage is not configured", async () => {
     process.env.FIREBASE_OWNER_ONLY_LOGIN = "true";
     process.env.FIREBASE_ALLOWED_LOGIN_EMAILS = "david@brothersrestoration.org";
 
-    let firestoreTouched = false;
     const app = express();
     app.use(express.json());
     const { router } = createFirebaseRbacRouter({
@@ -390,12 +489,11 @@ describe("insurance intake logic", () => {
       },
       getFirebasePublicConfig: () => ({
         enabled: true,
-        adminConfigured: true,
+        adminConfigured: false,
         webConfigured: true
       }),
       getFirestore() {
-        firestoreTouched = true;
-        throw new Error("Firestore should not be reached for rejected owner-only logins.");
+        return null;
       },
       isFirebaseConfigured: () => true
     });
@@ -410,7 +508,343 @@ describe("insurance intake logic", () => {
       success: false,
       message: "Only david@brothersrestoration.org is approved to sign in to Brothers OS."
     });
-    expect(firestoreTouched).toBe(false);
+  });
+
+  it("allows an issued contractor grant even when owner-only Super Admin login is enabled", async () => {
+    process.env.FIREBASE_OWNER_ONLY_LOGIN = "true";
+    process.env.FIREBASE_ALLOWED_LOGIN_EMAILS = "david@brothersrestoration.org";
+    process.env.SUPER_ADMIN_EMAILS = "david@brothersrestoration.org";
+    const accessToken = "issued-contractor-link-token";
+    const accessCode = "CON-ABC123";
+    const fakeDb = createFakeFirestore({
+      osAccessGrants: {
+        grant1: {
+          email: "contractor@brothersrestoration.org",
+          displayName: "Issued Contractor",
+          roleId: "contractor",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          contractorId: "contractor-demo",
+          accessScope: "48_hour_access",
+          status: "issued",
+          tokenHash: hashSecret(accessToken),
+          portalCodeHash: hashSecret(accessCode),
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }
+      }
+    });
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies: () => ({}),
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifyIdToken: async () => ({
+            uid: "contractor-uid",
+            email: "contractor@brothersrestoration.org",
+            email_verified: true,
+            name: "Issued Contractor",
+            firebase: { sign_in_provider: "google.com" }
+          }),
+          getUser: async () => ({
+            uid: "contractor-uid",
+            email: "contractor@brothersrestoration.org",
+            displayName: "Issued Contractor",
+            disabled: false
+          }),
+          setCustomUserClaims: async () => undefined,
+          createSessionCookie: async () => "session-cookie"
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .post("/api/auth/session/login")
+      .send({
+        idToken: "verified-google-token",
+        accessToken,
+        accessCode
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBe(true);
+    expect(response.body.session).toMatchObject({
+      email: "contractor@brothersrestoration.org",
+      roleId: "contractor",
+      contractorId: "contractor-demo"
+    });
+    expect(fakeDb.dump("osAccessGrants").grant1.status).toBe("active");
+  });
+
+  it("does not open non-owner Google login when owner-only mode is disabled without Admin storage", async () => {
+    process.env.FIREBASE_OWNER_ONLY_LOGIN = "false";
+
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies: () => ({}),
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifyIdToken: async () => ({
+            uid: "any-google-uid",
+            email: "anyone@example.com",
+            email_verified: true,
+            firebase: { sign_in_provider: "google.com" }
+          })
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: false,
+        webConfigured: true
+      }),
+      getFirestore() {
+        return null;
+      },
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .post("/api/auth/session/login")
+      .send({ idToken: "verified-google-token" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.message).toMatch(/Firebase Admin credentials are required/i);
+  });
+
+  it("keeps a contractor grant issued when the portal code is wrong", async () => {
+    process.env.FIREBASE_OWNER_ONLY_LOGIN = "true";
+    process.env.FIREBASE_ALLOWED_LOGIN_EMAILS = "david@brothersrestoration.org";
+    process.env.SUPER_ADMIN_EMAILS = "david@brothersrestoration.org";
+    const accessToken = "issued-contractor-link-token";
+    const accessCode = "CON-ABCD-EFGH-JKLM";
+    const fakeDb = createFakeFirestore({
+      osAccessGrants: {
+        grant1: {
+          email: "contractor@brothersrestoration.org",
+          displayName: "Issued Contractor",
+          roleId: "contractor",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          contractorId: "contractor-demo",
+          accessScope: "48_hour_access",
+          status: "issued",
+          tokenHash: hashSecret(accessToken),
+          portalCodeHash: hashPortalCode(accessCode),
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }
+      }
+    });
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies: () => ({}),
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifyIdToken: async () => ({
+            uid: "contractor-uid",
+            email: "contractor@brothersrestoration.org",
+            email_verified: true,
+            name: "Issued Contractor",
+            firebase: { sign_in_provider: "google.com" }
+          }),
+          getUser: async () => ({
+            uid: "contractor-uid",
+            email: "contractor@brothersrestoration.org",
+            displayName: "Issued Contractor",
+            disabled: false
+          }),
+          setCustomUserClaims: async () => undefined,
+          createSessionCookie: async () => "session-cookie"
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .post("/api/auth/session/login")
+      .send({
+        idToken: "verified-google-token",
+        accessToken,
+        accessCode: "CON-WRONG-CODE-0000"
+      });
+
+    expect(response.status).toBe(403);
+    expect(fakeDb.dump("osAccessGrants").grant1.status).toBe("issued");
+    expect(fakeDb.dump("osAccessGrants").grant1.failedCodeAttempts).toBe(1);
+  });
+
+  it("allows a contractor session refresh after a grant has been issued", async () => {
+    process.env.FIREBASE_OWNER_ONLY_LOGIN = "true";
+    process.env.FIREBASE_ALLOWED_LOGIN_EMAILS = "david@brothersrestoration.org";
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "contractor-uid": {
+          email: "contractor@brothersrestoration.org",
+          displayName: "Issued Contractor",
+          roleId: "contractor",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          contractorId: "contractor-demo",
+          accessScope: "48_hour_access",
+          accessExpiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async () => ({
+            uid: "contractor-uid",
+            email: "contractor@brothersrestoration.org",
+            email_verified: true,
+            name: "Issued Contractor",
+            firebase: { sign_in_provider: "google.com" }
+          }),
+          getUser: async () => ({
+            uid: "contractor-uid",
+            email: "contractor@brothersrestoration.org",
+            displayName: "Issued Contractor",
+            disabled: false
+          }),
+          setCustomUserClaims: async () => undefined
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=session-cookie"]);
+
+    expect(response.status).toBe(200);
+    expect(response.body.session).toMatchObject({
+      email: "contractor@brothersrestoration.org",
+      roleId: "contractor",
+      contractorId: "contractor-demo"
+    });
+  });
+
+  it("blocks franchise owners from escalating managed users into higher roles", async () => {
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "franchise-owner-uid": {
+          email: "franchise@example.com",
+          displayName: "Franchise Owner",
+          roleId: "franchise_owner",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        },
+        "worker-uid": {
+          email: "worker@example.com",
+          displayName: "Worker",
+          roleId: "worker",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async () => ({
+            uid: "franchise-owner-uid",
+            email: "franchise@example.com",
+            email_verified: true,
+            name: "Franchise Owner",
+            firebase: { sign_in_provider: "google.com" }
+          }),
+          getUser: async (uid) => ({
+            uid,
+            email: uid === "worker-uid" ? "worker@example.com" : "franchise@example.com",
+            displayName: uid === "worker-uid" ? "Worker" : "Franchise Owner",
+            disabled: false
+          }),
+          setCustomUserClaims: async () => undefined,
+          updateUser: async () => undefined
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .patch("/api/rbac/users/worker-uid")
+      .set("Cookie", ["brothers_os_session=session-cookie"])
+      .send({ roleId: "business_owner" });
+
+    expect(response.status).toBe(403);
+    expect(response.body.message).toMatch(/Changing user roles requires/i);
+    expect(fakeDb.dump("osUsers")["worker-uid"].roleId).toBe("worker");
   });
 
   it("uses production-safe domain defaults without deriving admin credentials on Vercel", () => {

@@ -268,6 +268,7 @@ const sectionTemplates = {
   daily: [
     ["daily-hero", "Daily dashboard hero"],
     ["daily-dashboard-grid", "Daily KPI grid"],
+    ["daily-module-directory", "Task-type module directory"],
     ["daily-service-requests", "Service requests"],
     ["daily-action-dashboard", "Action dashboard"],
     ["daily-investor-panel", "Institutional review"],

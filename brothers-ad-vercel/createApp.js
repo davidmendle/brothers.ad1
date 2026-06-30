@@ -48,6 +48,33 @@ const requiredFieldLabels = {
 
 let db;
 let blobSdkPromise;
+const rateLimitBuckets = new Map();
+
+function clientRateLimitKey(request, bucketName) {
+  const forwardedFor = String(request.get?.("x-forwarded-for") || "").split(",")[0].trim();
+  return `${bucketName}:${forwardedFor || request.ip || request.socket?.remoteAddress || "unknown"}`;
+}
+
+function rateLimit(bucketName, options = {}) {
+  const windowMs = Number(options.windowMs || 15 * 60 * 1000);
+  const max = Number(options.max || 20);
+  return (request, response, next) => {
+    const now = Date.now();
+    const key = clientRateLimitKey(request, bucketName);
+    const current = rateLimitBuckets.get(key);
+    if (!current || current.resetAt <= now) {
+      rateLimitBuckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    current.count += 1;
+    if (current.count > max) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((current.resetAt - now) / 1000));
+      response.setHeader("Retry-After", String(retryAfterSeconds));
+      return jsonError(response, 429, "Too many requests. Wait a few minutes and try again.");
+    }
+    return next();
+  };
+}
 
 function hasBlobStorage() {
   return Boolean(process.env.BLOB_READ_WRITE_TOKEN);
@@ -1147,6 +1174,8 @@ function createApp() {
     return response.json(getHealthStatus(request));
   });
 
+  app.use("/api/auth/session/login", rateLimit("firebase-session-login", { max: 12, windowMs: 15 * 60 * 1000 }));
+  app.use("/api/access/trial-request", rateLimit("trial-access-request", { max: 6, windowMs: 15 * 60 * 1000 }));
   app.use(firebaseRbac.router);
 
   app.get("/api/insurance-intake/public-config", insuranceCors(), (request, response) => {
@@ -1167,7 +1196,7 @@ function createApp() {
     return proxyLegacyRequest(request, response, `${getLegacyProxyBaseUrl()}${request.originalUrl}`);
   });
 
-  app.post("/api/insurance-intake", parseInsuranceIntakeRequest, async (request, response, next) => {
+  app.post("/api/insurance-intake", rateLimit("insurance-intake", { max: 20, windowMs: 15 * 60 * 1000 }), parseInsuranceIntakeRequest, async (request, response, next) => {
     if (!shouldProxyLegacyInsuranceIntake(request)) return next();
     return proxyLegacyInsuranceIntake(request, response);
   });
@@ -1194,7 +1223,7 @@ function createApp() {
     }
   });
 
-  app.post("/api/admin/login", (request, response) => {
+  app.post("/api/admin/login", rateLimit("admin-login", { max: 5, windowMs: 15 * 60 * 1000 }), (request, response) => {
     const authResult = authenticateAdminCredentials(request.body?.email, request.body?.password);
     if (!authResult.ok) return jsonError(response, authResult.statusCode, authResult.message);
 

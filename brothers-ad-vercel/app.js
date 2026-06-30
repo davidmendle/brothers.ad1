@@ -1,11 +1,23 @@
-import { fetchOsSession, loadFirebaseConfig, loginWithFirebaseGoogle, loginWithFirebasePassword, logoutFirebaseSession } from "./firebase-client.js";
+import {
+  addClientCommunityComment,
+  createClientAccessGrant,
+  createClientAccessRequest,
+  createClientCommunityPost,
+  fetchClientBusinessRecords,
+  fetchClientCommunityPosts,
+  fetchOsSession,
+  loadFirebaseConfig,
+  loginWithFirebaseGoogle,
+  loginWithFirebasePassword,
+  logoutFirebaseSession
+} from "./firebase-client.js";
 
 const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES : [];
 const storageKey = "brothers-os-workspace-v2";
 const workerAccessCode = "BROS-TIME";
 const adminAccessCode = "Issued by Super Admin";
 const employeeAllowedModuleKeys = ["time", "drylogs", "jobs", "photos", "equipment"];
-const brandLogoPath = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 80'%3E%3Crect width='240' height='80' rx='14' fill='%230f172a'/%3E%3Cpath d='M31 50 62 27l31 23v11H31z' fill='%23f8fafc'/%3E%3Cpath d='M57 61V45h12v16z' fill='%231e3a8a'/%3E%3Ctext x='112' y='38' font-family='Arial,sans-serif' font-size='18' font-weight='700' fill='%23f8fafc'%3EBrothers%3C/text%3E%3Ctext x='112' y='58' font-family='Arial,sans-serif' font-size='13' fill='%23bfdbfe'%3ERestoration OS%3C/text%3E%3C/svg%3E";
+const brandLogoPath = "/assets/brothers-logo.png";
 const insuranceStatuses = ["all", "new", "reviewed", "in-progress", "completed", "rejected"];
 const rbacActionKeys = [
   "manageUsers",
@@ -63,6 +75,45 @@ const categoryLabels = {
   training: "Training",
   vendors: "Vendors"
 };
+
+const taskTypeGroups = [
+  {
+    id: "command",
+    label: "Command and Access",
+    categories: ["core", "security", "platform"],
+    keys: ["daily", "launchcenter", "accessadmin", "globalindexes", "settings", "securitycenter", "auditlog", "datamodel", "sessiondevices", "trustsafety"]
+  },
+  {
+    id: "jobs-field",
+    label: "Jobs and Field Work",
+    categories: ["jobs", "field", "dispatch", "property"],
+    keys: ["universalintake", "insurance", "jobs", "workorders", "dispatch", "routeplanner", "drylogs", "time", "equipment", "photos", "fieldmobile", "properties", "sketch"]
+  },
+  {
+    id: "money",
+    label: "Money, Pricing, and Invoices",
+    categories: ["revenue", "finance"],
+    keys: ["pricing", "supplement", "revenueengine", "justification", "evidencechain", "payments", "accounting", "proofvalue"]
+  },
+  {
+    id: "people",
+    label: "People and Contractors",
+    categories: ["training", "vendors", "legal"],
+    keys: ["team", "contractorportal", "communications", "vendors", "marketplace", "partnerscore", "training", "sops", "certbadge", "contracts", "liens"]
+  },
+  {
+    id: "compliance",
+    label: "Compliance, Documents, and Closeout",
+    categories: ["compliance", "documents"],
+    keys: ["defensibility", "compliance", "nationalcodes", "safetyintel", "forms", "closeout", "reviews", "warranty"]
+  },
+  {
+    id: "growth",
+    label: "Growth, Reports, and Strategy",
+    categories: ["reports", "strategy", "marketing", "ai", "branch"],
+    keys: ["reports", "businesshealth", "licensing", "subscriptionbilling", "featuregates", "planmatrix", "setupwizard", "leads", "campaigns", "aicopilots", "aireview", "branches", "moduletoggles", "integrations"]
+  }
+];
 
 const basePinnedKeys = ["daily", "contractorportal", "accessadmin", "launchcenter", "globalindexes", "team", "communications", "payments", "accounting", "insurance", "sketch", "drylogs", "jobs", "pricing", "defensibility", "supplement", "compliance", "aicopilots", "time", "dispatch", "reports"];
 
@@ -1516,6 +1567,87 @@ function filteredModules() {
   });
 }
 
+function availableModulesForDirectory() {
+  return modules.filter((module) => isModuleAllowedByAccess(module.key));
+}
+
+function modulesForTaskGroup(group, availableModules, usedKeys) {
+  const availableByKey = new Map(availableModules.map((module) => [module.key, module]));
+  const groupCategories = new Set(group.categories || []);
+  const picked = [];
+  (group.keys || []).forEach((key) => {
+    const module = availableByKey.get(key);
+    if (module && !usedKeys.has(module.key)) {
+      picked.push(module);
+      usedKeys.add(module.key);
+    }
+  });
+  availableModules.forEach((module) => {
+    if (groupCategories.has(module.category) && !usedKeys.has(module.key)) {
+      picked.push(module);
+      usedKeys.add(module.key);
+    }
+  });
+  return picked.sort((left, right) => left.label.localeCompare(right.label));
+}
+
+function renderTaskTypeModuleDirectory() {
+  const available = availableModulesForDirectory();
+  const usedKeys = new Set();
+  const groups = taskTypeGroups
+    .map((group) => ({ ...group, modules: modulesForTaskGroup(group, available, usedKeys) }))
+    .filter((group) => group.modules.length);
+  const remaining = available.filter((module) => !usedKeys.has(module.key)).sort((left, right) => left.label.localeCompare(right.label));
+  if (remaining.length) {
+    groups.push({ id: "other", label: "Other Workflows", modules: remaining });
+  }
+
+  return `
+    <section class="module-directory-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Module directory by task type</h2>
+          <p>Scan every available module in fewer rows, sorted by the work you are trying to do.</p>
+        </div>
+        <div class="source-status">
+          <span>${available.length} available</span>
+          <span>${groups.length} task types</span>
+        </div>
+      </div>
+      <div class="module-directory-grid">
+        ${groups.map(renderTaskTypeGroup).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderTaskTypeGroup(group) {
+  return `
+    <article class="task-type-group">
+      <div class="task-type-head">
+        <strong>${escapeHtml(group.label)}</strong>
+        <span>${group.modules.length}</span>
+      </div>
+      <div class="module-tile-grid">
+        ${group.modules.map(renderDirectoryModuleTile).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function renderDirectoryModuleTile(module) {
+  const fileCount = filesForModule(module.key).length;
+  const queueCount = queueForModule(module.key).length;
+  const label = tabConfigByKey(module.key)?.label || module.label;
+  return `
+    <a class="module-directory-tile${state.activeKey === module.key ? " active" : ""}" href="#module/${module.key}" data-action="set-active" data-key="${module.key}">
+      <strong>${escapeHtml(label)}</strong>
+      <span>${escapeHtml(categoryLabels[module.category] || module.category)}</span>
+      <small>${fileCount} files / ${queueCount} queue</small>
+    </a>
+  `;
+}
+
 function filesForModule(key) {
   return state.files.filter((file) => file.moduleKey === key);
 }
@@ -1526,7 +1658,7 @@ function queueForModule(key) {
 
 function renderBrandLogo(className = "brand-logo", alt = "Brothers logo") {
   const configuredPath = state.accessContext?.companySettings?.brandLogoUrl || brandLogoPath;
-  return `<img class="${className}" src="${configuredPath}" alt="${alt}" />`;
+  return `<img class="${escapeHtml(className)}" src="${escapeHtml(configuredPath)}" alt="${escapeHtml(alt)}" />`;
 }
 
 function renderTopbarMeta(module) {
@@ -2099,7 +2231,10 @@ function closeModal() {
 
 function updateFileStatus(fileId, status) {
   const file = state.files.find((item) => item.id === fileId);
-  if (!file) return;
+  if (!file) {
+    setToast("That file is no longer available.");
+    return render();
+  }
   file.status = status;
   file.updatedAt = new Date().toISOString();
   file.history = [`Status changed to ${status}`, ...(file.history || [])];
@@ -2111,7 +2246,10 @@ function updateFileStatus(fileId, status) {
 
 function duplicateFile(fileId) {
   const file = state.files.find((item) => item.id === fileId);
-  if (!file) return;
+  if (!file) {
+    setToast("That file is no longer available.");
+    return render();
+  }
   const now = new Date().toISOString();
   const copy = {
     ...file,
@@ -2132,9 +2270,13 @@ function duplicateFile(fileId) {
 
 function deleteFile(fileId) {
   const file = state.files.find((item) => item.id === fileId);
+  if (!file) {
+    setToast("That file is no longer available.");
+    return render();
+  }
   state.files = state.files.filter((item) => item.id !== fileId);
   if (state.selectedFileId === fileId) state.selectedFileId = null;
-  if (file) addActivity(`Deleted ${file.title}.`);
+  addActivity(`Deleted ${file.title}.`);
   persist();
   setToast("File deleted");
   render();
@@ -2142,8 +2284,12 @@ function deleteFile(fileId) {
 
 function completeQueue(id) {
   const item = state.queue.find((entry) => entry.id === id);
+  if (!item) {
+    setToast("That queue item is no longer available.");
+    return render();
+  }
   state.queue = state.queue.filter((entry) => entry.id !== id);
-  if (item) addActivity(`Completed queue item: ${item.label}.`);
+  addActivity(`Completed queue item: ${item.label}.`);
   persist();
   setToast("Queue item cleared");
   render();
@@ -2967,6 +3113,23 @@ function renderManagedSection(id, content) {
   if (state.firebase.enabled && state.authChecked && config && config.visible === false) {
     return "";
   }
+  const heading = String(config?.content?.heading || "").trim();
+  const body = String(config?.content?.body || "").trim();
+  const imageUrl = String(config?.imageUrl || "").trim();
+  const buttons = renderSectionButtons(id);
+  if (heading || body || imageUrl || buttons) {
+    const override = `
+      <div class="managed-section-override">
+        ${imageUrl ? `<img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(heading || config?.title || "Section image")}" />` : ""}
+        <div>
+          ${heading ? `<h2>${escapeHtml(heading)}</h2>` : ""}
+          ${body ? `<p>${escapeHtml(body)}</p>` : ""}
+          ${buttons ? `<div class="hero-actions">${buttons}</div>` : ""}
+        </div>
+      </div>
+    `;
+    return content.replace(/(<(?:section|div)\b[^>]*>)/, `$1${override}`);
+  }
   return content;
 }
 
@@ -3107,6 +3270,101 @@ function sumRecords(records, key = "amount") {
   return records.reduce((sum, record) => sum + Number(record[key] || 0), 0);
 }
 
+function mergeById(existing = [], incoming = []) {
+  const merged = new Map();
+  [...existing, ...incoming].forEach((item) => {
+    if (!item) return;
+    const id = String(item.id || item.uid || item.invoiceId || item.customerId || createId("record"));
+    merged.set(id, { ...item, id });
+  });
+  return Array.from(merged.values());
+}
+
+function isAdminCredentialGap(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  if (!message && state.firebase?.enabled && !state.firebase.adminConfigured) return true;
+  return message.includes("firebase admin credentials")
+    || message.includes("persistent user management")
+    || message.includes("communication-board writes")
+    || message.includes("server credentials");
+}
+
+function upsertAccessGrant(grant) {
+  if (!grant) return;
+  state.accessContext = state.accessContext || {};
+  state.accessContext.accessGrants = mergeById([grant], state.accessContext.accessGrants || []);
+}
+
+function upsertAccessRequest(request) {
+  if (!request) return;
+  state.accessContext = state.accessContext || {};
+  state.accessContext.accessRequests = mergeById([request], state.accessContext.accessRequests || []);
+}
+
+function localCommunityPost(payload) {
+  const now = new Date().toISOString();
+  const post = {
+    id: createId("POST"),
+    title: String(payload.title || "Contractor discussion").trim(),
+    body: String(payload.body || "").trim(),
+    tags: csvValues(payload.tags),
+    visibility: "contractors",
+    authorEmail: state.authSession?.email || "approved user",
+    authorRoleId: currentRoleId() || "member",
+    contractorId: currentContractorId(),
+    comments: [],
+    pinned: false,
+    createdAt: now,
+    updatedAt: now,
+    source: "local-browser"
+  };
+  state.communityPosts = [post, ...(state.communityPosts || [])];
+  persist();
+  return post;
+}
+
+function localCommunityComment(postId, body) {
+  const comment = {
+    id: createId("COMMENT"),
+    body: String(body || "").trim(),
+    authorEmail: state.authSession?.email || "approved user",
+    authorRoleId: currentRoleId() || "member",
+    createdAt: new Date().toISOString(),
+    source: "local-browser"
+  };
+  state.communityPosts = (state.communityPosts || []).map((post) => {
+    if (post.id !== postId) return post;
+    return {
+      ...post,
+      comments: [...(Array.isArray(post.comments) ? post.comments : []), comment],
+      updatedAt: new Date().toISOString()
+    };
+  });
+  persist();
+  return comment;
+}
+
+async function hydrateClientFirebaseData() {
+  if (!state.firebase.enabled || !state.authSession) return;
+  try {
+    const [businessData, communityPosts] = await Promise.all([
+      fetchClientBusinessRecords().catch(() => []),
+      fetchClientCommunityPosts().catch(() => [])
+    ]);
+    if (businessData.length) {
+      state.businessData = mergeById(state.businessData || [], businessData);
+      if (state.accessContext) state.accessContext.businessData = state.businessData;
+    }
+    if (communityPosts.length) {
+      state.communityPosts = mergeById(state.communityPosts || [], communityPosts)
+        .sort((a, b) => String(b.pinned || "").localeCompare(String(a.pinned || "")) || new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+      if (state.accessContext) state.accessContext.communityPosts = state.communityPosts;
+    }
+  } catch (_error) {
+    // Server context remains the source of truth when Firestore browser reads are not available.
+  }
+}
+
 async function bootstrapFirebaseAuth() {
   try {
     const firebaseConfig = await loadFirebaseConfig();
@@ -3119,6 +3377,9 @@ async function bootstrapFirebaseAuth() {
       projectId: firebaseConfig.projectId || "",
       knownProjectId: firebaseConfig.knownProjectId || "",
       usingKnownProjectDefaults: Boolean(firebaseConfig.usingKnownProjectDefaults),
+      restAuthFallback: Boolean(firebaseConfig.restAuthFallback),
+      ownerOnlyLogin: Boolean(firebaseConfig.ownerOnlyLogin),
+      allowedLoginEmails: Array.isArray(firebaseConfig.allowedLoginEmails) ? firebaseConfig.allowedLoginEmails : [],
       missingAdminEnv: firebaseConfig.missingAdminEnv || [],
       missingWebEnv: firebaseConfig.missingWebEnv || [],
       allowedSignInProviders: firebaseConfig.allowedSignInProviders || [],
@@ -3155,6 +3416,7 @@ async function bootstrapFirebaseAuth() {
     if (session?.users?.length) {
       state.teamMembers = session.users.map(mapUserToTeamMember);
     }
+    await hydrateClientFirebaseData();
     state.authChecked = true;
     state.authError = "";
   } catch (error) {
@@ -3191,6 +3453,7 @@ async function refreshAccessContext() {
   if (session?.users?.length) {
     state.teamMembers = session.users.map(mapUserToTeamMember);
   }
+  await hydrateClientFirebaseData();
 }
 
 async function submitFirebaseLogin(formData) {
@@ -3266,23 +3529,35 @@ async function apiRequest(url, options = {}) {
 }
 
 async function requestTrialAccess(formData) {
+  const payload = {
+    displayName: String(formData.get("displayName") || "").trim(),
+    email: String(formData.get("email") || "").trim(),
+    companyName: String(formData.get("companyName") || "").trim(),
+    roleId: String(formData.get("roleId") || "contractor").trim()
+  };
   state.authLoading = true;
   state.authError = "";
   render();
   try {
     const result = await apiRequest("/api/access/trial-request", {
       method: "POST",
-      body: JSON.stringify({
-        displayName: String(formData.get("displayName") || "").trim(),
-        email: String(formData.get("email") || "").trim(),
-        companyName: String(formData.get("companyName") || "").trim(),
-        roleId: String(formData.get("roleId") || "contractor").trim()
-      })
+      body: JSON.stringify(payload)
     });
     state.accessRequestStatus = result.message || "Access request sent.";
     setToast("Access request sent");
   } catch (error) {
-    state.authError = error.message || "Unable to request access.";
+    if (!isAdminCredentialGap(error)) {
+      state.authError = error.message || "Unable to request access.";
+    } else {
+      try {
+        const result = await createClientAccessRequest(payload);
+        state.accessRequestStatus = `${result.message} Stored in Firebase from the login dashboard.`;
+        upsertAccessRequest(result.request);
+        setToast("Access request stored in Firebase");
+      } catch (fallbackError) {
+        state.authError = fallbackError.message || "Unable to request access.";
+      }
+    }
   } finally {
     state.authLoading = false;
     render();
@@ -3301,10 +3576,18 @@ async function createAccessGrant(formData) {
     ttlHours: Number(formData.get("ttlHours") || 48),
     sendEmail: formData.has("sendEmail")
   };
-  const result = await apiRequest("/api/access/grants", {
-    method: "POST",
-    body: JSON.stringify(payload)
-  });
+  let result;
+  let usedClientGrant = false;
+  try {
+    result = await apiRequest("/api/access/grants", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
+    if (!isAdminCredentialGap(error)) throw error;
+    usedClientGrant = true;
+    result = await createClientAccessGrant(payload);
+  }
   state.lastAccessGrant = {
     email: payload.email,
     accessCode: result.accessCode,
@@ -3312,33 +3595,76 @@ async function createAccessGrant(formData) {
     expiresAt: result.grant?.expiresAt || "",
     emailDelivery: result.emailDelivery || result.grant?.emailDelivery || null
   };
-  setToast(state.lastAccessGrant.emailDelivery?.status === "sent" ? "Invite email sent with access code" : "Access grant issued; email delivery needs setup or review");
-  await refreshAccessContext();
+  upsertAccessGrant(result.grant);
+  setToast(state.lastAccessGrant.emailDelivery?.status === "sent" ? "Invite email sent with access code" : "Access grant issued; send the link and code manually");
+  if (usedClientGrant) {
+    render();
+  } else {
+    await refreshAccessContext().catch(() => hydrateClientFirebaseData());
+  }
 }
 
 async function createCommunityPost(formData) {
-  await apiRequest("/api/community/posts", {
-    method: "POST",
-    body: JSON.stringify({
-      title: String(formData.get("title") || "").trim(),
-      body: String(formData.get("body") || "").trim(),
-      tags: csvValues(formData.get("tags"))
-    })
-  });
+  const payload = {
+    title: String(formData.get("title") || "").trim(),
+    body: String(formData.get("body") || "").trim(),
+    tags: csvValues(formData.get("tags")),
+    roleId: currentRoleId(),
+    contractorId: currentContractorId(),
+    companyId: state.authSession?.companyId || "default-company",
+    franchiseIds: currentUserFranchiseIds()
+  };
+  let usedLocalFallback = false;
+  try {
+    await apiRequest("/api/community/posts", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
+    if (!isAdminCredentialGap(error)) throw error;
+    try {
+      const result = await createClientCommunityPost(payload);
+      state.communityPosts = mergeById([result.post], state.communityPosts || []);
+    } catch (_fallbackError) {
+      usedLocalFallback = true;
+      localCommunityPost(payload);
+    }
+  }
   setToast("Board post published");
-  await refreshAccessContext();
+  if (usedLocalFallback) {
+    render();
+  } else {
+    await refreshAccessContext().catch(() => hydrateClientFirebaseData());
+  }
 }
 
 async function addCommunityComment(formData) {
   const postId = String(formData.get("postId") || "").trim();
-  await apiRequest(`/api/community/posts/${encodeURIComponent(postId)}/comments`, {
-    method: "POST",
-    body: JSON.stringify({
-      body: String(formData.get("body") || "").trim()
-    })
-  });
+  const body = String(formData.get("body") || "").trim();
+  let usedLocalFallback = false;
+  try {
+    await apiRequest(`/api/community/posts/${encodeURIComponent(postId)}/comments`, {
+      method: "POST",
+      body: JSON.stringify({ body })
+    });
+  } catch (error) {
+    if (!isAdminCredentialGap(error)) throw error;
+    try {
+      await addClientCommunityComment(postId, {
+        body,
+        roleId: currentRoleId()
+      });
+    } catch (_fallbackError) {
+      usedLocalFallback = true;
+      localCommunityComment(postId, body);
+    }
+  }
   setToast("Comment added");
-  await refreshAccessContext();
+  if (usedLocalFallback) {
+    render();
+  } else {
+    await refreshAccessContext().catch(() => hydrateClientFirebaseData());
+  }
 }
 
 async function createSecureUser(formData) {
@@ -4320,18 +4646,55 @@ function createPaymentRequest(formData) {
   });
 }
 
+function createPaymentRailSetup(method, route, detail) {
+  createFile({
+    moduleKey: "payments",
+    title: `${method} payment rail setup`,
+    type: "Payment rail",
+    owner: "Bookkeeping",
+    status: route === "gateway-ready" ? "Planned" : "Needs configuration",
+    priority: method === "Future rails" ? "Low" : "High",
+    due: today.toISOString().slice(0, 10),
+    relatedJob: "Payment operations",
+    notes: [
+      `Rail: ${method}`,
+      `Backend route: ${route}`,
+      `Purpose: ${detail}`,
+      route === "gateway-ready"
+        ? "Next step: choose the processor and add an approved backend connector before collecting money through this rail."
+        : "Next step: add verified processor credentials and a server endpoint before sending live payment links.",
+      "Security: keep processor secrets in Vercel environment variables only."
+    ].join("\n")
+  });
+}
+
 function connectQuickBooks() {
   state.quickBooksConnection = {
     ...state.quickBooksConnection,
-    connected: true,
+    connected: false,
     companyName: state.quickBooksConnection.companyName || "Connected contractor company",
     realmId: state.quickBooksConnection.realmId || createId("QBO"),
     lastSync: new Date().toISOString(),
-    mode: "OAuth ready"
+    mode: "OAuth setup file created"
   };
-  addActivity("QuickBooks connection marked active for invoice, expense, project, and profit tracking.");
+  createFile({
+    moduleKey: "accounting",
+    title: "QuickBooks OAuth setup",
+    type: "Integration setup",
+    owner: "Bookkeeping",
+    status: "Needs configuration",
+    priority: "High",
+    due: today.toISOString().slice(0, 10),
+    relatedJob: "Accounting integration",
+    notes: [
+      "Connect QuickBooks through a secured OAuth backend before syncing invoices, expenses, projects, or profit data.",
+      "Required production inputs: QuickBooks client id, client secret, redirect URI, company realm id, token storage, and webhook verification.",
+      "No live accounting data is transmitted until those credentials and routes are configured."
+    ].join("\n")
+  });
+  addActivity("Created QuickBooks OAuth setup file for invoice, expense, project, and profit tracking.");
   persist();
-  setToast("QuickBooks connected");
+  setToast("QuickBooks setup file created");
   render();
 }
 
@@ -4863,7 +5226,7 @@ function render() {
 
 function renderAuthGate() {
   if (!state.firebase.ready) {
-    return `<div class="app-loading"><div class="loading-card"><div class="brand-mark">B</div><div><strong>Loading authentication</strong><span>Connecting Brothers OS to Firebase Auth.</span></div></div></div>`;
+    return `<div class="app-loading"><div class="loading-card"><div class="loading-logo-wrap">${renderBrandLogo("loading-logo", "Brothers logo")}</div><div><strong>Loading authentication</strong><span>Connecting Brothers OS to Firebase Auth.</span></div></div></div>`;
   }
 
   if (!state.firebase.enabled) {
@@ -4873,7 +5236,7 @@ function renderAuthGate() {
     return `
       <div class="app-loading">
         <div class="loading-card auth-setup-card">
-          <div class="brand-mark">B</div>
+          <div class="loading-logo-wrap">${renderBrandLogo("loading-logo", "Brothers logo")}</div>
           <div>
             <strong>Authentication setup required</strong>
             <span>Brothers OS is locked until Firebase Google login is configured in Vercel.</span>
@@ -4893,12 +5256,17 @@ function renderAuthGate() {
   const accessTokenPresent = Boolean(getAccessTokenFromRoute());
   const ttlLabel = state.firebase.sessionTtlHours ? `${state.firebase.sessionTtlHours} hours` : "48 hours";
   const passwordAllowed = (state.firebase.allowedSignInProviders || []).includes("password");
+  const ownerEmails = (state.firebase.allowedLoginEmails || []).filter(Boolean);
+  const ownerLabel = ownerEmails.length ? ownerEmails.join(", ") : "the Super Admin email";
   return `
     <section class="auth-gate">
       <div class="auth-card">
+        <div class="auth-logo-wrap">${renderBrandLogo("auth-logo", "Brothers logo")}</div>
         <span>Secure company access</span>
         <h1>Sign in to Brothers OS</h1>
-        <p>Google sign-in is required. Only david@brothersrestoration.org is approved for owner access; approved trial and contractor sessions expire after ${escapeHtml(ttlLabel)} and require an individual access code.</p>
+        <p>Google verifies identity; Brothers OS authorizes access separately. Owner access is restricted to ${escapeHtml(ownerLabel)}. Every other Google account needs an active ${escapeHtml(ttlLabel)} invite link and an individual access code, or the session is denied.</p>
+        <div class="empty-state warning-state"><strong>Unapproved accounts are denied</strong><span>The Google button may open for any Google account, but the OS session is created only after the server approves the email, invite link, and contractor code.</span></div>
+        ${isAdminCredentialGap() ? `<div class="empty-state warning-state"><strong>Contractor code validation needs Firebase Admin credentials</strong><span>Owner login is locked now. Contractor and trial access-code validation becomes live after FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY are added in Vercel.</span></div>` : ""}
         ${accessTokenPresent ? `<div class="empty-state"><strong>Access link detected</strong><span>Sign in with the same Google email that requested access, then enter the contractor code if one was issued.</span></div>` : ""}
         <label><span>Contractor / trial access code</span><input data-field="login-access-code" name="accessCode" autocomplete="one-time-code" placeholder="CON-123ABC" /></label>
         <button type="button" data-action="firebase-google-login">${state.authLoading ? "Connecting..." : "Sign in with Google"}</button>
@@ -5197,6 +5565,7 @@ function renderDashboardSummary() {
       ${renderStatCard("Logged hours", hours, "Employee GPS time entries saved locally.", "time")}
     </section>
     `)}
+    ${renderManagedSection("daily-module-directory", renderTaskTypeModuleDirectory())}
     ${renderManagedSection("daily-service-requests", renderServiceRequestPanel())}
     ${renderManagedSection("daily-action-dashboard", renderActionDashboard())}
     ${renderManagedSection("daily-investor-panel", renderInstitutionalInvestorPanel())}
@@ -5615,7 +5984,7 @@ function renderStandardsAI(module) {
           </fieldset>
           <div class="modal-actions">
             <button type="button" data-action="open-create-file" data-key="${module.key}">Manual file</button>
-            <button type="button" data-action="run-live-source-check" data-key="${module.key}">Live web check</button>
+            <button type="button" data-action="run-live-source-check" data-key="${module.key}">Prepare source check</button>
             <button type="button" data-action="generate-rebuttal" data-key="${module.key}">Generate rebuttal</button>
             <button type="submit">Generate AI source draft</button>
           </div>
@@ -7542,6 +7911,7 @@ function renderGlobalIndexesModule(module) {
     </section>
     ${!state.firebase.enabled ? `<section class="panel"><div class="empty-state warning-state"><strong>Local preview note</strong><span>This preview is visible only because Firebase auth is not configured locally. On Vercel, Super Admin RBAC hides this module from contractors and workers.</span></div></section>` : ""}
     ${renderSkillsAndDatabasePanel()}
+    ${renderGlobalBusinessIndexPanel()}
     <section class="panel">
       <div class="panel-head">
         <div>
@@ -7555,6 +7925,65 @@ function renderGlobalIndexesModule(module) {
     </section>
     ${renderModuleFiles(module)}
     ${renderFileDetail(module)}
+  `;
+}
+
+function renderGlobalBusinessIndexPanel() {
+  const customers = customerRecords();
+  const invoices = revenueInvoices();
+  const contractorBills = contractorInvoices();
+  const allRecords = [...customers, ...invoices, ...contractorBills];
+  const revenueTotal = sumRecords(invoices, "amount");
+  const openBalance = sumRecords(invoices, "balance");
+  const contractorTotal = sumRecords(contractorBills, "amount");
+  const sourceLabel = state.firebase.adminConfigured
+    ? "Server Firebase Admin"
+    : allRecords.some((record) => record.source === "client-firestore")
+      ? "Browser Firestore fallback"
+      : "Secure default seed / role-scoped API";
+  return `
+    <section class="panel global-business-index">
+      <div class="panel-head">
+        <div>
+          <h2>Global customer, revenue, and contractor invoice index</h2>
+          <p>Super Admin-only financial visibility across customer accounts, receivables, revenue invoices, and contractor bills.</p>
+        </div>
+        <div class="row-actions">
+          <a href="#module/payments" data-action="set-active" data-key="payments">Payments</a>
+          <a href="#module/accounting" data-action="set-active" data-key="accounting">Accounting</a>
+        </div>
+      </div>
+      <div class="metric-strip">
+        <div><strong>${customers.length}</strong><span>Customers</span></div>
+        <div><strong>${escapeHtml(formatMoney(revenueTotal))}</strong><span>Revenue invoices</span></div>
+        <div><strong>${escapeHtml(formatMoney(openBalance))}</strong><span>Open balance</span></div>
+        <div><strong>${escapeHtml(formatMoney(contractorTotal))}</strong><span>Contractor invoices</span></div>
+      </div>
+      ${!state.firebase.adminConfigured ? `<div class="empty-state warning-state"><strong>Persistent Admin storage still needs Firebase service-account credentials</strong><span>The index is visible to Super Admin now, and browser Firestore can read/write allowed records, but server-side invite validation and durable admin writes require FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY in Vercel.</span></div>` : ""}
+      <div class="empty-state compact-empty"><strong>Data source</strong><span>${escapeHtml(sourceLabel)}</span></div>
+      ${allRecords.length ? `
+        <div class="business-record-grid">
+          ${customers.map(renderCustomerRecordCard).join("")}
+          ${invoices.map(renderRevenueInvoiceCard).join("")}
+          ${contractorBills.map(renderContractorInvoiceCard).join("")}
+        </div>
+      ` : `<div class="empty-state"><strong>No business records available</strong><span>Customer, revenue, and contractor invoice records appear here after Firebase returns records for your role.</span></div>`}
+    </section>
+  `;
+}
+
+function renderCustomerRecordCard(customer) {
+  return `
+    <article class="business-record-card">
+      <div class="file-card-head"><span>Customer</span><strong>${escapeHtml(customer.status || "Active")}</strong></div>
+      <h3>${escapeHtml(customer.name || customer.customerId || customer.id)}</h3>
+      <p>${escapeHtml(customer.email || customer.phone || "No contact on file")}</p>
+      <dl>
+        <div><dt>Revenue</dt><dd>${escapeHtml(formatMoney(customer.revenueTotal || 0))}</dd></div>
+        <div><dt>Open</dt><dd>${escapeHtml(formatMoney(customer.openBalance || 0))}</dd></div>
+        <div><dt>Contractor</dt><dd>${escapeHtml(customer.contractorId || "Unassigned")}</dd></div>
+      </dl>
+    </article>
   `;
 }
 
@@ -7660,6 +8089,7 @@ function renderPaymentRail(method, route, detail) {
       <span>${escapeHtml(route)}</span>
       <h3>${escapeHtml(method)}</h3>
       <p>${escapeHtml(detail)}</p>
+      <button type="button" data-action="create-payment-rail" data-method="${escapeHtml(method)}" data-route="${escapeHtml(route)}" data-detail="${escapeHtml(detail)}">Create setup file</button>
     </article>
   `;
 }
@@ -8196,12 +8626,12 @@ function renderAccountingModule(module) {
   const contractorBills = contractorInvoices();
   return `
     <section class="hero-band">
-      <div><p>${escapeHtml(module.purpose)}</p><div class="hero-actions"><button type="button" data-action="connect-quickbooks">${qbo.connected ? "Sync QuickBooks" : "Connect QuickBooks"}</button><a href="#module/payments" data-action="set-active" data-key="payments">Payments</a><a href="#module/reports" data-action="set-active" data-key="reports">Reports</a></div></div>
+      <div><p>${escapeHtml(module.purpose)}</p><div class="hero-actions"><button type="button" data-action="connect-quickbooks">${qbo.connected ? "Sync QuickBooks" : "Create QuickBooks setup"}</button><a href="#module/payments" data-action="set-active" data-key="payments">Payments</a><a href="#module/reports" data-action="set-active" data-key="reports">Reports</a></div></div>
       <div class="metric-strip"><div><strong>${customers.length}</strong><span>Customers</span></div><div><strong>${escapeHtml(formatMoney(sumRecords(invoices, "amount")))}</strong><span>Revenue</span></div><div><strong>${escapeHtml(formatMoney(sumRecords(contractorBills, "amount")))}</strong><span>Contractors</span></div></div>
     </section>
     <section class="payments-layout">
       <div class="panel">
-        <div class="panel-head"><div><h2>QuickBooks login gateway</h2><p>Connect contractor company files for invoices, expenses, projects, and job profit.</p></div><button type="button" data-action="connect-quickbooks">${qbo.connected ? "Sync now" : "Connect"}</button></div>
+        <div class="panel-head"><div><h2>QuickBooks login gateway</h2><p>Create the OAuth setup file before syncing invoices, expenses, projects, and job profit.</p></div><button type="button" data-action="connect-quickbooks">${qbo.connected ? "Sync now" : "Create setup file"}</button></div>
         <div class="quickbooks-card">
           <strong>${escapeHtml(qbo.companyName || "No company connected")}</strong>
           <span>${escapeHtml(qbo.mode)} - ${qbo.lastSync ? `Last sync ${formatTime(qbo.lastSync)}` : "Waiting for OAuth setup"}</span>
@@ -9047,7 +9477,7 @@ document.addEventListener("click", (event) => {
   if (action === "capture-equipment-gps") return captureEquipmentGps();
   if (action === "create-equipment-invoice") return createEquipmentInvoice(id);
   if (action === "generate-rebuttal") return generateStandardsFromButton(actionElement, "rebuttal", "Rebuttal generated");
-  if (action === "run-live-source-check") return generateStandardsFromButton(actionElement, "code-search", "Live source check prepared");
+  if (action === "run-live-source-check") return generateStandardsFromButton(actionElement, "code-search", "Source-check file prepared");
   if (action === "toggle-job-gate") return toggleJobGate(id, actionElement.dataset.gate);
   if (action === "create-job-packet") return createJobPacket(id);
   if (action === "create-drylog-packet") return createDryLogPacket(id);
@@ -9060,6 +9490,7 @@ document.addEventListener("click", (event) => {
   if (action === "create-estimate-invoice") return createEstimateInvoice();
   if (action === "remove-estimate-line") return removeEstimateLine(id);
   if (action === "connect-quickbooks") return connectQuickBooks();
+  if (action === "create-payment-rail") return createPaymentRailSetup(actionElement.dataset.method || "Payment", actionElement.dataset.route || "gateway-ready", actionElement.dataset.detail || "Payment rail setup");
   if (action === "complete-task") return completeTask(id);
   if (action === "professionalize-sketch") return professionalizeSketch();
   if (action === "select-sketch-room") {
