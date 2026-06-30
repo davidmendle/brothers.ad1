@@ -1,223 +1,24 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() {
       return request.auth != null;
     }
 
-    function isBlockedEmail() {
-      return signedIn() && (
-        request.auth.token.email == 'chaim@brothersrestoration.org' ||
-        request.auth.token.email == 'reznikchaim@gmail.com'
-      );
-    }
-
-    function isHardcodedSuperAdmin() {
+    function isBlogAdmin() {
       return signedIn()
-        && !isBlockedEmail()
-        && request.auth.token.email == 'david@brothersrestoration.org'
-        && request.auth.token.email_verified == true;
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == "david@brothersrestoration.org";
     }
 
-    function hasLegacyAdminDoc() {
-      return signedIn()
-        && !isBlockedEmail()
-        && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    match /blogPosts/{slug} {
+      allow read: if resource.data.status == "published" || isBlogAdmin();
+      allow create, update, delete: if isBlogAdmin();
     }
 
-    function legacyAdminIsSuperAdmin() {
-      return hasLegacyAdminDoc()
-        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'super_admin';
-    }
-
-    function hasOsUserDoc() {
-      return signedIn() && exists(/databases/$(database)/documents/osUsers/$(request.auth.uid));
-    }
-
-    function currentUserDoc() {
-      return get(/databases/$(database)/documents/osUsers/$(request.auth.uid));
-    }
-
-    function currentRole() {
-      return isHardcodedSuperAdmin()
-        ? 'super_admin'
-        : hasOsUserDoc()
-            ? currentUserDoc().data.roleId
-            : legacyAdminIsSuperAdmin()
-              ? 'super_admin'
-              : null;
-    }
-
-    function isAdmin() {
-      return signedIn() && (
-        isHardcodedSuperAdmin()
-        || currentRole() == 'super_admin'
-        || currentRole() == 'business_owner'
-        || currentRole() == 'franchise_owner'
-      );
-    }
-
-    function isSuperAdmin() {
-      return signedIn() && (
-        isHardcodedSuperAdmin()
-        || legacyAdminIsSuperAdmin()
-        || currentRole() == 'super_admin'
-      );
-    }
-
-    function companyMatches(data) {
-      return hasOsUserDoc()
-        && data.companyId == currentUserDoc().data.companyId;
-    }
-
-    function franchiseMatches(data) {
-      return hasOsUserDoc() && (
-        currentRole() == 'super_admin'
-        || currentRole() == 'business_owner'
-        || data.franchiseId in currentUserDoc().data.franchiseIds
-      );
-    }
-
-    function contractorMatches(data) {
-      return hasOsUserDoc()
-        && currentUserDoc().data.contractorId != null
-        && currentUserDoc().data.contractorId != ''
-        && data.contractorId == currentUserDoc().data.contractorId;
-    }
-
-    function canReadBusinessRecord(data) {
-      return isSuperAdmin()
-        || currentRole() == 'business_owner'
-        || (currentRole() == 'franchise_owner' && franchiseMatches(data))
-        || (currentRole() == 'contractor' && data.type == 'contractorInvoice' && contractorMatches(data));
-    }
-
-    match /services/{serviceId} {
-      allow read: if true;
-      allow write: if isAdmin();
-    }
-
-    match /projects/{projectId} {
-      allow read: if true;
-      allow write: if isAdmin();
-    }
-
-    match /reviews/{reviewId} {
-      allow read: if true;
-      allow write: if isAdmin();
-    }
-
-    match /settings/{settingId} {
-      allow read: if true;
-      allow write: if isAdmin();
-    }
-
-    match /leads/{leadId} {
-      allow create: if true;
-      allow read, update, delete: if isAdmin();
-    }
-
-    match /mail/{mailId} {
-      allow create: if request.resource.data.to == 'david@brothersrestoration.org';
-      allow read, update, delete: if false;
-    }
-
-    match /gallery/{imageId} {
-      allow read: if true;
-      allow write: if isAdmin();
-    }
-
-    match /pages/{pageId} {
-      allow read: if true;
-      allow write: if isAdmin();
-    }
-
-    match /blogs/{blogId} {
-      allow read: if true;
-      allow write: if isAdmin();
-    }
-
-    match /admins/{adminId} {
-      allow read: if signedIn() && (
-        request.auth.uid == adminId
-        || isHardcodedSuperAdmin()
-      );
-      allow write: if isHardcodedSuperAdmin();
-      allow list: if signedIn() && (
-        isHardcodedSuperAdmin()
-        || request.auth.uid == adminId
-      );
-    }
-
-    match /osUsers/{uid} {
-      allow read: if signedIn() && (
-        request.auth.uid == uid
-        || isSuperAdmin()
-        || currentRole() == 'business_owner'
-        || (currentRole() == 'franchise_owner' && franchiseMatches(resource.data))
-      );
-      allow list: if isSuperAdmin() || currentRole() == 'business_owner';
-      allow create, update, delete: if isSuperAdmin();
-    }
-
-    match /osRoles/{roleId} {
-      allow read: if isAdmin();
-      allow create, update, delete: if isSuperAdmin();
-    }
-
-    match /osPermissions/{roleId} {
-      allow read: if isAdmin();
-      allow create, update, delete: if isSuperAdmin();
-    }
-
-    match /osTabs/{tabId} {
-      allow read: if isAdmin();
-      allow create, update, delete: if isSuperAdmin();
-    }
-
-    match /osPages/{pageId} {
-      allow read: if isAdmin();
-      allow create, update, delete: if isSuperAdmin();
-    }
-
-    match /osPageSections/{sectionId} {
-      allow read: if isAdmin();
-      allow create, update, delete: if isSuperAdmin();
-    }
-
-    match /osCompanySettings/{settingId} {
-      allow read: if isAdmin();
-      allow create, update, delete: if isSuperAdmin();
-    }
-
-    match /osFranchiseSettings/{settingId} {
-      allow read: if isAdmin();
-      allow create, update, delete: if isSuperAdmin() || currentRole() == 'business_owner';
-    }
-
-    match /osAuditLogs/{logId} {
-      allow read: if isSuperAdmin() || currentRole() == 'business_owner';
-      allow create, update, delete: if false;
-    }
-
-    match /osAccessRequests/{requestId} {
-      allow create: if true;
-      allow read, update, delete: if isSuperAdmin();
-    }
-
-    match /osAccessGrants/{grantId} {
-      allow read, create, update, delete: if isSuperAdmin();
-    }
-
-    match /osBusinessRecords/{recordId} {
-      allow read: if signedIn() && canReadBusinessRecord(resource.data);
-      allow create, update, delete: if isSuperAdmin();
-    }
-
-    match /osCommunityPosts/{postId} {
-      allow read: if signedIn() && currentRole() in ['super_admin', 'business_owner', 'franchise_owner', 'contractor', 'worker'];
-      allow create: if signedIn() && currentRole() in ['super_admin', 'business_owner', 'franchise_owner', 'contractor', 'worker'];
-      allow update, delete: if isSuperAdmin() || currentRole() == 'business_owner';
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }
