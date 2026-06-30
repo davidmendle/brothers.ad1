@@ -1,2 +1,6 @@
 allowBuilds:
-  sharp: true
+  '@firebase/util': true
+  '@prisma/client': true
+  '@prisma/engines': true
+  prisma: true
+  protobufjs: true

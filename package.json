@@ -1,20 +1,29 @@
 {
-  "name": "brothers-ad",
-  "version": "2.0.0",
+  "name": "brothers-pasted-app",
   "private": true,
+  "version": "1.0.0",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
+    "dev": "node server.js",
+    "start": "node server.js",
+    "build": "node -e \"console.log('Static app: no build step required.')\"",
+    "preview": "node server.js",
+    "prisma:generate": "prisma generate",
+    "prisma:push": "node -e \"console.log('Runtime SQLite schema is created automatically on server startup.')\"",
+    "test": "vitest run",
+    "test:insurance": "vitest run tests/insurance-intake.test.js",
+    "verify:firebase-rbac": "node scripts/verify-firebase-rbac.js"
   },
   "dependencies": {
-    "next": "16.2.9",
-    "react": "19.2.7",
-    "react-dom": "19.2.7"
+    "@prisma/client": "^6.10.1",
+    "@vercel/blob": "^2.4.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "firebase-admin": "^14.0.0",
+    "multer": "^2.1.1",
+    "prisma": "^6.10.1"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "sharp"
-    ]
+  "devDependencies": {
+    "supertest": "^7.2.2",
+    "vitest": "^4.1.8"
   }
 }
