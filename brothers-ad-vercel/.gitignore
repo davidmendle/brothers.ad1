@@ -1,0 +1,11 @@
+node_modules
+.env
+.env.local
+.secrets/*
+!.secrets/.gitkeep
+prisma/*.db
+prisma/*.db-journal
+uploads/insurance-intake/*
+!uploads/insurance-intake/.gitkeep
+coverage
+.vercel
