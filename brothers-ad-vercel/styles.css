@@ -1028,6 +1028,20 @@ textarea:hover {
   color: var(--blue);
 }
 
+.file-module-links {
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 7px;
+  padding-top: 10px;
+}
+
+.file-module-links > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
 .panel-head {
   display: flex;
   justify-content: space-between;

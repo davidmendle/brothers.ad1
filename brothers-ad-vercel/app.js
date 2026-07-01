@@ -51,7 +51,7 @@ const rbacActionKeys = [
 ];
 
 const app = document.getElementById("app");
-const today = new Date("2026-06-06T09:00:00");
+const today = new Date();
 
 const categoryLabels = {
   ai: "AI",
@@ -1039,6 +1039,27 @@ function mergeDefaultsById(current, defaults) {
   return [...current, ...defaults.filter((item) => !currentIds.has(item.id)).map((item) => clone(item))];
 }
 
+function normalizeModuleKeyList(value, primaryKey = "") {
+  const rawKeys = Array.isArray(value) ? value : String(value || "").split(/[\s,|]+/);
+  return [...new Set(rawKeys.map((key) => String(key || "").trim()).filter(Boolean))]
+    .filter((key) => key !== primaryKey && moduleByKey(key));
+}
+
+function fileLinkedModules(file) {
+  return normalizeModuleKeyList(file.linkedModuleKeys || file.linkedModules || [], file.moduleKey);
+}
+
+function normalizeFileRecord(file) {
+  return {
+    ...file,
+    linkedModuleKeys: fileLinkedModules(file),
+    sourceType: file.sourceType || "",
+    sourceId: file.sourceId || "",
+    customer: file.customer || "",
+    amount: parseAmount(file.amount)
+  };
+}
+
 function normalizeJobRecord(job) {
   const gates = Array.isArray(job.gates) ? [...job.gates] : [];
   if (!gates.some((gate) => gate.id === "drylogs")) {
@@ -1061,6 +1082,7 @@ function loadState() {
 
 function normalizeState(next) {
   next.files = Array.isArray(next.files) ? mergeDefaultsById(next.files, defaultFiles) : clone(defaultFiles);
+  next.files = next.files.map(normalizeFileRecord);
   next.queue = Array.isArray(next.queue) ? next.queue : clone(defaultQueue);
   next.activity = Array.isArray(next.activity) ? next.activity : clone(defaultActivity);
   next.standardsOutputs = Array.isArray(next.standardsOutputs) ? next.standardsOutputs : clone(defaultStandardsOutputs);
@@ -1264,7 +1286,11 @@ function routeToModule(key) {
 
 function formatDate(value) {
   if (!value) return "No date";
-  const date = new Date(value);
+  const text = String(value);
+  const dateOnly = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const date = dateOnly
+    ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+    : new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(date);
 }
@@ -1658,7 +1684,11 @@ function renderDirectoryModuleTile(module) {
 }
 
 function filesForModule(key) {
-  return state.files.filter((file) => file.moduleKey === key);
+  return state.files.filter((file) => fileBelongsToModule(file, key));
+}
+
+function fileBelongsToModule(file, key) {
+  return file.moduleKey === key || fileLinkedModules(file).includes(key);
 }
 
 function queueForModule(key) {
@@ -2134,6 +2164,9 @@ function saveStandardsOutputAsFile(id) {
   if (!output) return;
   createFile({
     moduleKey: output.moduleKey || state.activeKey,
+    linkedModuleKeys: ["compliance", "defensibility", "supplement", "evidencechain"],
+    sourceType: "standardsOutput",
+    sourceId: output.id,
     title: output.title,
     type: "AI standards draft",
     owner: "Compliance AI",
@@ -2177,12 +2210,52 @@ function generateStandardsFromButton(button, forcedMode, toastText) {
   saveGeneratedStandardsOutput(output, toastText);
 }
 
+function workflowTaskKey(task) {
+  if (!task.sourceId) return "";
+  return [task.sourceType || "workflow", task.sourceId, task.moduleKey, task.title].join(":");
+}
+
+function ensureWorkflowTask(taskData) {
+  const module = moduleByKey(taskData.moduleKey);
+  if (!module) return null;
+  const task = {
+    id: createId("TASK"),
+    title: String(taskData.title || `${module.label} follow-up`).trim(),
+    assigneeId: taskData.assigneeId || state.teamMembers[0]?.id || "",
+    moduleKey: module.key,
+    relatedJob: String(taskData.relatedJob || "").trim(),
+    due: taskData.due || today.toISOString().slice(0, 10),
+    status: taskData.status || "Open",
+    priority: taskData.priority || "Medium",
+    sourceType: taskData.sourceType || "workflow",
+    sourceId: taskData.sourceId || "",
+    workflowKey: ""
+  };
+  task.workflowKey = workflowTaskKey(task);
+  if (task.workflowKey && state.tasks.some((item) => item.workflowKey === task.workflowKey && item.status !== "Complete")) {
+    return null;
+  }
+  state.tasks = [task, ...state.tasks];
+  return task;
+}
+
+function ensureWorkflowTasks(tasks) {
+  return tasks.map(ensureWorkflowTask).filter(Boolean);
+}
+
 function createFile(data) {
   const module = moduleByKey(data.moduleKey || state.activeKey) || activeModule();
   const now = new Date().toISOString();
+  const linkedModuleKeys = normalizeModuleKeyList(data.linkedModuleKeys || data.linkedModules || [], module.key);
+  const linkedLabels = linkedModuleKeys.map((key) => moduleByKey(key)?.label || key);
   const file = {
     id: createId("F"),
     moduleKey: module.key,
+    linkedModuleKeys,
+    sourceType: data.sourceType || "",
+    sourceId: data.sourceId || "",
+    customer: String(data.customer || "").trim(),
+    amount: parseAmount(data.amount),
     title: data.title?.trim() || `${module.label} file`,
     type: data.type || suggestedFileType(module),
     owner: data.owner?.trim() || (state.worker?.name || "Office"),
@@ -2193,7 +2266,7 @@ function createFile(data) {
     notes: data.notes?.trim() || "",
     createdAt: now,
     updatedAt: now,
-    history: [`Created in ${module.label}`]
+    history: [`Created in ${module.label}`, ...(linkedLabels.length ? [`Visible in ${linkedLabels.join(", ")}`] : [])]
   };
   state.files = [file, ...state.files];
   state.selectedFileId = file.id;
@@ -2662,6 +2735,9 @@ function createInvestorReport() {
   };
   createFile({
     moduleKey: "daily",
+    linkedModuleKeys: ["globalindexes", "reports", "businesshealth", "proofvalue"],
+    sourceType: "institutionalReview",
+    sourceId: review.generatedAt,
     title: `Institutional diligence report ${today.toISOString().slice(0, 10)}`,
     type: "Investor diligence",
     owner: "Owner",
@@ -2783,13 +2859,20 @@ function addServiceRequest(formData) {
       relatedJob: request.id,
       due: request.preferredDate,
       status: "Open",
-      priority: servicePriority(request.urgency)
+      priority: servicePriority(request.urgency),
+      sourceType: "serviceRequest",
+      sourceId: request.id,
+      workflowKey: `serviceRequest:${request.id}:dispatch:Call ${request.name} for service request`
     },
     ...state.tasks
   ];
   addActivity(`Service request ${request.id} created for ${request.name}; email prepared for ${request.notificationEmail} and callout added to schedule.`);
   createFile({
     moduleKey: "universalintake",
+    linkedModuleKeys: ["dispatch", "communications", "relationships", "properties", "jobs"],
+    sourceType: "serviceRequest",
+    sourceId: request.id,
+    customer: request.name,
     title: `${request.name} service request`,
     type: "Service request",
     owner: "Dispatch",
@@ -3051,6 +3134,10 @@ function addJobRecord(formData) {
   state.jobBoards = [job, ...state.jobBoards];
   createFile({
     moduleKey: "jobs",
+    linkedModuleKeys: job.linkedModules,
+    sourceType: "job",
+    sourceId: job.id,
+    customer: job.customer,
     title: `${job.jobId} ${job.title}`,
     type: "Job",
     owner: job.owner,
@@ -3060,6 +3147,53 @@ function addJobRecord(formData) {
     relatedJob: job.jobId,
     notes: `Stage: ${job.stage}\nCustomer: ${job.customer}\nProperty: ${job.property}\nNext action: ${job.nextAction}\nBlockers: ${job.blockers || "None"}`
   });
+  ensureWorkflowTasks([
+    {
+      title: `Collect required photos for ${job.jobId}`,
+      moduleKey: "photos",
+      relatedJob: job.jobId,
+      due: job.end,
+      priority: "High",
+      sourceType: "job",
+      sourceId: job.id
+    },
+    {
+      title: `Add first moisture log for ${job.jobId}`,
+      moduleKey: "drylogs",
+      relatedJob: job.jobId,
+      due: job.start,
+      priority: "High",
+      sourceType: "job",
+      sourceId: job.id
+    },
+    {
+      title: `Confirm equipment plan for ${job.jobId}`,
+      moduleKey: "equipment",
+      relatedJob: job.jobId,
+      due: job.start,
+      priority: "Medium",
+      sourceType: "job",
+      sourceId: job.id
+    },
+    {
+      title: `Track labor time for ${job.jobId}`,
+      moduleKey: "time",
+      relatedJob: job.jobId,
+      due: job.start,
+      priority: "Medium",
+      sourceType: "job",
+      sourceId: job.id
+    },
+    {
+      title: `Prepare deposit and invoice path for ${job.jobId}`,
+      moduleKey: "payments",
+      relatedJob: job.jobId,
+      due: job.end,
+      priority: job.blockers ? "High" : "Medium",
+      sourceType: "job",
+      sourceId: job.id
+    }
+  ]);
   addActivity(`Added job tracker record for ${job.jobId}.`);
   persist();
   render();
@@ -3395,12 +3529,32 @@ function localCommunityComment(postId, body) {
   return comment;
 }
 
+function mergeCommunityComment(postId, comment) {
+  if (!postId || !comment) return;
+  state.communityPosts = (state.communityPosts || []).map((post) => {
+    if (post.id !== postId) return post;
+    return {
+      ...post,
+      comments: mergeById([comment], Array.isArray(post.comments) ? post.comments : []),
+      updatedAt: comment.createdAt || new Date().toISOString()
+    };
+  });
+  persist();
+}
+
+function optionalFirebaseRead(promise, fallback = []) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => window.setTimeout(() => resolve(fallback), 2500))
+  ]).catch(() => fallback);
+}
+
 async function hydrateClientFirebaseData() {
   if (!state.firebase.enabled || !state.authSession) return;
   try {
     const [businessData, communityPosts] = await Promise.all([
-      fetchClientBusinessRecords().catch(() => []),
-      fetchClientCommunityPosts().catch(() => [])
+      optionalFirebaseRead(fetchClientBusinessRecords()),
+      optionalFirebaseRead(fetchClientCommunityPosts())
     ]);
     if (businessData.length) {
       state.businessData = mergeById(state.businessData || [], businessData);
@@ -3666,23 +3820,29 @@ async function createCommunityPost(formData) {
     franchiseIds: currentUserFranchiseIds()
   };
   let usedLocalFallback = false;
+  let updatedFromApi = false;
   try {
-    await apiRequest("/api/community/posts", {
+    const result = await apiRequest("/api/community/posts", {
       method: "POST",
       body: JSON.stringify(payload)
     });
+    if (result.post) {
+      state.communityPosts = mergeById([result.post], state.communityPosts || []);
+      updatedFromApi = true;
+    }
   } catch (error) {
     if (!isAdminCredentialGap(error)) throw error;
     try {
       const result = await createClientCommunityPost(payload);
       state.communityPosts = mergeById([result.post], state.communityPosts || []);
+      updatedFromApi = true;
     } catch (_fallbackError) {
       usedLocalFallback = true;
       localCommunityPost(payload);
     }
   }
   setToast("Board post published");
-  if (usedLocalFallback) {
+  if (usedLocalFallback || updatedFromApi) {
     render();
   } else {
     await refreshAccessContext().catch(() => hydrateClientFirebaseData());
@@ -3693,25 +3853,35 @@ async function addCommunityComment(formData) {
   const postId = String(formData.get("postId") || "").trim();
   const body = String(formData.get("body") || "").trim();
   let usedLocalFallback = false;
+  let updatedFromApi = false;
   try {
-    await apiRequest(`/api/community/posts/${encodeURIComponent(postId)}/comments`, {
+    const result = await apiRequest(`/api/community/posts/${encodeURIComponent(postId)}/comments`, {
       method: "POST",
       body: JSON.stringify({ body })
     });
+    if (result.post) {
+      state.communityPosts = mergeById([result.post], state.communityPosts || []);
+      updatedFromApi = true;
+    } else if (result.comment) {
+      mergeCommunityComment(postId, result.comment);
+      updatedFromApi = true;
+    }
   } catch (error) {
     if (!isAdminCredentialGap(error)) throw error;
     try {
-      await addClientCommunityComment(postId, {
+      const result = await addClientCommunityComment(postId, {
         body,
         roleId: currentRoleId()
       });
+      if (result?.comment) mergeCommunityComment(postId, result.comment);
+      updatedFromApi = Boolean(result?.comment);
     } catch (_fallbackError) {
       usedLocalFallback = true;
       localCommunityComment(postId, body);
     }
   }
   setToast("Comment added");
-  if (usedLocalFallback) {
+  if (usedLocalFallback || updatedFromApi) {
     render();
   } else {
     await refreshAccessContext().catch(() => hydrateClientFirebaseData());
@@ -3934,6 +4104,10 @@ function createJobPacket(jobId) {
   ].join("\n");
   createFile({
     moduleKey: "jobs",
+    linkedModuleKeys: job.linkedModules,
+    sourceType: "jobPacket",
+    sourceId: job.id,
+    customer: job.customer,
     title: `${job.jobId} job packet`,
     type: "Job packet",
     owner: job.owner,
@@ -3972,6 +4146,9 @@ function addDryLogRecord(formData) {
   if (job) updateDryLogGate(job.jobId);
   createFile({
     moduleKey: "drylogs",
+    linkedModuleKeys: ["jobs", "equipment", "payments", "photos", "defensibility", "evidencechain"],
+    sourceType: "dryLog",
+    sourceId: log.id,
     title: `${log.jobId} ${log.room} dry log`,
     type: "Dry log",
     owner: log.technician,
@@ -3988,6 +4165,34 @@ function addDryLogRecord(formData) {
       log.notes
     ].filter(Boolean).join("\n")
   });
+  ensureWorkflowTasks([
+    ...(dryLogGap(log) > 0
+      ? [
+          {
+            title: `Recheck ${log.room} moisture for ${log.jobId}`,
+            moduleKey: "drylogs",
+            relatedJob: log.jobId,
+            due: log.readingDate,
+            priority: dryLogGap(log) > 2 ? "High" : "Medium",
+            sourceType: "dryLog",
+            sourceId: log.id
+          }
+        ]
+      : []),
+    ...(equipmentIds.length
+      ? [
+          {
+            title: `Verify equipment billing support for ${log.jobId}`,
+            moduleKey: "payments",
+            relatedJob: log.jobId,
+            due: log.readingDate,
+            priority: "Medium",
+            sourceType: "dryLog",
+            sourceId: log.id
+          }
+        ]
+      : [])
+  ]);
   addActivity(`Added dry log for ${log.jobId} ${log.room}.`);
   persist();
   setToast("Dry log saved and job gate updated");
@@ -4013,6 +4218,10 @@ function createDryLogPacket(jobId) {
   ].join("\n");
   createFile({
     moduleKey: "drylogs",
+    linkedModuleKeys: ["jobs", "equipment", "payments", "photos", "defensibility", "evidencechain"],
+    sourceType: "dryLogPacket",
+    sourceId: job.id,
+    customer: job.customer,
     title: `${job.jobId} drying documentation packet`,
     type: "Dry log packet",
     owner: job.owner,
@@ -4064,6 +4273,10 @@ function createContactFile(contactId) {
   if (!contact) return;
   createFile({
     moduleKey: "relationships",
+    linkedModuleKeys: ["communications", "properties", "jobs", "payments"],
+    sourceType: "contact",
+    sourceId: contact.id,
+    customer: contact.name,
     title: `${contact.name} relationship file`,
     type: "Contact record",
     owner: "Relationship desk",
@@ -4135,6 +4348,9 @@ function createBranchFile(branchId) {
   if (!branch) return;
   createFile({
     moduleKey: "branches",
+    linkedModuleKeys: ["branchbench", "moduletoggles", "licensing", "globalindexes"],
+    sourceType: "branch",
+    sourceId: branch.id,
     title: `${branch.name} access profile`,
     type: "Branch access",
     owner: branch.manager,
@@ -4171,6 +4387,28 @@ function addPriceItem(formData) {
   };
   state.priceItems = [item, ...state.priceItems];
   applyHighestPricingPolicy();
+  createFile({
+    moduleKey: "pricing",
+    linkedModuleKeys: ["revenueengine", "payments", "defensibility", "accounting"],
+    sourceType: "priceItem",
+    sourceId: item.id,
+    amount: item.rate,
+    title: `${item.code} ${item.name}`,
+    type: "Price book item",
+    owner: "Estimator",
+    status: "Active",
+    priority: item.rate > item.cost ? "Medium" : "High",
+    due: "",
+    relatedJob: item.branch,
+    notes: [
+      `Category: ${item.category}`,
+      `Unit: ${item.unit}`,
+      `Rate: ${formatMoney(item.rate)}`,
+      `Cost: ${formatMoney(item.cost)}`,
+      `Branch: ${item.branch}`,
+      `Justification: ${item.justification || "Not entered"}`
+    ].join("\n")
+  });
   addActivity(`Added price book item ${item.code}.`);
   persist();
   setToast("Price item added");
@@ -4352,6 +4590,9 @@ async function processXactimateFile(file) {
       ];
       createFile({
         moduleKey: "pricing",
+        linkedModuleKeys: ["defensibility", "payments", "accounting", "revenueengine"],
+        sourceType: "xactimateImport",
+        sourceId: file.name,
         title: `${file.name} import review`,
         type: "Xactimate import",
         owner: "Estimator",
@@ -4390,6 +4631,25 @@ async function processXactimateFile(file) {
       },
       ...state.xactimateImports
     ];
+    createFile({
+      moduleKey: "pricing",
+      linkedModuleKeys: ["defensibility", "payments", "accounting", "revenueengine"],
+      sourceType: "xactimateImport",
+      sourceId: file.name,
+      amount: lines.reduce((sum, line) => sum + Number(line.qty || 1) * Number(line.rate || 0), 0),
+      title: `${file.name} Xactimate pricing import`,
+      type: "Xactimate import",
+      owner: "Estimator",
+      status: "Imported",
+      priority: "Medium",
+      due: today.toISOString().slice(0, 10),
+      relatedJob: state.estimateDraft.job,
+      notes: [
+        `${items.length} line items imported into the price book.`,
+        `Total source value: ${formatMoney(lines.reduce((sum, line) => sum + Number(line.qty || 1) * Number(line.rate || 0), 0))}`,
+        "Linked modules: pricing, defensibility, payments, accounting, and revenue engine."
+      ].join("\n")
+    });
     addActivity(`Imported ${items.length} Xactimate line items from ${file.name}.`);
     return { fileName: file.name, imported: items.length, captured: false };
   } catch {
@@ -4640,6 +4900,11 @@ function createEstimateInvoice() {
   ].join("\n");
   createFile({
     moduleKey: "payments",
+    linkedModuleKeys: ["pricing", "accounting", "revenueengine", "defensibility", "jobs"],
+    sourceType: "estimateInvoice",
+    sourceId: state.estimateDraft.estimateNo,
+    customer: state.estimateDraft.customer,
+    amount: estimateSubtotal(),
     title: `${state.estimateDraft.estimateNo} invoice request`,
     type: "Invoice",
     owner: state.estimateDraft.preparedBy || "Bookkeeping",
@@ -4649,6 +4914,28 @@ function createEstimateInvoice() {
     relatedJob: state.estimateDraft.job,
     notes
   });
+  ensureWorkflowTasks([
+    {
+      title: `Post ${state.estimateDraft.estimateNo} to accounting`,
+      moduleKey: "accounting",
+      relatedJob: state.estimateDraft.job,
+      due: today.toISOString().slice(0, 10),
+      priority: "High",
+      sourceType: "estimateInvoice",
+      sourceId: state.estimateDraft.estimateNo
+    },
+    {
+      title: `Review defensibility support for ${state.estimateDraft.estimateNo}`,
+      moduleKey: "defensibility",
+      relatedJob: state.estimateDraft.job,
+      due: today.toISOString().slice(0, 10),
+      priority: "Medium",
+      sourceType: "estimateInvoice",
+      sourceId: state.estimateDraft.estimateNo
+    }
+  ]);
+  persist();
+  render();
 }
 
 function createPaymentRequest(formData) {
@@ -4672,6 +4959,11 @@ function createPaymentRequest(formData) {
           : "Create card payment intent from payment processor backend.";
   createFile({
     moduleKey: "payments",
+    linkedModuleKeys: ["accounting", "revenueengine", "jobs", "relationships"],
+    sourceType: "paymentRequest",
+    sourceId: `${method}-${customer}-${job}-${Date.now()}`,
+    customer,
+    amount,
     title: `${method} payment request - ${customer}`,
     type: "Payment request",
     owner: "Bookkeeping",
@@ -4690,11 +4982,25 @@ function createPaymentRequest(formData) {
       "Security: never collect customer bank login credentials inside this app."
     ].join("\n")
   });
+  ensureWorkflowTask({
+    title: `Record ${method} payment status for ${customer}`,
+    moduleKey: "accounting",
+    relatedJob: job,
+    due: String(formData.get("due") || today.toISOString().slice(0, 10)),
+    priority: amount >= 1000 ? "High" : "Medium",
+    sourceType: "paymentRequest",
+    sourceId: `${method}-${customer}-${job}`
+  });
+  persist();
+  render();
 }
 
 function createPaymentRailSetup(method, route, detail) {
   createFile({
     moduleKey: "payments",
+    linkedModuleKeys: ["accounting", "integrations", "securitycenter"],
+    sourceType: "paymentRail",
+    sourceId: method,
     title: `${method} payment rail setup`,
     type: "Payment rail",
     owner: "Bookkeeping",
@@ -4725,6 +5031,9 @@ function connectQuickBooks() {
   };
   createFile({
     moduleKey: "accounting",
+    linkedModuleKeys: ["payments", "integrations", "reports", "globalindexes"],
+    sourceType: "quickBooksSetup",
+    sourceId: state.quickBooksConnection.realmId,
     title: "QuickBooks OAuth setup",
     type: "Integration setup",
     owner: "Bookkeeping",
@@ -4847,6 +5156,9 @@ function generateDefensibilityReview(formData) {
   ].join("\n");
   createFile({
     moduleKey: "defensibility",
+    linkedModuleKeys: ["pricing", "payments", "jobs", "supplement", "evidencechain"],
+    sourceType: "defensibilityReview",
+    sourceId: `${String(formData.get("estimateName") || "Estimate").trim()}-${String(formData.get("relatedJob") || "").trim()}`,
     title: `${String(formData.get("estimateName") || "Estimate")} defensibility review`,
     type: "Defensibility score",
     owner: "Estimator",
@@ -4879,6 +5191,9 @@ function generateSupplementPacket(formData) {
   saveGeneratedStandardsOutput(response, "Supplement rebuttal generated");
   createFile({
     moduleKey: "supplement",
+    linkedModuleKeys: ["pricing", "payments", "jobs", "defensibility", "evidencechain"],
+    sourceType: "supplementPacket",
+    sourceId: `${issue}-${String(formData.get("relatedJob") || "").trim()}`,
     title: `${issue} supplement packet`,
     type: "Supplement packet",
     owner: "Estimator",
@@ -5081,6 +5396,9 @@ function createWorkbenchRecord(formData) {
   ].join("\n");
   createFile({
     moduleKey: module.key,
+    linkedModuleKeys: config.links,
+    sourceType: "moduleWorkbench",
+    sourceId: `${module.key}-${Date.now()}`,
     title: subject || `${module.label} record`,
     type: config.fileType,
     owner: String(formData.get("owner") || "Office"),
@@ -5170,6 +5488,40 @@ async function addEquipmentDeployment(formData) {
     updatedAt: new Date().toISOString()
   };
   state.equipmentDeployments = [deployment, ...state.equipmentDeployments];
+  createFile({
+    moduleKey: "equipment",
+    linkedModuleKeys: ["jobs", "drylogs", "payments", "photos", "time"],
+    sourceType: "equipmentDeployment",
+    sourceId: deployment.id,
+    amount: equipmentCharge(deployment),
+    title: `${deployment.equipmentName} deployment - ${deployment.job || deployment.room || deployment.assetTag || "unassigned"}`,
+    type: "Equipment deployment",
+    owner: state.worker?.name || "Field operations",
+    status: deployment.status,
+    priority: deployment.billable ? "High" : "Medium",
+    due: today.toISOString().slice(0, 10),
+    relatedJob: deployment.job,
+    notes: [
+      `Asset tag: ${deployment.assetTag || "Not entered"}`,
+      `Room/address: ${deployment.room || deployment.address || "Not specified"}`,
+      `GPS: ${deployment.gpsLabel || "Not captured"}`,
+      `Billable: ${deployment.billable ? "Yes" : "No"}`,
+      `Rental support: ${deployment.rentalDays} days x ${formatMoney(deployment.dailyRate)} = ${formatMoney(equipmentCharge(deployment))}`,
+      `Invoice: ${deployment.invoiceNumber || "Not attached"}`,
+      deployment.notes
+    ].filter(Boolean).join("\n")
+  });
+  if (deployment.billable) {
+    ensureWorkflowTask({
+      title: `Create equipment invoice for ${deployment.equipmentName}`,
+      moduleKey: "payments",
+      relatedJob: deployment.job,
+      due: today.toISOString().slice(0, 10),
+      priority: "High",
+      sourceType: "equipmentDeployment",
+      sourceId: deployment.id
+    });
+  }
   addActivity(`${deployment.equipmentName} added to equipment GPS map and tied to ${deployment.invoiceNumber || "invoice draft"}.`);
   persist();
   setToast("Equipment location added");
@@ -5183,6 +5535,10 @@ function createEquipmentInvoice(deploymentId) {
   const title = `${deployment.invoiceNumber || "INV-EQUIPMENT"} ${deployment.equipmentName}`;
   const file = createFile({
     moduleKey: "payments",
+    linkedModuleKeys: ["equipment", "jobs", "accounting", "drylogs", "revenueengine"],
+    sourceType: "equipmentInvoice",
+    sourceId: deployment.id,
+    amount,
     title,
     type: "Invoice",
     owner: "Bookkeeping",
@@ -5237,6 +5593,26 @@ async function clockOut() {
   };
   state.timeEntries = [entry, ...state.timeEntries];
   state.clockSession = null;
+  createFile({
+    moduleKey: "time",
+    linkedModuleKeys: ["jobs", "payments", "reports", "closeout"],
+    sourceType: "timeEntry",
+    sourceId: entry.id,
+    title: `${entry.worker} labor time - ${entry.job}`,
+    type: "Labor time",
+    owner: entry.worker,
+    status: entry.billable ? "Billable" : "Complete",
+    priority: entry.billable ? "High" : "Medium",
+    due: today.toISOString().slice(0, 10),
+    relatedJob: entry.job,
+    notes: [
+      `Task: ${entry.task}`,
+      `Hours: ${entry.hours}`,
+      `Start GPS: ${entry.startGps?.label || "Not captured"}`,
+      `End GPS: ${entry.endGps?.label || "Not captured"}`,
+      `Billable: ${entry.billable ? "Yes" : "No"}`
+    ].join("\n")
+  });
   addActivity(`${entry.worker} clocked out with GPS.`);
   persist();
   setToast("Clocked out");
@@ -6282,6 +6658,7 @@ function renderFileCard(file) {
       </div>
       <h3>${escapeHtml(file.title)}</h3>
       <p>${escapeHtml(file.notes || "No notes yet.")}</p>
+      ${renderFileLinkedModuleChips(file)}
       <dl>
         <div><dt>Status</dt><dd>${escapeHtml(file.status)}</dd></div>
         <div><dt>Owner</dt><dd>${escapeHtml(file.owner)}</dd></div>
@@ -6297,7 +6674,7 @@ function renderFileCard(file) {
 }
 
 function renderFileDetail(module) {
-  const file = state.files.find((item) => item.id === state.selectedFileId && item.moduleKey === module.key);
+  const file = state.files.find((item) => item.id === state.selectedFileId && fileBelongsToModule(item, module.key));
   if (!file) return "";
   return `
     <section class="detail-panel">
@@ -6312,6 +6689,7 @@ function renderFileDetail(module) {
         <div><strong>${escapeHtml(formatDate(file.due))}</strong><span>Due</span></div>
         <div><strong>${escapeHtml(file.relatedJob || "None")}</strong><span>Related</span></div>
       </div>
+      ${renderFileLinkedModuleChips(file)}
       <div class="detail-actions">
         <button type="button" data-action="status-review" data-id="${file.id}">Needs review</button>
         <button type="button" data-action="status-active" data-id="${file.id}">Active</button>
@@ -6319,6 +6697,17 @@ function renderFileDetail(module) {
         <button type="button" data-action="delete-file" data-id="${file.id}">Delete</button>
       </div>
     </section>
+  `;
+}
+
+function renderFileLinkedModuleChips(file) {
+  const keys = fileLinkedModules(file);
+  if (!keys.length) return "";
+  return `
+    <div class="file-module-links">
+      <span>Also visible in</span>
+      <div class="workflow-links">${renderLinkedModuleChips(keys)}</div>
+    </div>
   `;
 }
 
