@@ -5298,6 +5298,15 @@ function renderAuthGate() {
   const passwordAllowed = (state.firebase.allowedSignInProviders || []).includes("password");
   const ownerEmails = (state.firebase.allowedLoginEmails || []).filter(Boolean);
   const ownerLabel = ownerEmails.length ? ownerEmails.join(", ") : "the Super Admin email";
+  const adminCredentialWarning = state.firebase.restAuthFallback
+    ? {
+        title: "Firebase Admin credentials still needed for contractor codes",
+        body: "Owner Google login can use secure Firebase REST token verification. Add FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY in Vercel to activate contractor code validation, invite management, Firestore-backed portals, and full admin datastore features."
+      }
+    : {
+        title: "Contractor code validation needs Firebase Admin credentials",
+        body: "Owner login and contractor code validation become live after FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY are added in Vercel."
+      };
   return `
     <section class="auth-gate">
       <div class="auth-card">
@@ -5306,7 +5315,7 @@ function renderAuthGate() {
         <h1>Sign in to Brothers OS</h1>
         <p>Google verifies identity; Brothers OS authorizes access separately. Owner access is restricted to ${escapeHtml(ownerLabel)}. Every other Google account needs an active ${escapeHtml(ttlLabel)} invite link and an individual access code, or the session is denied.</p>
         <div class="empty-state warning-state"><strong>Unapproved accounts are denied</strong><span>The Google button may open for any Google account, but the OS session is created only after the server approves the email, invite link, and contractor code.</span></div>
-        ${isAdminCredentialGap() ? `<div class="empty-state warning-state"><strong>Contractor code validation needs Firebase Admin credentials</strong><span>Owner login is locked now. Contractor and trial access-code validation becomes live after FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY are added in Vercel.</span></div>` : ""}
+        ${isAdminCredentialGap() ? `<div class="empty-state warning-state"><strong>${escapeHtml(adminCredentialWarning.title)}</strong><span>${escapeHtml(adminCredentialWarning.body)}</span></div>` : ""}
         ${accessTokenPresent ? `<div class="empty-state"><strong>Access link detected</strong><span>Sign in with the same Google email that requested access, then enter the contractor code if one was issued.</span></div>` : ""}
         <label><span>Contractor / trial access code</span><input data-field="login-access-code" name="accessCode" autocomplete="one-time-code" placeholder="CON-123ABC" /></label>
         <button type="button" data-action="firebase-google-login">${state.authLoading ? "Connecting..." : "Sign in with Google"}</button>
