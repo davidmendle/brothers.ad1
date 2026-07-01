@@ -7,6 +7,10 @@ function uniqueMatches(pattern) {
   return Array.from(new Set([...source.matchAll(pattern)].map((match) => match[1]))).sort();
 }
 
+function tagAttributes(pattern) {
+  return [...source.matchAll(pattern)].map((match) => match[1]);
+}
+
 describe("UI action inventory", () => {
   it("handles every rendered data-action value", () => {
     const renderedActions = uniqueMatches(/data-action=\"([^\"]+)\"/g);
@@ -35,6 +39,39 @@ describe("UI action inventory", () => {
 
     expect(renderedButtons.length).toBeGreaterThan(100);
     expect(inertButtons).toEqual([]);
+  });
+
+  it("keeps rendered buttons accessible by text or aria-label", () => {
+    const renderedButtons = [...source.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)];
+    const unlabeledButtons = renderedButtons
+      .filter(([, attributes, body]) => {
+        const bodySource = String(body || "");
+        const visibleOrDynamicText = bodySource.replace(/<[^>]+>/g, "").trim() || bodySource.includes("${");
+        return !/aria-label=/.test(attributes) && !visibleOrDynamicText;
+      })
+      .map(([, attributes]) => attributes.trim());
+
+    expect(renderedButtons.length).toBeGreaterThan(100);
+    expect(unlabeledButtons).toEqual([]);
+  });
+
+  it("renders role permissions from each role's own permission document", () => {
+    expect(source).toContain("function renderRolePermissionForms(editableRoles, permissionDocs)");
+    expect(source).toContain("rolePermissionsFor(permissionDocs, role.id)");
+    expect(source).not.toContain("editableRoles[0]");
+  });
+
+  it("keeps the legacy local login invite hidden when Firebase auth is active", () => {
+    expect(source).toContain("Secure login manager is active");
+    expect(source).toContain("state.firebase.enabled && state.authSession");
+  });
+
+  it("keeps module anchors wired through the router", () => {
+    const moduleAnchors = tagAttributes(/<a\b([^>]*href=\"#module\/[^>]*)>/g);
+    const unhandledAnchors = moduleAnchors.filter((attributes) => !/data-action=\"set-active\"/.test(attributes) || !/data-key=/.test(attributes));
+
+    expect(moduleAnchors.length).toBeGreaterThan(40);
+    expect(unhandledAnchors).toEqual([]);
   });
 
   it("filters admin-authored navigation and section URLs through shared guards", () => {

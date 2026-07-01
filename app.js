@@ -3336,6 +3336,22 @@ function upsertAccessRequest(request) {
   state.accessContext.accessRequests = mergeById([request], state.accessContext.accessRequests || []);
 }
 
+function upsertManagedUser(user) {
+  if (!user) return;
+  state.accessContext = state.accessContext || {};
+  state.accessContext.users = mergeById([user], state.accessContext.users || []);
+  state.teamMembers = mergeById([mapUserToTeamMember(user)], state.teamMembers || []);
+}
+
+function removeManagedUser(uid) {
+  if (!uid) return;
+  const matchesUid = (item) => String(item?.uid || item?.id || "") === String(uid);
+  if (state.accessContext?.users) {
+    state.accessContext.users = state.accessContext.users.filter((user) => !matchesUid(user));
+  }
+  state.teamMembers = (state.teamMembers || []).filter((member) => !matchesUid(member));
+}
+
 function localCommunityPost(payload) {
   const now = new Date().toISOString();
   const post = {
@@ -3719,21 +3735,9 @@ async function createSecureUser(formData) {
     method: "POST",
     body: JSON.stringify(payload)
   });
-  state.teamMembers = [
-    {
-      id: result.user.uid,
-      name: result.user.displayName,
-      email: result.user.email,
-      role: result.user.roleId,
-      accountType: result.user.roleId,
-      access: result.user.roleId,
-      permissions: [],
-      status: result.user.status || "Active"
-    },
-    ...state.teamMembers
-  ];
-  setToast("Firebase user created");
-  await refreshAccessContext();
+  upsertManagedUser(result.user);
+  setToast("Firebase user created and added to managed users");
+  await refreshAccessContext().catch(() => render());
 }
 
 async function saveRolePermissions(formData) {
@@ -3854,12 +3858,13 @@ function mapUserToTeamMember(member) {
 
 async function updateSecureUser(payload) {
   if (!payload.uid) throw new Error("User id is required.");
-  await apiRequest(`/api/rbac/users/${encodeURIComponent(payload.uid)}`, {
+  const result = await apiRequest(`/api/rbac/users/${encodeURIComponent(payload.uid)}`, {
     method: "PATCH",
     body: JSON.stringify(payload)
   });
+  upsertManagedUser(result.user || payload);
   setToast("User updated");
-  await refreshAccessContext();
+  await refreshAccessContext().catch(() => render());
 }
 
 async function resetSecureUserPermissions(uid) {
@@ -3876,8 +3881,9 @@ async function deleteSecureUser(uid) {
     method: "DELETE",
     body: JSON.stringify({})
   });
+  removeManagedUser(uid);
   setToast("User removed");
-  await refreshAccessContext();
+  await refreshAccessContext().catch(() => render());
 }
 
 async function uploadAdminAssetFile(file) {
@@ -8252,7 +8258,7 @@ function renderTeamModule(module) {
         </div>
       </div>
       <div class="metric-strip">
-        <div><strong>${state.teamMembers.length}</strong><span>Users</span></div>
+        <div><strong>${displayedUsers.length}</strong><span>Users</span></div>
         <div><strong>${state.tasks.filter((task) => task.status !== "Complete").length}</strong><span>Open tasks</span></div>
         <div><strong>${state.tasks.filter((task) => task.priority === "High").length}</strong><span>High priority</span></div>
       </div>
@@ -8262,7 +8268,7 @@ function renderTeamModule(module) {
     <section class="team-layout">
       <div class="panel">
         <div class="panel-head"><div><h2>Owner-created logins</h2><p>Create user access and assign module permissions.</p></div></div>
-        ${renderTeamForm()}
+        ${state.firebase.enabled && state.authSession ? `<div class="empty-state"><strong>Secure login manager is active</strong><span>Use the User Login Manager above to create Firebase users, issue invite links, and control module access.</span></div>` : renderTeamForm()}
         <div class="team-grid">${displayedUsers.map(renderTeamMemberCard).join("")}</div>
       </div>
       <div class="panel">
@@ -8282,6 +8288,7 @@ function renderRbacAdminPanel(options = {}) {
   const roles = state.accessContext?.roles || [];
   const permissionDocs = state.accessContext?.permissions || [];
   const editableRoles = roles.filter((role) => role.id && role.id !== "super_admin");
+  const assignableRoles = editableRoles.length ? editableRoles : roles.filter((role) => role.id !== "super_admin");
   const managedUsers = (state.accessContext?.users || []).map(mapUserToTeamMember);
   const auditLogs = state.accessContext?.auditLogs || [];
   const accessRequests = state.accessContext?.accessRequests || [];
@@ -8304,7 +8311,7 @@ function renderRbacAdminPanel(options = {}) {
             <label><span>Name</span><input name="displayName" required placeholder="Full name" /></label>
             <label><span>Email</span><input name="email" type="email" required placeholder="user@company.com" /></label>
             <label><span>Password</span><input name="password" type="password" required placeholder="Temporary password" /></label>
-            <label><span>Role</span><select name="roleId">${roles.map((role) => `<option value="${role.id}">${escapeHtml(role.label || role.id)}</option>`).join("")}</select></label>
+            <label><span>Role</span><select name="roleId">${assignableRoles.map((role) => `<option value="${role.id}">${escapeHtml(role.label || role.id)}</option>`).join("")}</select></label>
             <label><span>Company id</span><input name="companyId" placeholder="default-company" /></label>
             <label><span>Franchise ids</span><input name="franchiseIds" placeholder="franchise-a,franchise-b" /></label>
             <label><span>Contractor id</span><input name="contractorId" placeholder="contractor-company" /></label>
@@ -8315,31 +8322,11 @@ function renderRbacAdminPanel(options = {}) {
           <button type="submit">Create Firebase user</button>
         </form>
       ` : ""}
-      ${canDo("manageAccessGrants") ? renderAccessGrantPanel(accessRequests, accessGrants, roles) : ""}
-      ${canDo("manageRolePermissions") ? `
-        <form class="stack-form inline-section" data-form="role-permissions">
-          <h3>Role permission editor</h3>
-          <div class="form-grid">
-            <label><span>Role</span><select name="roleId">${editableRoles.map((role) => `<option value="${role.id}">${escapeHtml(role.label || role.id)}</option>`).join("")}</select></label>
-            <label><span>Visible tabs</span><input name="allowedTabs" placeholder="daily,team,jobs,reports" /></label>
-            <label><span>Visible pages</span><input name="allowedPages" placeholder="daily,team,jobs,reports" /></label>
-            <label><span>Hidden sections</span><input name="hiddenSections" placeholder="daily-performance,team-access-panel" /></label>
-          </div>
-          <fieldset class="source-picker compact-picker">
-            <legend>Role actions</legend>
-            ${rbacActionKeys
-              .map((action) => {
-                const isEnabled = permissionDocs.find((doc) => doc.roleId === editableRoles[0]?.id)?.actions?.[action];
-                return `<label class="source-check"><input name="actions" type="checkbox" value="${action}" ${isEnabled ? "checked" : ""} /><span><strong>${escapeHtml(action)}</strong><small>Permission flag</small></span></label>`;
-              })
-              .join("")}
-          </fieldset>
-          <button type="submit">Save role permissions</button>
-        </form>
-      ` : ""}
-      ${managedUsers.length ? `
+      ${canDo("manageAccessGrants") ? renderAccessGrantPanel(accessRequests, accessGrants, assignableRoles) : ""}
+      ${canDo("manageRolePermissions") ? renderRolePermissionForms(editableRoles, permissionDocs) : ""}
+      ${canDo("manageUsers") ? `
         <div class="panel-head"><div><h3>Managed users</h3><p>Update roles, disable accounts, reset access, or remove users.</p></div></div>
-        <div class="team-grid">${managedUsers.map(renderTeamMemberCard).join("")}</div>
+        ${managedUsers.length ? `<div class="team-grid">${managedUsers.map(renderTeamMemberCard).join("")}</div>` : `<div class="empty-state"><strong>No managed users loaded yet</strong><span>Created Firebase users and accepted invite accounts will appear here after the server saves them.</span></div>`}
       ` : ""}
       ${auditLogs.length ? `
         <div class="panel-head"><div><h3>Audit logs</h3><p>Recent security, permissions, user, and content changes.</p></div></div>
@@ -8348,6 +8335,49 @@ function renderRbacAdminPanel(options = {}) {
         </div>
       ` : ""}
     </section>
+  `;
+}
+
+function rolePermissionsFor(permissionDocs, roleId) {
+  return permissionDocs.find((doc) => doc.roleId === roleId) || {};
+}
+
+function accessListValue(config, key) {
+  return Array.isArray(config?.[key]) ? config[key].join(",") : "";
+}
+
+function renderRolePermissionForms(editableRoles, permissionDocs) {
+  if (!editableRoles.length) {
+    return `<div class="empty-state"><strong>No editable roles loaded</strong><span>Run RBAC bootstrap after Firebase Admin credentials are configured.</span></div>`;
+  }
+  return `
+    <div class="inline-section">
+      <div class="panel-head"><div><h3>Role permission editor</h3><p>Edit each role separately so module visibility, hidden sections, and actions save to the correct access level.</p></div></div>
+      <div class="role-permission-grid">
+        ${editableRoles.map((role) => {
+          const permissions = rolePermissionsFor(permissionDocs, role.id);
+          const actions = permissions.actions || {};
+          return `
+            <form class="stack-form inline-section" data-form="role-permissions">
+              <h3>${escapeHtml(role.label || role.id)}</h3>
+              <input type="hidden" name="roleId" value="${escapeHtml(role.id)}" />
+              <div class="form-grid">
+                <label><span>Visible tabs</span><input name="allowedTabs" value="${escapeHtml(accessListValue(permissions.tabs, "allowed"))}" placeholder="daily,team,jobs,reports" /></label>
+                <label><span>Visible pages</span><input name="allowedPages" value="${escapeHtml(accessListValue(permissions.pages, "allowed"))}" placeholder="daily,team,jobs,reports" /></label>
+                <label><span>Hidden sections</span><input name="hiddenSections" value="${escapeHtml(accessListValue(permissions.sections, "hidden"))}" placeholder="daily-performance,team-access-panel" /></label>
+              </div>
+              <fieldset class="source-picker compact-picker">
+                <legend>${escapeHtml(role.label || role.id)} actions</legend>
+                ${rbacActionKeys
+                  .map((action) => `<label class="source-check"><input name="actions" type="checkbox" value="${action}" ${actions[action] ? "checked" : ""} /><span><strong>${escapeHtml(action)}</strong><small>Permission flag</small></span></label>`)
+                  .join("")}
+              </fieldset>
+              <button type="submit">Save ${escapeHtml(role.label || role.id)} permissions</button>
+            </form>
+          `;
+        }).join("")}
+      </div>
+    </div>
   `;
 }
 
@@ -9252,6 +9282,7 @@ function renderAdminEditOverlay() {
 function renderUserManageModal() {
   const member = (state.accessContext?.users || []).find((user) => (user.uid || user.id) === state.modal.userId);
   const roles = state.accessContext?.roles || [];
+  const selectableRoles = roles.filter((role) => role.id !== "super_admin" || role.id === member?.roleId);
   if (!member) {
     return modalShell(`
       <div class="modal-head">
@@ -9269,7 +9300,7 @@ function renderUserManageModal() {
       <input type="hidden" name="uid" value="${escapeHtml(member.uid || member.id)}" />
       <div class="form-grid">
         <label><span>Display name</span><input name="displayName" value="${escapeHtml(member.displayName || "")}" /></label>
-        <label><span>Role</span><select name="roleId">${roles.map((role) => `<option value="${role.id}"${role.id === member.roleId ? " selected" : ""}>${escapeHtml(role.label || role.id)}</option>`).join("")}</select></label>
+        <label><span>Role</span><select name="roleId">${selectableRoles.map((role) => `<option value="${role.id}"${role.id === member.roleId ? " selected" : ""}>${escapeHtml(role.label || role.id)}</option>`).join("")}</select></label>
         <label><span>Company id</span><input name="companyId" value="${escapeHtml(member.companyId || "")}" /></label>
         <label><span>Franchise ids</span><input name="franchiseIds" value="${escapeHtml((member.franchiseIds || []).join(","))}" /></label>
         <label><span>Contractor id</span><input name="contractorId" value="${escapeHtml(member.contractorId || "")}" /></label>

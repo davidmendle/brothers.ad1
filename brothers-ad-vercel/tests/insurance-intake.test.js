@@ -847,6 +847,267 @@ describe("insurance intake logic", () => {
     expect(fakeDb.dump("osUsers")["worker-uid"].roleId).toBe("worker");
   });
 
+  it("returns created Firebase users in the managed account list", async () => {
+    process.env.SUPER_ADMIN_EMAILS = "david@brothersrestoration.org";
+    const authUsers = new Map([
+      ["owner-uid", {
+        uid: "owner-uid",
+        email: "david@brothersrestoration.org",
+        displayName: "David",
+        disabled: false
+      }]
+    ]);
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "owner-uid": {
+          email: "david@brothersrestoration.org",
+          displayName: "David",
+          roleId: "super_admin",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async () => ({
+            uid: "owner-uid",
+            email: "david@brothersrestoration.org",
+            email_verified: true,
+            name: "David",
+            firebase: { sign_in_provider: "google.com" }
+          }),
+          getUser: async (uid) => authUsers.get(uid),
+          createUser: async (payload) => {
+            const user = {
+              uid: "created-worker-uid",
+              email: payload.email,
+              displayName: payload.displayName,
+              disabled: Boolean(payload.disabled)
+            };
+            authUsers.set(user.uid, user);
+            return user;
+          },
+          setCustomUserClaims: async () => undefined,
+          listUsers: async () => ({ users: Array.from(authUsers.values()) })
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const createResponse = await request(app)
+      .post("/api/rbac/users")
+      .set("Cookie", ["brothers_os_session=session-cookie"])
+      .send({
+        displayName: "Created Worker",
+        email: "created.worker@example.com",
+        password: "temporary-password-123",
+        roleId: "worker",
+        companyId: "default-company",
+        franchiseIds: ["default-franchise"]
+      });
+    const listResponse = await request(app)
+      .get("/api/rbac/users")
+      .set("Cookie", ["brothers_os_session=session-cookie"]);
+
+    expect(createResponse.status).toBe(201);
+    expect(createResponse.body.user).toMatchObject({
+      uid: "created-worker-uid",
+      email: "created.worker@example.com",
+      roleId: "worker"
+    });
+    expect(listResponse.status).toBe(200);
+    expect(listResponse.body.users.map((user) => user.email)).toContain("created.worker@example.com");
+    expect(fakeDb.dump("osUsers")["created-worker-uid"].roleId).toBe("worker");
+  });
+
+  it("filters managed account lists to a franchise owner's assigned scope", async () => {
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "franchise-owner-uid": {
+          email: "franchise@example.com",
+          displayName: "Franchise Owner",
+          roleId: "franchise_owner",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        },
+        "worker-same-uid": {
+          email: "same-worker@example.com",
+          displayName: "Same Franchise Worker",
+          roleId: "worker",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        },
+        "worker-other-uid": {
+          email: "other-worker@example.com",
+          displayName: "Other Franchise Worker",
+          roleId: "worker",
+          companyId: "default-company",
+          franchiseIds: ["other-franchise"],
+          status: "active",
+          disabled: false
+        },
+        "business-owner-uid": {
+          email: "business-owner@example.com",
+          displayName: "Business Owner",
+          roleId: "business_owner",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async () => ({
+            uid: "franchise-owner-uid",
+            email: "franchise@example.com",
+            email_verified: true,
+            name: "Franchise Owner",
+            firebase: { sign_in_provider: "google.com" }
+          }),
+          getUser: async (uid) => ({
+            uid,
+            email: fakeDb.dump("osUsers")[uid]?.email,
+            displayName: fakeDb.dump("osUsers")[uid]?.displayName,
+            disabled: false
+          }),
+          setCustomUserClaims: async () => undefined,
+          listUsers: async () => ({
+            users: Object.entries(fakeDb.dump("osUsers")).map(([uid, user]) => ({
+              uid,
+              email: user.email,
+              displayName: user.displayName,
+              disabled: false
+            }))
+          })
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .get("/api/rbac/users")
+      .set("Cookie", ["brothers_os_session=session-cookie"]);
+
+    expect(response.status).toBe(200);
+    expect(response.body.users.map((user) => user.email).sort()).toEqual([
+      "franchise@example.com",
+      "same-worker@example.com"
+    ]);
+  });
+
+  it("rejects Super Admin assignment for any email outside the owner allowlist", async () => {
+    process.env.SUPER_ADMIN_EMAILS = "david@brothersrestoration.org";
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "owner-uid": {
+          email: "david@brothersrestoration.org",
+          displayName: "David",
+          roleId: "super_admin",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async () => ({
+            uid: "owner-uid",
+            email: "david@brothersrestoration.org",
+            email_verified: true,
+            name: "David",
+            firebase: { sign_in_provider: "google.com" }
+          }),
+          getUser: async () => ({
+            uid: "owner-uid",
+            email: "david@brothersrestoration.org",
+            displayName: "David",
+            disabled: false
+          }),
+          createUser: async () => {
+            throw new Error("createUser should not be called");
+          },
+          setCustomUserClaims: async () => undefined
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .post("/api/rbac/users")
+      .set("Cookie", ["brothers_os_session=session-cookie"])
+      .send({
+        displayName: "Second Admin",
+        email: "other-admin@example.com",
+        password: "temporary-password-123",
+        roleId: "super_admin"
+      });
+
+    expect(response.status).toBe(403);
+    expect(response.body.message).toMatch(/Super Admin access is restricted/i);
+  });
+
   it("uses production-safe domain defaults without deriving admin credentials on Vercel", () => {
     delete process.env.ALLOWED_WEBSITE_ORIGIN;
     delete process.env.ADMIN_EMAILS;

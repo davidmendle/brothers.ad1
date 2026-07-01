@@ -764,6 +764,45 @@ function createFirebaseRbacRouter(deps) {
     return { ok: true };
   }
 
+  function scopeOverlaps(session, userRecord = {}) {
+    const sessionCompanyId = String(session?.companyId || "").trim();
+    const userCompanyId = String(userRecord.companyId || "").trim();
+    const sessionFranchiseIds = new Set(parseFranchiseIds(session?.franchiseIds || []));
+    const userFranchiseIds = parseFranchiseIds(userRecord.franchiseIds || []);
+    const companyScope = session?.permissions?.dataAccess?.company || "none";
+    const franchiseScope = session?.permissions?.dataAccess?.franchises || "none";
+    const workerScope = session?.permissions?.dataAccess?.workers || "none";
+    const sameCompany = Boolean(sessionCompanyId && userCompanyId && sessionCompanyId === userCompanyId);
+    const sameFranchise = Boolean(sessionFranchiseIds.size && userFranchiseIds.some((id) => sessionFranchiseIds.has(id)));
+    const sameContractor = Boolean(session?.contractorId && userRecord.contractorId && session.contractorId === userRecord.contractorId);
+
+    if (workerScope === "all") return true;
+    if (workerScope === "self") return sameContractor;
+    if (workerScope !== "assigned") return false;
+    if (companyScope === "assigned" && sameCompany) return true;
+    if (franchiseScope === "assigned" && sameFranchise) return true;
+    return sameContractor;
+  }
+
+  function canViewUserRecord(session, userRecord = {}) {
+    if (!session || !userRecord) return false;
+    if (isSuperAdminSession(session)) return true;
+    const sessionEmail = normalizeEmail(session.email);
+    const userEmail = normalizeEmail(userRecord.email);
+    const isOwnRecord = (session.uid && (session.uid === userRecord.uid || session.uid === userRecord.id))
+      || (sessionEmail && userEmail && sessionEmail === userEmail);
+    if (isOwnRecord) return true;
+    if (!sessionHasAction(session, "manageUsers")) return false;
+    if (roleRank(userRecord.roleId) >= roleRank(session.roleId)) return false;
+    return scopeOverlaps(session, userRecord);
+  }
+
+  function validateSuperAdminEmailAssignment(roleId, email) {
+    if (String(roleId || "").trim() !== "super_admin") return { ok: true };
+    if (isSuperAdminEmail(email)) return { ok: true };
+    return { ok: false, statusCode: 403, message: "Super Admin access is restricted to david@brothersrestoration.org." };
+  }
+
   function validateSensitiveUserMutation(session, payload, current = {}) {
     const roleRequested = Object.prototype.hasOwnProperty.call(payload, "roleId");
     const nextRoleId = String(roleRequested ? payload.roleId : current.roleId || "worker").trim();
@@ -963,7 +1002,9 @@ function createFirebaseRbacRouter(deps) {
       pageSections: sections,
       companySettings: companySnapshot.exists ? companySnapshot.data() : getDefaultCompanySettings(),
       franchiseSettings: franchiseSnapshot.docs.map((doc) => doc.data()),
-      users: usersSnapshot.docs.map((doc) => doc.data()),
+      users: usersSnapshot.docs
+        .map((doc) => normalizeUserRecord(doc.id, null, doc.data()))
+        .filter((user) => canViewUserRecord(session, user)),
       auditLogs: auditSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })),
       businessData: businessSnapshot.docs.map(docDataWithId).filter((record) => canViewBusinessRecord(session, record)),
       accessRequests: accessRequestsSnapshot.docs.map(docDataWithId),
@@ -1103,6 +1144,8 @@ function createFirebaseRbacRouter(deps) {
     const companyName = String(request.body?.companyName || "").trim();
     const requestedRole = String(request.body?.roleId || "contractor").trim();
     if (!email || !email.includes("@")) return jsonError(response, 400, "A valid email is required.");
+    const superAdminRequest = validateSuperAdminEmailAssignment(requestedRole, email);
+    if (!superAdminRequest.ok) return jsonError(response, superAdminRequest.statusCode, superAdminRequest.message);
 
     const requestDoc = {
       email,
@@ -1136,6 +1179,8 @@ function createFirebaseRbacRouter(deps) {
     const email = normalizeEmail(request.body?.email);
     if (!email || !email.includes("@")) return jsonError(response, 400, "A valid email is required.");
     const roleId = String(request.body?.roleId || "contractor").trim();
+    const superAdminRequest = validateSuperAdminEmailAssignment(roleId, email);
+    if (!superAdminRequest.ok) return jsonError(response, superAdminRequest.statusCode, superAdminRequest.message);
     const ttlHours = clampAccessHours(request.body?.ttlHours);
     const token = createToken();
     const accessCode = createAccessCode(roleId);
@@ -1162,6 +1207,15 @@ function createFirebaseRbacRouter(deps) {
       createdByEmail: request.osSession.email,
       requestId: String(request.body?.requestId || "").trim()
     };
+    const mutationResult = validateSensitiveUserMutation(request.osSession, {
+      roleId,
+      companyId: grant.companyId,
+      franchiseIds: grant.franchiseIds,
+      contractorId: grant.contractorId,
+      accessExpiresAt: grant.expiresAt,
+      accessScope: grant.accessScope
+    });
+    if (!mutationResult.ok) return jsonError(response, mutationResult.statusCode, mutationResult.message);
     const grantRef = await db.collection(COLLECTIONS.accessGrants).add(grant);
     const accessLink = buildAccessLink(request, token);
     const shouldSendEmail = request.body?.sendEmail !== false;
@@ -1317,10 +1371,12 @@ function createFirebaseRbacRouter(deps) {
     const db = getFirestore();
     const [firestoreUsers, authUsers] = await Promise.all([
       db.collection(COLLECTIONS.users).get(),
-      auth.listUsers(1000)
+      typeof auth.listUsers === "function" ? auth.listUsers(1000) : Promise.resolve({ users: [] })
     ]);
     const authMap = new Map(authUsers.users.map((user) => [user.uid, user]));
-    const users = firestoreUsers.docs.map((doc) => normalizeUserRecord(doc.id, authMap.get(doc.id), doc.data()));
+    const users = firestoreUsers.docs
+      .map((doc) => normalizeUserRecord(doc.id, authMap.get(doc.id), doc.data()))
+      .filter((user) => canViewUserRecord(request.osSession, user));
     return response.json({ success: true, users });
   });
 
@@ -1340,10 +1396,13 @@ function createFirebaseRbacRouter(deps) {
       : requestedFranchiseIds;
 
     if (!email || !password) return jsonError(response, 400, "Email and password are required.");
+    const superAdminRequest = validateSuperAdminEmailAssignment(roleId, email);
+    if (!superAdminRequest.ok) return jsonError(response, superAdminRequest.statusCode, superAdminRequest.message);
     const mutationPayload = {
       roleId,
       companyId,
-      franchiseIds
+      franchiseIds,
+      contractorId: String(request.body?.contractorId || "").trim()
     };
     if (accessCode) mutationPayload.accessCode = accessCode;
     if (request.body?.accessExpiresAt) mutationPayload.accessExpiresAt = request.body.accessExpiresAt;
@@ -1397,6 +1456,13 @@ function createFirebaseRbacRouter(deps) {
     const snapshot = await userRef.get();
     if (!snapshot.exists) return jsonError(response, 404, "User not found.");
     const currentData = snapshot.data() || {};
+    if (!canViewUserRecord(request.osSession, normalizeUserRecord(uid, null, currentData))) {
+      return jsonError(response, 403, "You can manage users only inside your assigned scope.");
+    }
+    const nextRoleId = Object.prototype.hasOwnProperty.call(updates, "roleId") ? updates.roleId : currentData.roleId;
+    const nextEmail = updates.email || currentData.email;
+    const superAdminRequest = validateSuperAdminEmailAssignment(nextRoleId, nextEmail);
+    if (!superAdminRequest.ok) return jsonError(response, superAdminRequest.statusCode, superAdminRequest.message);
     const mutationResult = validateSensitiveUserMutation(request.osSession, updates, currentData);
     if (!mutationResult.ok) return jsonError(response, mutationResult.statusCode, mutationResult.message);
 
@@ -1453,6 +1519,11 @@ function createFirebaseRbacRouter(deps) {
     if (!firebaseAdminDataStoreConfigured()) return adminDataStoreRequired(response);
     const db = getFirestore();
     const uid = request.params.uid;
+    const snapshot = await db.collection(COLLECTIONS.users).doc(uid).get();
+    if (!snapshot.exists) return jsonError(response, 404, "User not found.");
+    if (!canViewUserRecord(request.osSession, normalizeUserRecord(uid, null, snapshot.data()))) {
+      return jsonError(response, 403, "You can manage users only inside your assigned scope.");
+    }
     await db.collection(COLLECTIONS.users).doc(uid).set({
       permissionsOverride: {},
       visibleTabIds: [],
@@ -1475,6 +1546,11 @@ function createFirebaseRbacRouter(deps) {
     const auth = getFirebaseAuth();
     const db = getFirestore();
     const uid = request.params.uid;
+    const snapshot = await db.collection(COLLECTIONS.users).doc(uid).get();
+    if (!snapshot.exists) return jsonError(response, 404, "User not found.");
+    if (!canViewUserRecord(request.osSession, normalizeUserRecord(uid, null, snapshot.data()))) {
+      return jsonError(response, 403, "You can manage users only inside your assigned scope.");
+    }
     await db.collection(COLLECTIONS.users).doc(uid).delete();
     await auth.deleteUser(uid);
     await writeAuditLog(db, {
