@@ -20,6 +20,31 @@ describe("UI action inventory", () => {
     expect(missing).toEqual([]);
   });
 
+  it("handles every rendered data-form value", () => {
+    const renderedForms = uniqueMatches(/data-form=\"([^\"]+)\"/g);
+    const handledForms = uniqueMatches(/if \(type === \"([^\"]+)\"\)/g);
+    const missing = renderedForms.filter((form) => !handledForms.includes(form));
+
+    expect(renderedForms.length).toBeGreaterThan(30);
+    expect(missing).toEqual([]);
+  });
+
+  it("does not render inert buttons", () => {
+    const renderedButtons = [...source.matchAll(/<button\b([^>]*)>/g)].map((match) => match[1]);
+    const inertButtons = renderedButtons.filter((attributes) => !/data-action=/.test(attributes) && !/type=\"submit\"/.test(attributes));
+
+    expect(renderedButtons.length).toBeGreaterThan(100);
+    expect(inertButtons).toEqual([]);
+  });
+
+  it("filters admin-authored navigation and section URLs through shared guards", () => {
+    expect(source).toContain('import { normalizeSectionButtonUrl } from "./ui-security.js";');
+    expect(source).toContain("function renderModuleButton(key, fallback = \"\")");
+    expect(source).toContain("function renderModuleTextLink(key, fallback = \"\", className = \"text-link\")");
+    expect(source).toContain("normalizeSectionButtonUrl(button.url, { allowedModuleKeys })");
+    expect(source).toContain("normalizeSectionButtonUrl(rawButtonUrl, { allowedModuleKeys: modules.map((module) => module.key) })");
+  });
+
   it("keeps the communication board and global index modules routable", () => {
     expect(source).toContain('if (module.key === "communications") return renderCommunicationsModule(module);');
     expect(source).toContain('if (module.key === "globalindexes") return renderGlobalIndexesModule(module);');

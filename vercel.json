@@ -23,6 +23,10 @@
       "use": "@vercel/static"
     },
     {
+      "src": "ui-security.js",
+      "use": "@vercel/static"
+    },
+    {
       "src": "module-data.js",
       "use": "@vercel/static"
     },

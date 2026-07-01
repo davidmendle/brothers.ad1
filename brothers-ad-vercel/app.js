@@ -12,6 +12,7 @@ import {
   logoutFirebaseSession
 } from "./firebase-client.js";
 import { brothersLogoDataUrl } from "./logo-data.js";
+import { normalizeSectionButtonUrl } from "./ui-security.js";
 
 const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES : [];
 const storageKey = "brothers-os-workspace-v2";
@@ -80,37 +81,43 @@ const categoryLabels = {
 const taskTypeGroups = [
   {
     id: "command",
-    label: "Command and Access",
+    label: "Command, Access, and Admin",
+    description: "Owner-only controls, launch status, security, user access, and global visibility.",
     categories: ["core", "security", "platform"],
     keys: ["daily", "launchcenter", "accessadmin", "globalindexes", "settings", "securitycenter", "auditlog", "datamodel", "sessiondevices", "trustsafety"]
   },
   {
     id: "jobs-field",
-    label: "Jobs and Field Work",
+    label: "Jobs, Field, and Dispatch",
+    description: "Intake, job tracking, drying, routes, equipment, photos, properties, and field execution.",
     categories: ["jobs", "field", "dispatch", "property"],
     keys: ["universalintake", "insurance", "jobs", "workorders", "dispatch", "routeplanner", "drylogs", "time", "equipment", "photos", "fieldmobile", "properties", "sketch"]
   },
   {
     id: "money",
     label: "Money, Pricing, and Invoices",
+    description: "Pricing, supplements, revenue files, payments, accounting, and proof of value.",
     categories: ["revenue", "finance"],
     keys: ["pricing", "supplement", "revenueengine", "justification", "evidencechain", "payments", "accounting", "proofvalue"]
   },
   {
     id: "people",
-    label: "People and Contractors",
+    label: "People, Contractors, and Board",
+    description: "Team access, contractor portals, internal posts, vendors, training, contracts, and liens.",
     categories: ["training", "vendors", "legal"],
     keys: ["team", "contractorportal", "communications", "vendors", "marketplace", "partnerscore", "training", "sops", "certbadge", "contracts", "liens"]
   },
   {
     id: "compliance",
     label: "Compliance, Documents, and Closeout",
+    description: "Defensibility, standards, code checks, forms, closeout, reviews, safety, and warranty.",
     categories: ["compliance", "documents"],
     keys: ["defensibility", "compliance", "nationalcodes", "safetyintel", "forms", "closeout", "reviews", "warranty"]
   },
   {
     id: "growth",
     label: "Growth, Reports, and Strategy",
+    description: "Business health, licensing, subscriptions, branches, AI review, reports, and integrations.",
     categories: ["reports", "strategy", "marketing", "ai", "branch"],
     keys: ["reports", "businesshealth", "licensing", "subscriptionbilling", "featuregates", "planmatrix", "setupwizard", "leads", "campaigns", "aicopilots", "aireview", "branches", "moduletoggles", "integrations"]
   }
@@ -1607,12 +1614,12 @@ function renderTaskTypeModuleDirectory() {
     <section class="module-directory-panel">
       <div class="panel-head">
         <div>
-          <h2>Module directory by task type</h2>
-          <p>Scan every available module in fewer rows, sorted by the work you are trying to do.</p>
+          <h2>Module map</h2>
+          <p>All available modules are grouped by task type so owners, admins, and contractors can find the right workspace without hunting through the sidebar.</p>
         </div>
         <div class="source-status">
-          <span>${available.length} available</span>
-          <span>${groups.length} task types</span>
+          <span>${available.length} modules</span>
+          <span>${groups.length} task groups</span>
         </div>
       </div>
       <div class="module-directory-grid">
@@ -1629,6 +1636,7 @@ function renderTaskTypeGroup(group) {
         <strong>${escapeHtml(group.label)}</strong>
         <span>${group.modules.length}</span>
       </div>
+      ${group.description ? `<p class="task-type-description">${escapeHtml(group.description)}</p>` : ""}
       <div class="module-tile-grid">
         ${group.modules.map(renderDirectoryModuleTile).join("")}
       </div>
@@ -3093,19 +3101,45 @@ function sectionImage(id) {
   return pageSectionById(id)?.imageUrl || "";
 }
 
+function allowedModuleKeysForActions() {
+  return modules.filter((module) => isModuleAllowedByAccess(module.key)).map((module) => module.key);
+}
+
+function canShowModuleAction(key) {
+  return Boolean(moduleByKey(key) && isModuleAllowedByAccess(key));
+}
+
+function moduleActionLabel(key, fallback = "") {
+  const module = moduleByKey(key);
+  return fallback || tabConfigByKey(key)?.label || module?.label || key;
+}
+
+function renderModuleButton(key, fallback = "") {
+  if (!canShowModuleAction(key)) return "";
+  return `<button type="button" data-action="set-active" data-key="${escapeHtml(key)}">${escapeHtml(moduleActionLabel(key, fallback))}</button>`;
+}
+
+function renderModuleTextLink(key, fallback = "", className = "text-link") {
+  if (!canShowModuleAction(key)) return "";
+  return `<a class="${escapeHtml(className)}" href="#module/${escapeHtml(key)}" data-action="set-active" data-key="${escapeHtml(key)}">${escapeHtml(moduleActionLabel(key, fallback))}</a>`;
+}
+
 function renderSectionButtons(id) {
   const buttons = sectionButtons(id);
   if (!buttons.length) return "";
+  const allowedModuleKeys = allowedModuleKeysForActions();
   return buttons
     .map((button) => {
       const label = escapeHtml(button.label || "Open");
-      const url = String(button.url || "#");
+      const url = normalizeSectionButtonUrl(button.url, { allowedModuleKeys });
+      if (!url) return "";
       if (url.startsWith("#module/")) {
         const key = url.replace(/^#module\//, "");
         return `<a href="${escapeHtml(url)}" data-action="set-active" data-key="${escapeHtml(key)}">${label}</a>`;
       }
       return `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${label}</a>`;
     })
+    .filter(Boolean)
     .join("");
 }
 
@@ -3762,7 +3796,12 @@ async function savePageConfig(formData) {
 async function savePageSectionConfig(formData) {
   const id = String(formData.get("id") || "").trim();
   const buttonLabel = String(formData.get("buttonLabel") || "").trim();
-  const buttonUrl = String(formData.get("buttonUrl") || "").trim();
+  const rawButtonUrl = String(formData.get("buttonUrl") || "").trim();
+  const buttonUrl = normalizeSectionButtonUrl(rawButtonUrl, { allowedModuleKeys: modules.map((module) => module.key) });
+  if (rawButtonUrl && !buttonUrl) {
+    setToast("Button URL must be an allowed module route or an HTTPS link.");
+    return render();
+  }
   await apiRequest(`/api/rbac/page-sections/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: JSON.stringify({
@@ -3773,7 +3812,7 @@ async function savePageSectionConfig(formData) {
       content: {
         heading: String(formData.get("heading") || "").trim(),
         body: String(formData.get("body") || "").trim(),
-        buttons: buttonLabel || buttonUrl ? [{ label: buttonLabel, url: buttonUrl || "#" }] : []
+        buttons: buttonLabel || buttonUrl ? [{ label: buttonLabel || "Open", url: buttonUrl }] : []
       }
     })
   });
@@ -5415,6 +5454,17 @@ function renderTrialBanner() {
     `;
   }
   const profile = industryProfiles[state.industryProfile] || industryProfiles.restoration;
+  const trialActions = [
+    `<button type="button" data-action="open-service-request">Request service</button>`,
+    renderModuleButton("contractorportal", "Contractor Portal"),
+    renderModuleButton("team", "Team"),
+    renderModuleButton("accessadmin", "Admin Access"),
+    renderModuleButton("communications", "Board"),
+    renderModuleButton("daily", "Module map"),
+    renderModuleButton("sketch", "Sketch"),
+    renderModuleButton("pricing", "Import invoice"),
+    renderModuleButton("settings", "Settings")
+  ].filter(Boolean).join("");
   return `
     <section class="trial-banner">
       <div>
@@ -5430,14 +5480,7 @@ function renderTrialBanner() {
         </select>
       </label>
       <div class="trial-actions">
-        <button type="button" data-action="open-service-request">Request service</button>
-        <button type="button" data-action="set-active" data-key="contractorportal">Contractor Portal</button>
-        <button type="button" data-action="set-active" data-key="team">Team</button>
-        <button type="button" data-action="set-active" data-key="accessadmin">Admin Access</button>
-        <button type="button" data-action="set-active" data-key="communications">Board</button>
-        <button type="button" data-action="set-active" data-key="sketch">Sketch</button>
-        <button type="button" data-action="set-active" data-key="pricing">Import invoice</button>
-        <button type="button" data-action="set-active" data-key="settings">Settings</button>
+        ${trialActions}
       </div>
     </section>
   `;
@@ -5447,29 +5490,30 @@ function renderTopbar(module) {
   const primaryActions = state.employeeMode
     ? `
         <button type="button" data-action="open-service-request">Request service</button>
-        <a class="text-link" href="#module/time" data-action="set-active" data-key="time">Time</a>
-        <a class="text-link" href="#module/jobs" data-action="set-active" data-key="jobs">Jobs</a>
+        ${renderModuleTextLink("time", "Time")}
+        ${renderModuleTextLink("jobs", "Jobs")}
       `
     : `
         <button type="button" data-action="open-service-request">Request service</button>
         <button type="button" data-action="open-create-file">New file</button>
-        <a class="text-link" href="#module/insurance" data-action="set-active" data-key="insurance">Insurance intake</a>
+        ${renderModuleTextLink("insurance", "Insurance intake")}
       `;
 
   const secondaryActions = state.employeeMode
     ? `
-        <a class="text-link" href="#module/drylogs" data-action="set-active" data-key="drylogs">Dry logs</a>
-        <a class="text-link" href="#module/equipment" data-action="set-active" data-key="equipment">Equipment</a>
+        ${renderModuleTextLink("drylogs", "Dry logs")}
+        ${renderModuleTextLink("equipment", "Equipment")}
         <button type="button" data-action="employee-logout">Owner/admin login</button>
       `
     : `
-        <a class="text-link" href="#module/jobs" data-action="set-active" data-key="jobs">Open jobs</a>
-        <a class="text-link" href="#module/contractorportal" data-action="set-active" data-key="contractorportal">Contractor Portal</a>
-        <a class="text-link" href="#module/pricing" data-action="set-active" data-key="pricing">Import invoice</a>
-        <a class="text-link" href="#module/accessadmin" data-action="set-active" data-key="accessadmin">Admin Access</a>
-        ${!state.authSession || canDo("viewGlobalIndexes") ? `<a class="text-link" href="#module/launchcenter" data-action="set-active" data-key="launchcenter">Launch Center</a>` : ""}
-        ${!state.authSession || canDo("viewGlobalIndexes") ? `<a class="text-link" href="#module/globalindexes" data-action="set-active" data-key="globalindexes">Global Indexes</a>` : ""}
-        <a class="text-link" href="#module/communications" data-action="set-active" data-key="communications">Board</a>
+        ${renderModuleTextLink("daily", "Module map", "text-link module-map-link")}
+        ${renderModuleTextLink("jobs", "Open jobs")}
+        ${renderModuleTextLink("contractorportal", "Contractor Portal")}
+        ${renderModuleTextLink("pricing", "Import invoice")}
+        ${renderModuleTextLink("accessadmin", "Admin Access")}
+        ${!state.authSession || canDo("viewGlobalIndexes") ? renderModuleTextLink("launchcenter", "Launch Center") : ""}
+        ${!state.authSession || canDo("viewGlobalIndexes") ? renderModuleTextLink("globalindexes", "Global Indexes") : ""}
+        ${renderModuleTextLink("communications", "Board")}
         <button type="button" data-action="open-activity">Alerts</button>
         ${!state.authSession || canDo("viewGlobalIndexes") ? `<button type="button" data-action="open-export">Export</button>` : ""}
         <button type="button" data-action="open-employee-login">Employee time</button>
@@ -5557,6 +5601,7 @@ function renderDashboardSummary() {
   const openQueue = state.queue.length;
   const hours = state.timeEntries.reduce((sum, entry) => sum + Number(entry.hours || 0), 0).toFixed(2);
   return `
+    ${renderManagedSection("daily-module-directory", renderTaskTypeModuleDirectory())}
     ${renderManagedSection("daily-dashboard-grid", `
     <section class="dashboard-grid">
       ${renderStatCard("Active jobs", activeJobs, "Jobs still moving through the operating loop.", "jobs")}
@@ -5566,7 +5611,6 @@ function renderDashboardSummary() {
       ${renderStatCard("Logged hours", hours, "Employee GPS time entries saved locally.", "time")}
     </section>
     `)}
-    ${renderManagedSection("daily-module-directory", renderTaskTypeModuleDirectory())}
     ${renderManagedSection("daily-service-requests", renderServiceRequestPanel())}
     ${renderManagedSection("daily-action-dashboard", renderActionDashboard())}
     ${renderManagedSection("daily-investor-panel", renderInstitutionalInvestorPanel())}
@@ -8490,6 +8534,12 @@ function renderTaskForm() {
 
 function renderTeamMemberCard(member) {
   const canManage = canDo("manageUsers") && member.id;
+  const cardActions = [
+    canManage ? `<button type="button" data-action="open-user-manage" data-id="${member.id}">Manage</button>` : "",
+    member.id && canDo("resetPermissions") ? `<button type="button" data-action="reset-user-permissions" data-id="${member.id}">Reset access</button>` : "",
+    member.id && canDo("disableAccounts") ? `<button type="button" data-action="toggle-user-disabled" data-id="${member.id}" data-disabled="${member.status === "Disabled" ? "true" : "false"}">${member.status === "Disabled" ? "Enable" : "Disable"}</button>` : "",
+    member.id && canDo("removeUsers") ? `<button type="button" data-action="delete-user" data-id="${member.id}">Delete</button>` : ""
+  ].filter(Boolean).join("");
   return `
     <article class="team-card">
       <div class="file-card-head"><span>${escapeHtml(member.accountType || "Employee")}</span><strong>${escapeHtml(member.status)}</strong></div>
@@ -8498,14 +8548,7 @@ function renderTeamMemberCard(member) {
       <span>${escapeHtml(member.role)} - ${escapeHtml(member.access)}</span>
       <small>${escapeHtml((member.permissions || []).join(", ") || "No permissions set")}</small>
       ${member.companyId ? `<small>Company: ${escapeHtml(member.companyId)}${member.franchiseIds?.length ? ` | Franchise: ${escapeHtml(member.franchiseIds.join(", "))}` : ""}</small>` : ""}
-      ${canManage ? `
-        <div class="card-actions">
-          <button type="button" data-action="open-user-manage" data-id="${member.id}">Manage</button>
-          <button type="button" data-action="reset-user-permissions" data-id="${member.id}">Reset access</button>
-          <button type="button" data-action="toggle-user-disabled" data-id="${member.id}" data-disabled="${member.status === "Disabled" ? "true" : "false"}">${member.status === "Disabled" ? "Enable" : "Disable"}</button>
-          ${canDo("removeUsers") ? `<button type="button" data-action="delete-user" data-id="${member.id}">Delete</button>` : ""}
-        </div>
-      ` : ""}
+      ${cardActions ? `<div class="card-actions">${cardActions}</div>` : ""}
     </article>
   `;
 }
