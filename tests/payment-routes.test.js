@@ -25,7 +25,7 @@ describe("payment and integration routes", () => {
 
   it("keeps card and PayPal payment routes online with setup-required responses", async () => {
     const card = await request(app)
-      .post("/payments/stripe/intent")
+      .post("/api/payments/stripe/intent")
       .send({ amount: 1250, customer: "North Ridge Apartments" })
       .expect(202);
     expect(card.body).toMatchObject({
@@ -37,7 +37,7 @@ describe("payment and integration routes", () => {
     });
 
     const paypal = await request(app)
-      .post("/payments/paypal/order")
+      .post("/api/payments/paypal/order")
       .send({ amount: 860, customer: "Oak Avenue" })
       .expect(202);
     expect(paypal.body).toMatchObject({
@@ -50,13 +50,13 @@ describe("payment and integration routes", () => {
   });
 
   it("keeps manual rail and QuickBooks routes from falling through to static pages", async () => {
-    const zelle = await request(app).get("/payments/zelle/instructions").expect(202);
+    const zelle = await request(app).get("/api/payments/zelle/instructions").expect(202);
     expect(zelle.body).toMatchObject({ success: true, rail: "Zelle", status: "configuration_required" });
 
-    const wire = await request(app).get("/payments/wire/instructions").expect(202);
+    const wire = await request(app).get("/api/payments/wire/instructions").expect(202);
     expect(wire.body).toMatchObject({ success: true, rail: "Wire", status: "configuration_required" });
 
-    const quickBooks = await request(app).get("/integrations/quickbooks/oauth/start").expect(202);
+    const quickBooks = await request(app).get("/api/integrations/quickbooks/oauth/start").expect(202);
     expect(quickBooks.body).toMatchObject({ success: true, integration: "QuickBooks", status: "configuration_required" });
   });
 });

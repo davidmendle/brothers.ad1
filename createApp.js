@@ -1325,7 +1325,7 @@ function createApp() {
     }
   });
 
-  app.post("/payments/stripe/intent", (request, response) => {
+  app.post("/api/payments/stripe/intent", (request, response) => {
     return response.status(202).json({
       success: true,
       rail: "Card",
@@ -1336,7 +1336,7 @@ function createApp() {
     });
   });
 
-  app.post("/payments/paypal/order", (request, response) => {
+  app.post("/api/payments/paypal/order", (request, response) => {
     return response.status(202).json({
       success: true,
       rail: "PayPal",
@@ -1347,7 +1347,7 @@ function createApp() {
     });
   });
 
-  app.get("/payments/zelle/instructions", (_request, response) => {
+  app.get("/api/payments/zelle/instructions", (_request, response) => {
     return response.status(202).json({
       success: true,
       rail: "Zelle",
@@ -1356,7 +1356,7 @@ function createApp() {
     });
   });
 
-  app.get("/payments/wire/instructions", (_request, response) => {
+  app.get("/api/payments/wire/instructions", (_request, response) => {
     return response.status(202).json({
       success: true,
       rail: "Wire",
@@ -1365,7 +1365,7 @@ function createApp() {
     });
   });
 
-  app.get("/integrations/quickbooks/oauth/start", (_request, response) => {
+  app.get("/api/integrations/quickbooks/oauth/start", (_request, response) => {
     return response.status(202).json({
       success: true,
       integration: "QuickBooks",

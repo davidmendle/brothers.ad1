@@ -5121,10 +5121,10 @@ function createPaymentRequest(formData) {
   const amount = parseAmount(formData.get("amount"));
   const method = String(formData.get("method") || "Card");
   const routeMap = {
-    Card: "/payments/stripe/intent",
-    PayPal: "/payments/paypal/order",
-    Zelle: "/payments/zelle/instructions",
-    Wire: "/payments/wire/instructions"
+    Card: "/api/payments/stripe/intent",
+    PayPal: "/api/payments/paypal/order",
+    Zelle: "/api/payments/zelle/instructions",
+    Wire: "/api/payments/wire/instructions"
   };
   const customer = String(formData.get("customer") || "Customer").trim();
   const job = String(formData.get("job") || "").trim();
@@ -5156,7 +5156,7 @@ function createPaymentRequest(formData) {
       `Customer: ${customer}`,
       `Job: ${job}`,
       `Email/phone: ${String(formData.get("contact") || "").trim()}`,
-      `Backend route: ${routeMap[method] || "/payments/manual-receipt"}`,
+      `Backend route: ${routeMap[method] || "/api/payments/manual-receipt"}`,
       instructions,
       "Security: never collect customer bank login credentials inside this app."
     ].join("\n")
@@ -8662,11 +8662,11 @@ function renderPaymentsModule(module) {
           <div><h2>Payment rail window</h2><p>Card, PayPal, Zelle, wire, and manual receipt records.</p></div>
         </div>
         <div class="payment-rail-grid">
-          ${renderPaymentRail("Card", "/payments/stripe/intent", "Hosted card or debit payment intent")}
-          ${renderPaymentRail("PayPal", "/payments/paypal/order", "PayPal order and capture")}
-          ${renderPaymentRail("Zelle", "/payments/zelle/instructions", "Business Zelle instructions")}
-          ${renderPaymentRail("Wire", "/payments/wire/instructions", "Verified wiring instructions")}
-          ${renderPaymentRail("QuickBooks", "/integrations/quickbooks/oauth/start", "QuickBooks invoice and expense sync")}
+          ${renderPaymentRail("Card", "/api/payments/stripe/intent", "Hosted card or debit payment intent")}
+          ${renderPaymentRail("PayPal", "/api/payments/paypal/order", "PayPal order and capture")}
+          ${renderPaymentRail("Zelle", "/api/payments/zelle/instructions", "Business Zelle instructions")}
+          ${renderPaymentRail("Wire", "/api/payments/wire/instructions", "Verified wiring instructions")}
+          ${renderPaymentRail("QuickBooks", "/api/integrations/quickbooks/oauth/start", "QuickBooks invoice and expense sync")}
           ${renderPaymentRail("Future rails", "gateway-ready", "ACH, Plaid, Square, Venmo, check, financing")}
         </div>
         ${renderPaymentRequestForm()}
