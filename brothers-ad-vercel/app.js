@@ -1221,7 +1221,28 @@ function persist() {
     worker: state.worker,
     selectedFileId: state.selectedFileId
   };
-  localStorage.setItem(storageKey, JSON.stringify(persisted));
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(persisted));
+  } catch (error) {
+    const leanPersisted = {
+      ...persisted,
+      activity: state.activity.slice(0, 25),
+      standardsOutputs: state.standardsOutputs.slice(0, 10),
+      learnedJargon: state.learnedJargon.slice(0, 50),
+      estimateDraft: {
+        ...state.estimateDraft,
+        logoDataUrl: ""
+      }
+    };
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(leanPersisted));
+      state.estimateDraft.logoDataUrl = "";
+      state.toast = "Saved a compact copy after browser storage filled up";
+    } catch (retryError) {
+      console.warn("Brothers OS could not persist local browser state.", retryError || error);
+      state.toast = "Browser storage is full; export or clear old local data";
+    }
+  }
 }
 
 function moduleByKey(key) {
@@ -3423,8 +3444,35 @@ function businessRecordsByType(type) {
   return (state.businessData || []).filter((record) => record.type === type);
 }
 
+function localRevenueInvoiceRecords() {
+  return state.files
+    .filter((file) => file.sourceType === "estimateInvoice" || (file.moduleKey === "payments" && String(file.type || "").toLowerCase() === "invoice"))
+    .map((file) => {
+      const invoiceId = file.sourceId || file.title || file.id;
+      return {
+        id: `LOCAL-${normalizePriceToken(invoiceId || file.id)}`,
+        type: "revenueInvoice",
+        invoiceId,
+        customerId: normalizePriceToken(file.customer || "customer"),
+        customerName: file.customer || "Customer",
+        amount: Number(file.amount || 0),
+        balance: /paid|closed|complete/i.test(String(file.status || "")) ? 0 : Number(file.amount || 0),
+        status: file.status || "Drafting",
+        jobId: file.relatedJob || "",
+        dueDate: file.due || "",
+        source: "local-file",
+        sourceFileId: file.id
+      };
+    });
+}
+
 function revenueInvoices() {
-  return businessRecordsByType("revenueInvoice");
+  const records = new Map();
+  [...localRevenueInvoiceRecords(), ...businessRecordsByType("revenueInvoice")].forEach((record) => {
+    const id = String(record.id || record.invoiceId || createId("invoice"));
+    records.set(id, { ...record, id });
+  });
+  return Array.from(records.values());
 }
 
 function contractorInvoices() {
@@ -3432,7 +3480,30 @@ function contractorInvoices() {
 }
 
 function customerRecords() {
-  return businessRecordsByType("customer");
+  const records = new Map();
+  businessRecordsByType("customer").forEach((record) => {
+    const id = String(record.id || record.customerId || normalizePriceToken(record.name || "customer"));
+    records.set(id, { ...record, id });
+  });
+  localRevenueInvoiceRecords().forEach((invoice) => {
+    const id = invoice.customerId || normalizePriceToken(invoice.customerName || "customer");
+    const current = records.get(id) || {
+      id,
+      type: "customer",
+      customerId: id,
+      name: invoice.customerName || "Customer",
+      revenueTotal: 0,
+      openBalance: 0,
+      status: "Active",
+      source: "local-file"
+    };
+    records.set(id, {
+      ...current,
+      revenueTotal: Number(current.revenueTotal || 0) + Number(invoice.amount || 0),
+      openBalance: Number(current.openBalance || 0) + Number(invoice.balance || 0)
+    });
+  });
+  return Array.from(records.values());
 }
 
 function sumRecords(records, key = "amount") {
@@ -4492,10 +4563,22 @@ function parsePriceCsv(text) {
   const headers = rows[0].map((header) => header.toLowerCase().replace(/[^a-z0-9]/g, ""));
   const hasHeader = headers.some((header) => ["code", "name", "item", "rate", "price", "unit", "cost"].includes(header));
   const body = hasHeader ? rows.slice(1) : rows;
+  const headerAliases = {
+    code: ["code", "selector", "catselector", "catsel", "lineitemcode", "act", "activity"],
+    name: ["name", "item", "description", "desc", "lineitemdescription"],
+    category: ["category", "cat", "trade", "group"],
+    unit: ["unit", "uom", "unitofmeasure", "measure"],
+    rate: ["rate", "price", "unitprice", "unitcost", "rcv", "amount", "total"],
+    cost: ["cost", "laborcost", "materialcost"],
+    branch: ["branch", "location", "market"],
+    justification: ["justification", "notes", "note", "scope"],
+    qty: ["qty", "quantity", "count"]
+  };
   return body
     .map((row) => {
       const value = (name, fallbackIndex) => {
-        const index = headers.indexOf(name);
+        const names = headerAliases[name] || [name];
+        const index = names.map((alias) => headers.indexOf(alias)).find((aliasIndex) => aliasIndex >= 0);
         return row[index >= 0 ? index : fallbackIndex] || "";
       };
       return {
@@ -4507,7 +4590,8 @@ function parsePriceCsv(text) {
         rate: parseAmount(value("rate", 4) || value("price", 4)),
         cost: parseAmount(value("cost", 5)),
         branch: String(value("branch", 6) || "All branches").trim(),
-        justification: String(value("justification", 7) || value("notes", 7) || "").trim()
+        justification: String(value("justification", 7) || value("notes", 7) || "").trim(),
+        qty: Math.max(1, parseAmount(value("qty", 8)) || 1)
       };
     })
     .filter((item) => item.name);
@@ -4522,7 +4606,7 @@ function parseXactimateLines(text, fileName = "xactimate import") {
       code: item.code,
       name: item.name,
       unit: item.unit,
-      qty: 1,
+      qty: item.qty || 1,
       rate: item.rate,
       source: fileName
     }));
@@ -4568,6 +4652,139 @@ function parseXactimateLines(text, fileName = "xactimate import") {
   });
 }
 
+function pricingImportTotal(lines) {
+  return lines.reduce((sum, line) => sum + Number(line.qty || 1) * Number(line.rate || 0), 0);
+}
+
+function parsePastedPricingImport(text, sourceName = "pasted pricing import") {
+  const textValue = String(text || "").trim();
+  if (!textValue) return [];
+  const firstLines = textValue.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 3);
+  if (firstLines.some((line) => line.includes(","))) {
+    const csvLines = parsePriceCsv(textValue)
+      .filter((item) => Number(item.rate || 0) > 0)
+      .map((item) => ({
+        ...item,
+        qty: item.qty || 1,
+        source: sourceName
+      }));
+    if (csvLines.length) return csvLines;
+  }
+  return parseXactimateLines(textValue, sourceName);
+}
+
+function importPricingLines(lines, sourceName, options = {}) {
+  const now = new Date().toISOString();
+  const normalizedLines = lines
+    .map((line) => ({
+      ...line,
+      code: String(line.code || createId("ITEM")).trim().toUpperCase(),
+      name: String(line.name || "Imported item").trim(),
+      unit: String(line.unit || "each").trim(),
+      rate: parseAmount(line.rate),
+      cost: parseAmount(line.cost),
+      qty: Math.max(1, parseAmount(line.qty) || 1)
+    }))
+    .filter((line) => line.name && Number(line.rate || 0) > 0);
+  if (!normalizedLines.length) {
+    return { items: [], total: 0 };
+  }
+  const category = options.category || "Xactimate pricing";
+  const branch = options.branch || "Pricing import";
+  const sourceType = options.sourceType || "pricingImport";
+  const total = pricingImportTotal(normalizedLines);
+  const importNotes = options.notes || "Imported into the Price Book and linked to billing, accounting, revenue, and defensibility workflows.";
+  const items = normalizedLines.map((line) => ({
+    id: createId("PB"),
+    code: line.code,
+    name: line.name,
+    category: line.category || category,
+    unit: line.unit,
+    rate: line.rate,
+    cost: line.cost,
+    branch: line.branch || branch,
+    sourceFile: sourceName,
+    importedAt: now,
+    pricingDate: inferPricingDate(sourceName, now),
+    pricePolicy: "highest-rate-wins",
+    justification: line.justification || `Imported from ${sourceName}. Quantity in estimate: ${line.qty}. Highest/latest pricing policy keeps the active rate at the highest known price for this line.`
+  }));
+  state.priceItems = [...items, ...state.priceItems];
+  applyHighestPricingPolicy();
+  state.xactimateImports = [
+    {
+      id: createId("XI"),
+      fileName: sourceName,
+      importedAt: now,
+      lineCount: items.length,
+      total,
+      status: options.status || "Imported",
+      notes: importNotes
+    },
+    ...state.xactimateImports
+  ];
+  createFile({
+    moduleKey: "pricing",
+    linkedModuleKeys: ["defensibility", "payments", "accounting", "revenueengine"],
+    sourceType,
+    sourceId: sourceName,
+    amount: total,
+    title: options.title || `${sourceName} pricing import`,
+    type: options.type || "Pricing import",
+    owner: "Estimator",
+    status: options.status || "Imported",
+    priority: "Medium",
+    due: today.toISOString().slice(0, 10),
+    relatedJob: state.estimateDraft.job,
+    notes: [
+      `${items.length} line items imported into the price book.`,
+      `Total source value: ${formatMoney(total)}`,
+      importNotes,
+      "Linked modules: pricing, defensibility, payments, accounting, and revenue engine."
+    ].join("\n")
+  });
+  addActivity(`${options.activityPrefix || "Imported"} ${items.length} pricing line items from ${sourceName}.`);
+  return { items, total };
+}
+
+function importPastedPricing(formData) {
+  const sourceName = String(formData.get("sourceName") || `Pasted pricing ${today.toISOString().slice(0, 10)}`).trim();
+  const lines = parsePastedPricingImport(formData.get("importText"), sourceName);
+  if (!lines.length) {
+    setToast("No pricing lines detected");
+    render();
+    return;
+  }
+  const result = importPricingLines(lines, sourceName, {
+    sourceType: "pastedPriceImport",
+    title: `${sourceName} pasted pricing import`,
+    notes: "Imported from pasted CSV, text, or Xactimate-style line items.",
+    activityPrefix: "Imported pasted"
+  });
+  persist();
+  setToast(`${result.items.length} pasted pricing lines imported`);
+  routeToModule("pricing");
+}
+
+function importSamplePricing() {
+  const sourceName = `Sample pricing ${today.toISOString().slice(0, 10)}`;
+  const sampleText = [
+    "WTR.LAB Water mitigation technician labor 4 HR 85.00",
+    "EQP.DEH Commercial dehumidifier rental 3 DAYS 95.00",
+    "DOC.PKT Photo and invoice support packet 1 EACH 185.00"
+  ].join("\n");
+  const lines = parsePastedPricingImport(sampleText, sourceName);
+  const result = importPricingLines(lines, sourceName, {
+    sourceType: "samplePriceImport",
+    title: `${sourceName} starter price book`,
+    notes: "Starter pricing loaded from the built-in sample so the estimate workflow can be tested without a file upload.",
+    activityPrefix: "Loaded sample"
+  });
+  persist();
+  setToast(`${result.items.length} sample pricing lines loaded`);
+  routeToModule("pricing");
+}
+
 async function processXactimateFile(file) {
   try {
     const arrayBuffer = await readFileAsArrayBuffer(file);
@@ -4602,56 +4819,15 @@ async function processXactimateFile(file) {
       });
       return { fileName: file.name, imported: 0, captured: true };
     }
-    const items = lines.map((line) => ({
-      id: createId("PB"),
-      code: line.code,
-      name: line.name,
-      category: "Xactimate pricing",
-      unit: line.unit,
-      rate: line.rate,
-      cost: 0,
-      branch: "Xactimate import",
-      sourceFile: file.name,
-      importedAt: new Date().toISOString(),
-      pricingDate: inferPricingDate(file.name),
-      pricePolicy: "highest-rate-wins",
-      justification: `Imported from ${file.name}. Quantity in estimate: ${line.qty}. Highest/latest pricing policy keeps the active rate at the highest known price for this line.`
-    }));
-    state.priceItems = [...items, ...state.priceItems];
-    applyHighestPricingPolicy();
-    state.xactimateImports = [
-      {
-        id: createId("XI"),
-        fileName: file.name,
-        importedAt: new Date().toISOString(),
-        lineCount: items.length,
-        total: lines.reduce((sum, line) => sum + Number(line.qty || 1) * Number(line.rate || 0), 0),
-        status: "Imported",
-        notes: "Imported into Price Book under Xactimate pricing."
-      },
-      ...state.xactimateImports
-    ];
-    createFile({
-      moduleKey: "pricing",
-      linkedModuleKeys: ["defensibility", "payments", "accounting", "revenueengine"],
+    const result = importPricingLines(lines, file.name, {
       sourceType: "xactimateImport",
-      sourceId: file.name,
-      amount: lines.reduce((sum, line) => sum + Number(line.qty || 1) * Number(line.rate || 0), 0),
       title: `${file.name} Xactimate pricing import`,
       type: "Xactimate import",
-      owner: "Estimator",
-      status: "Imported",
-      priority: "Medium",
-      due: today.toISOString().slice(0, 10),
-      relatedJob: state.estimateDraft.job,
-      notes: [
-        `${items.length} line items imported into the price book.`,
-        `Total source value: ${formatMoney(lines.reduce((sum, line) => sum + Number(line.qty || 1) * Number(line.rate || 0), 0))}`,
-        "Linked modules: pricing, defensibility, payments, accounting, and revenue engine."
-      ].join("\n")
+      branch: "Xactimate import",
+      notes: "Imported into Price Book under Xactimate pricing.",
+      activityPrefix: "Imported"
     });
-    addActivity(`Imported ${items.length} Xactimate line items from ${file.name}.`);
-    return { fileName: file.name, imported: items.length, captured: false };
+    return { fileName: file.name, imported: result.items.length, captured: false };
   } catch {
     return { fileName: file.name, imported: 0, captured: false, failed: true };
   }
@@ -4775,20 +4951,17 @@ async function handlePriceCsvUpload(input) {
   if (!file) return;
   try {
     const text = await readFile(file);
-    const now = new Date().toISOString();
-    const items = parsePriceCsv(text).map((item) => ({
-      ...item,
-      sourceFile: file.name,
-      importedAt: now,
-      pricingDate: inferPricingDate(file.name, now),
-      pricePolicy: "highest-rate-wins",
-      justification: item.justification || `Imported from ${file.name}. Active price uses highest/latest pricing policy.`
-    }));
-    state.priceItems = [...items, ...state.priceItems];
-    applyHighestPricingPolicy();
-    addActivity(`Imported ${items.length} price book items from ${file.name}.`);
+    const items = parsePriceCsv(text);
+    const result = importPricingLines(items, file.name, {
+      sourceType: "priceCsvImport",
+      category: "Imported pricing",
+      branch: "CSV import",
+      title: `${file.name} CSV price book import`,
+      notes: "Imported from CSV into the active price book and linked to billing workflows.",
+      activityPrefix: "Imported"
+    });
     persist();
-    setToast(`${items.length} price items imported`);
+    setToast(`${result.items.length} price items imported`);
     render();
   } catch {
     setToast("Pricing upload failed");
@@ -4882,10 +5055,16 @@ function downloadEstimate() {
   addActivity(`Downloaded estimate ${state.estimateDraft.estimateNo}.`);
   persist();
   setToast("Estimate downloaded");
+  render();
 }
 
 function createEstimateInvoice() {
   const lines = estimateLines();
+  if (!lines.length) {
+    setToast("Add at least one estimate line before creating an invoice");
+    render();
+    return;
+  }
   const notes = [
     `Estimate: ${state.estimateDraft.estimateNo}`,
     `Customer: ${state.estimateDraft.customer}`,
@@ -7782,6 +7961,18 @@ function renderXactimateImportWorkstation() {
         <strong>Pricing rule</strong>
         <span>For matching line items, Brothers OS uses the highest known rate. If rates tie, the latest pricing date/import wins. Older lower estimates stay in history and cannot lower the active price.</span>
       </div>
+      <form class="pasted-pricing-import" data-form="pasted-pricing-import">
+        <div>
+          <strong>Paste pricing lines</strong>
+          <span>Use CSV headers or Xactimate-style text when file upload is not available.</span>
+        </div>
+        <label><span>Source name</span><input name="sourceName" value="Manual pricing import ${escapeHtml(today.toISOString().slice(0, 10))}" /></label>
+        <label><span>CSV, text, or Xactimate lines</span><textarea name="importText" rows="4" placeholder="Code,Description,Category,Unit,Rate,Cost&#10;WTR.LAB,Water mitigation labor,Labor,HR,85,42"></textarea></label>
+        <div class="pricing-import-actions">
+          <button type="submit">Import pasted pricing</button>
+          <button type="button" data-action="import-sample-pricing">Load sample pricing</button>
+        </div>
+      </form>
     </section>
   `;
 }
@@ -7806,12 +7997,16 @@ function renderPriceItemTable() {
       <table class="data-table price-table">
         <thead><tr><th>Status</th><th>Code</th><th>Item</th><th>Unit</th><th>Rate</th><th>Source/date</th><th>History</th></tr></thead>
         <tbody>
-          ${sortedItems
-            .map((item) => {
-              const status = item.activePrice === false ? "History only" : "Active highest";
-              return `<tr class="${item.activePrice === false ? "price-history-row" : "price-active-row"}"><td><strong>${escapeHtml(status)}</strong></td><td>${escapeHtml(item.code)}</td><td><strong>${escapeHtml(item.name)}</strong><br /><span>${escapeHtml(item.justification || item.category)}</span></td><td>${escapeHtml(item.unit)}</td><td><strong>${escapeHtml(formatMoney(item.rate))}</strong><br /><span>Active ${escapeHtml(formatMoney(item.highestKnownRate || item.rate))}</span></td><td>${escapeHtml(item.sourceFile || item.branch || "Manual")}<br /><span>${escapeHtml(item.latestKnownPricingDate || item.pricingDate || "No date")}</span></td><td>${escapeHtml(`${item.priceHistoryCount || 1} record${Number(item.priceHistoryCount || 1) === 1 ? "" : "s"}`)}</td></tr>`;
-            })
-            .join("")}
+          ${
+            sortedItems.length
+              ? sortedItems
+                  .map((item) => {
+                    const status = item.activePrice === false ? "History only" : "Active highest";
+                    return `<tr class="${item.activePrice === false ? "price-history-row" : "price-active-row"}"><td><strong>${escapeHtml(status)}</strong></td><td>${escapeHtml(item.code)}</td><td><strong>${escapeHtml(item.name)}</strong><br /><span>${escapeHtml(item.justification || item.category)}</span></td><td>${escapeHtml(item.unit)}</td><td><strong>${escapeHtml(formatMoney(item.rate))}</strong><br /><span>Active ${escapeHtml(formatMoney(item.highestKnownRate || item.rate))}</span></td><td>${escapeHtml(item.sourceFile || item.branch || "Manual")}<br /><span>${escapeHtml(item.latestKnownPricingDate || item.pricingDate || "No date")}</span></td><td>${escapeHtml(`${item.priceHistoryCount || 1} record${Number(item.priceHistoryCount || 1) === 1 ? "" : "s"}`)}</td></tr>`;
+                  })
+                  .join("")
+              : `<tr><td colspan="7"><div class="empty-state compact-empty"><strong>No price rows yet</strong><span>Import pricing, load sample pricing, or add a manual price item to start an estimate.</span></div></td></tr>`
+          }
         </tbody>
       </table>
     </div>
@@ -7862,6 +8057,7 @@ function renderEstimateSettingsForm() {
 
 function renderEstimatePreview() {
   const lines = estimateLines();
+  const prices = activePriceItems();
   return `
     <div class="estimate-preview">
       <div class="estimate-head">
@@ -7873,10 +8069,10 @@ function renderEstimatePreview() {
         <strong>${escapeHtml(formatMoney(estimateSubtotal()))}</strong>
       </div>
       <form class="estimate-line-form" data-form="estimate-line">
-        <label><span>Price item</span><select name="priceItemId">${activePriceItems().map((item) => `<option value="${item.id}">${escapeHtml(item.code)} - ${escapeHtml(item.name)} (${escapeHtml(formatMoney(item.highestKnownRate || item.rate))}/${escapeHtml(item.unit)})</option>`).join("")}</select></label>
+        <label><span>Price item</span><select name="priceItemId" ${prices.length ? "" : "disabled"}>${prices.length ? prices.map((item) => `<option value="${item.id}">${escapeHtml(item.code)} - ${escapeHtml(item.name)} (${escapeHtml(formatMoney(item.highestKnownRate || item.rate))}/${escapeHtml(item.unit)})</option>`).join("") : `<option>No active price items</option>`}</select></label>
         <label><span>Qty</span><input name="qty" type="number" step="0.01" value="1" /></label>
         <label><span>Line note</span><input name="note" placeholder="Room, reason, photo, support" /></label>
-        <button type="submit">Add line</button>
+        <button type="submit" ${prices.length ? "" : "disabled"}>Add line</button>
       </form>
       <div class="estimate-lines">
         ${
@@ -8389,6 +8585,8 @@ function renderGlobalBusinessIndexPanel() {
     ? "Server Firebase Admin"
     : allRecords.some((record) => record.source === "client-firestore")
       ? "Browser Firestore fallback"
+      : allRecords.some((record) => record.source === "local-file")
+        ? "Local operating files plus secured defaults"
       : "Secure default seed / role-scoped API";
   return `
     <section class="panel global-business-index">
@@ -9962,6 +10160,7 @@ document.addEventListener("click", (event) => {
   if (action === "download-estimate") return downloadEstimate();
   if (action === "create-estimate-invoice") return createEstimateInvoice();
   if (action === "remove-estimate-line") return removeEstimateLine(id);
+  if (action === "import-sample-pricing") return importSamplePricing();
   if (action === "connect-quickbooks") return connectQuickBooks();
   if (action === "create-payment-rail") return createPaymentRailSetup(actionElement.dataset.method || "Payment", actionElement.dataset.route || "gateway-ready", actionElement.dataset.detail || "Payment rail setup");
   if (action === "complete-task") return completeTask(id);
@@ -10069,6 +10268,9 @@ document.addEventListener("submit", (event) => {
   }
   if (type === "price-item") {
     addPriceItem(formData);
+  }
+  if (type === "pasted-pricing-import") {
+    importPastedPricing(formData);
   }
   if (type === "estimate-settings") {
     applyEstimateSettings(formData);

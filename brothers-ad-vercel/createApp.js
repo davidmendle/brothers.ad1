@@ -1325,6 +1325,55 @@ function createApp() {
     }
   });
 
+  app.post("/payments/stripe/intent", (request, response) => {
+    return response.status(202).json({
+      success: true,
+      rail: "Card",
+      status: "configuration_required",
+      message: "Stripe payment intent route is online. Add live Stripe credentials before collecting card payments.",
+      requestedAmount: Number(request.body?.amount || 0),
+      customer: String(request.body?.customer || "")
+    });
+  });
+
+  app.post("/payments/paypal/order", (request, response) => {
+    return response.status(202).json({
+      success: true,
+      rail: "PayPal",
+      status: "configuration_required",
+      message: "PayPal order route is online. Add live PayPal credentials before collecting PayPal payments.",
+      requestedAmount: Number(request.body?.amount || 0),
+      customer: String(request.body?.customer || "")
+    });
+  });
+
+  app.get("/payments/zelle/instructions", (_request, response) => {
+    return response.status(202).json({
+      success: true,
+      rail: "Zelle",
+      status: "configuration_required",
+      message: "Zelle instructions route is online. Configure the approved business Zelle email or phone before sending customer instructions."
+    });
+  });
+
+  app.get("/payments/wire/instructions", (_request, response) => {
+    return response.status(202).json({
+      success: true,
+      rail: "Wire",
+      status: "configuration_required",
+      message: "Wire instructions route is online. Configure verified business banking instructions before sending payment details."
+    });
+  });
+
+  app.get("/integrations/quickbooks/oauth/start", (_request, response) => {
+    return response.status(202).json({
+      success: true,
+      integration: "QuickBooks",
+      status: "configuration_required",
+      message: "QuickBooks OAuth route is online. Add Intuit OAuth credentials before starting a live QuickBooks connection."
+    });
+  });
+
   app.use(express.static(rootDir, { extensions: ["html"] }));
   app.use("/uploads", express.static(uploadsRoot));
 
