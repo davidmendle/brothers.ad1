@@ -18,7 +18,7 @@ const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES
 const storageKey = "brothers-os-workspace-v2";
 const workerAccessCode = "BROS-TIME";
 const adminAccessCode = "Issued by Super Admin";
-const employeeAllowedModuleKeys = ["time", "drylogs", "jobs", "photos", "equipment"];
+const employeeAllowedModuleKeys = ["time", "drylogs", "jobs", "photos", "equipment", "communications"];
 const brandLogoPath = brothersLogoDataUrl;
 const insuranceStatuses = ["all", "new", "reviewed", "in-progress", "completed", "rejected"];
 const rbacActionKeys = [
@@ -723,6 +723,9 @@ const defaultTeamMembers = [
     accountType: "Administrator",
     access: "Full access, billing, users, exports, AI, security, integrations",
     permissions: ["owner-dashboard", "user-management", "billing", "exports", "ai-admin", "security"],
+    accessCode: "OWNER-ADMIN",
+    assignedJobIds: [],
+    assignedTaskIds: [],
     status: "Active",
     lastLogin: "2026-06-06T08:30:00.000Z"
   },
@@ -732,8 +735,11 @@ const defaultTeamMembers = [
     email: "field@example.com",
     role: "Field manager",
     accountType: "Employee",
-    access: "Jobs, dry logs, time, sketch, equipment",
-    permissions: ["jobs", "drylogs", "time", "sketch", "equipment"],
+    access: "Jobs, dry logs, time, photos, equipment, communication board",
+    permissions: ["jobs", "drylogs", "time", "photos", "equipment", "communications"],
+    accessCode: "FIELD-2039",
+    assignedJobIds: ["J-2039"],
+    assignedTaskIds: ["TASK-1001"],
     status: "Invited",
     lastLogin: ""
   }
@@ -760,6 +766,8 @@ const defaultTasks = [
     id: "TASK-1001",
     title: "Upload Oak Avenue final photos",
     assigneeId: "TM-1002",
+    assigneeName: "Field Lead",
+    assigneeEmail: "field@example.com",
     moduleKey: "photos",
     relatedJob: "J-2039",
     due: "2026-06-07",
@@ -770,11 +778,29 @@ const defaultTasks = [
     id: "TASK-1002",
     title: "Review supplement rebuttal",
     assigneeId: "TM-1001",
+    assigneeName: "David",
+    assigneeEmail: "owner@example.com",
     moduleKey: "supplement",
     relatedJob: "J-2039",
     due: "2026-06-08",
     status: "Open",
     priority: "High"
+  }
+];
+
+const defaultPhotoRecords = [
+  {
+    id: "PHOTO-1001",
+    jobId: "J-2039",
+    room: "Living room",
+    category: "Completion",
+    photoRef: "IMG-2039-LR-014",
+    notes: "Final floor condition attached to closeout support.",
+    taskId: "TASK-1001",
+    workerId: "TM-1002",
+    workerName: "Field Lead",
+    workerEmail: "field@example.com",
+    createdAt: "2026-06-06T13:30:00.000Z"
   }
 ];
 
@@ -969,6 +995,7 @@ const defaultState = {
   accountProfile: defaultAccountProfile,
   teamMembers: defaultTeamMembers,
   tasks: defaultTasks,
+  photoRecords: defaultPhotoRecords,
   sketchRooms: defaultSketchRooms,
   performanceMetrics: defaultPerformanceMetrics,
   actionDashboard: defaultActionDashboard,
@@ -1070,6 +1097,53 @@ function normalizeJobRecord(job) {
   return { ...job, gates, linkedModules };
 }
 
+function normalizeListValue(value) {
+  return Array.isArray(value)
+    ? value.map((item) => String(item || "").trim()).filter(Boolean)
+    : String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function fallbackAccessCodeForMember(member, accountType) {
+  if (/admin/i.test(accountType)) return "OWNER-ADMIN";
+  const seed = String(member.id || member.email || member.name || "worker")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "")
+    .slice(0, 8)
+    .padEnd(8, "X");
+  return `EMP-${seed.slice(0, 4)}-${seed.slice(4, 8)}`;
+}
+
+function normalizeTeamMember(member) {
+  const accountType = member.accountType || (/owner|admin/i.test(`${member.role} ${member.access}`) ? "Administrator" : "Employee");
+  const permissions = Array.isArray(member.permissions)
+    ? member.permissions.map(String).filter(Boolean)
+    : String(member.access || "").split(",").map((item) => item.trim()).filter(Boolean);
+  const defaultPermissions = /admin/i.test(accountType)
+    ? ["owner-dashboard", "user-management", "billing", "exports", "ai-admin", "security"]
+    : ["time", "drylogs", "jobs", "photos", "equipment", "communications"];
+  return {
+    ...member,
+    accountType,
+    permissions: permissions.length ? permissions : defaultPermissions,
+    accessCode: String(member.accessCode || fallbackAccessCodeForMember(member, accountType)).trim().toUpperCase(),
+    assignedJobIds: normalizeListValue(member.assignedJobIds || member.assignedJobs || ""),
+    assignedTaskIds: normalizeListValue(member.assignedTaskIds || member.tasks || ""),
+    status: member.status || "Invited",
+    lastLogin: member.lastLogin || ""
+  };
+}
+
+function normalizeTaskRecord(task, teamMembers = []) {
+  const assignee = teamMembers.find((member) => member.id === task.assigneeId || member.email === task.assigneeEmail);
+  return {
+    ...task,
+    assigneeName: task.assigneeName || assignee?.name || "",
+    assigneeEmail: task.assigneeEmail || assignee?.email || "",
+    status: task.status || "Open",
+    priority: task.priority || "Medium"
+  };
+}
+
 function loadState() {
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey) || "null");
@@ -1106,12 +1180,10 @@ function normalizeState(next) {
   next.accountProfile.adminAccount = { ...clone(defaultAccountProfile.adminAccount), ...(next.accountProfile.adminAccount || {}) };
   next.accountProfile.employeePortal = { ...clone(defaultAccountProfile.employeePortal), ...(next.accountProfile.employeePortal || {}) };
   next.teamMembers = Array.isArray(next.teamMembers) ? mergeDefaultsById(next.teamMembers, defaultTeamMembers) : clone(defaultTeamMembers);
-  next.teamMembers = next.teamMembers.map((member) => ({
-    ...member,
-    accountType: member.accountType || (/owner|admin/i.test(`${member.role} ${member.access}`) ? "Administrator" : "Employee"),
-    permissions: Array.isArray(member.permissions) ? member.permissions : String(member.access || "").split(",").map((item) => item.trim()).filter(Boolean)
-  }));
+  next.teamMembers = next.teamMembers.map(normalizeTeamMember);
   next.tasks = Array.isArray(next.tasks) ? mergeDefaultsById(next.tasks, defaultTasks) : clone(defaultTasks);
+  next.tasks = next.tasks.map((task) => normalizeTaskRecord(task, next.teamMembers));
+  next.photoRecords = Array.isArray(next.photoRecords) ? mergeDefaultsById(next.photoRecords, defaultPhotoRecords) : clone(defaultPhotoRecords);
   next.sketchRooms = Array.isArray(next.sketchRooms) ? mergeDefaultsById(next.sketchRooms, defaultSketchRooms) : clone(defaultSketchRooms);
   next.performanceMetrics =
     next.performanceMetrics && typeof next.performanceMetrics === "object" ? { ...clone(defaultPerformanceMetrics), ...next.performanceMetrics } : clone(defaultPerformanceMetrics);
@@ -1198,6 +1270,7 @@ function persist() {
     accountProfile: state.accountProfile,
     teamMembers: state.teamMembers,
     tasks: state.tasks,
+    photoRecords: state.photoRecords,
     sketchRooms: state.sketchRooms,
     performanceMetrics: state.performanceMetrics,
     actionDashboard: state.actionDashboard,
@@ -1268,7 +1341,7 @@ function getLoginAccessOptions() {
 }
 
 function isModuleAllowedByAccess(key) {
-  if (state.employeeMode) return employeeAllowedModuleKeys.includes(key);
+  if (state.employeeMode) return employeeModuleKeys().includes(key);
   if (state.firebase.enabled && state.accessContext?.tabs?.length) {
     const tab = tabConfigByKey(key);
     return Boolean(tab && tab.visible !== false);
@@ -1277,8 +1350,8 @@ function isModuleAllowedByAccess(key) {
 }
 
 function routeToModule(key) {
-  if (state.employeeMode && !employeeAllowedModuleKeys.includes(key)) {
-    state.activeKey = "time";
+  if (state.employeeMode && !employeeModuleKeys().includes(key)) {
+    state.activeKey = employeeModuleKeys()[0] || "time";
     setToast("Employee portal is restricted to field modules");
     persist();
     render();
@@ -1594,8 +1667,8 @@ async function updateInsuranceSubmissionNotes(submissionId, notes) {
 }
 
 function activeModule() {
-  if (state.employeeMode && !employeeAllowedModuleKeys.includes(state.activeKey)) {
-    return moduleByKey("time") || modules[0];
+  if (state.employeeMode && !employeeModuleKeys().includes(state.activeKey)) {
+    return moduleByKey(employeeModuleKeys()[0] || "time") || modules[0];
   }
   if (!isModuleAllowedByAccess(state.activeKey)) {
     return modules.find((module) => isModuleAllowedByAccess(module.key)) || modules[0];
@@ -1705,7 +1778,7 @@ function renderDirectoryModuleTile(module) {
 }
 
 function filesForModule(key) {
-  return state.files.filter((file) => fileBelongsToModule(file, key));
+  return state.files.filter((file) => fileBelongsToModule(file, key)).filter(fileVisibleToCurrentWorker);
 }
 
 function fileBelongsToModule(file, key) {
@@ -3360,6 +3433,136 @@ function currentContractorId() {
   return state.authSession?.contractorId || currentSessionUser()?.contractorId || "";
 }
 
+function normalizeLocalAccessCode(value) {
+  return String(value || "").trim().toUpperCase().replace(/[\s-]+/g, "");
+}
+
+function employeeAccessCodeFor(member) {
+  return String(member?.accessCode || fallbackAccessCodeForMember(member || {}, member?.accountType || "Employee")).trim().toUpperCase();
+}
+
+function assignableTeamMembers() {
+  const secureUsers = (state.accessContext?.users || []).map(mapUserToTeamMember);
+  return mergeById(state.teamMembers || [], secureUsers).map(normalizeTeamMember);
+}
+
+function mergeSessionTeamMembers(users = []) {
+  if (!Array.isArray(users) || !users.length) return;
+  state.teamMembers = mergeById(state.teamMembers || [], users.map(mapUserToTeamMember)).map(normalizeTeamMember);
+}
+
+function currentWorkerMember() {
+  const worker = state.worker || {};
+  const workerId = String(worker.id || "").trim();
+  const workerEmail = String(worker.email || "").trim().toLowerCase();
+  const workerName = String(worker.name || "").trim().toLowerCase();
+  return assignableTeamMembers().find((member) => {
+    return (workerId && member.id === workerId)
+      || (workerEmail && String(member.email || "").toLowerCase() === workerEmail)
+      || (workerName && String(member.name || "").toLowerCase() === workerName);
+  }) || null;
+}
+
+function currentWorkerProfile() {
+  const member = currentWorkerMember();
+  return {
+    ...(member || {}),
+    ...(state.worker || {}),
+    permissions: state.worker?.permissions?.length ? state.worker.permissions : (member?.permissions || []),
+    assignedJobIds: state.worker?.assignedJobIds?.length ? state.worker.assignedJobIds : (member?.assignedJobIds || []),
+    assignedTaskIds: state.worker?.assignedTaskIds?.length ? state.worker.assignedTaskIds : (member?.assignedTaskIds || [])
+  };
+}
+
+function employeeModuleKeys() {
+  const profile = currentWorkerProfile();
+  const requestedKeys = Array.isArray(profile.permissions) && profile.permissions.length ? profile.permissions : employeeAllowedModuleKeys;
+  return [...new Set(requestedKeys)]
+    .filter((key) => employeeAllowedModuleKeys.includes(key))
+    .filter((key) => moduleByKey(key));
+}
+
+function taskMatchesCurrentWorker(task) {
+  const profile = currentWorkerProfile();
+  const assignedTaskIds = new Set(normalizeListValue(profile.assignedTaskIds));
+  const workerId = String(profile.id || "").trim();
+  const workerEmail = String(profile.email || "").trim().toLowerCase();
+  const workerName = String(profile.name || "").trim().toLowerCase();
+  return assignedTaskIds.has(task.id)
+    || (workerId && task.assigneeId === workerId)
+    || (workerEmail && String(task.assigneeEmail || task.contractorEmail || "").toLowerCase() === workerEmail)
+    || (workerName && String(task.assigneeName || "").toLowerCase() === workerName);
+}
+
+function jobReferenceValues(job) {
+  return [job?.id, job?.jobId, job?.title, job?.customer, job?.property, job?.owner]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+}
+
+function currentWorkerAllowedJobRefs() {
+  const profile = currentWorkerProfile();
+  const refs = new Set(normalizeListValue(profile.assignedJobIds));
+  state.tasks.filter(taskMatchesCurrentWorker).forEach((task) => {
+    if (task.relatedJob) refs.add(String(task.relatedJob).trim());
+  });
+  if (state.clockSession?.job) refs.add(String(state.clockSession.job).trim());
+  [...refs].forEach((ref) => {
+    const job = jobByJobId(ref);
+    if (job) jobReferenceValues(job).forEach((value) => refs.add(value));
+  });
+  return refs;
+}
+
+function jobMatchesCurrentWorker(job) {
+  const refs = currentWorkerAllowedJobRefs();
+  const workerName = String(currentWorkerProfile().name || "").trim().toLowerCase();
+  return jobReferenceValues(job).some((value) => refs.has(value))
+    || (workerName && String(job.owner || "").trim().toLowerCase() === workerName);
+}
+
+function timeEntryMatchesCurrentWorker(entry) {
+  const profile = currentWorkerProfile();
+  const workerId = String(profile.id || "").trim();
+  const workerEmail = String(profile.email || "").trim().toLowerCase();
+  const workerName = String(profile.name || "").trim().toLowerCase();
+  const allowedJobs = currentWorkerAllowedJobRefs();
+  const entryJob = String(entry.job || entry.relatedJob || "").trim();
+  return (workerId && entry.workerId === workerId)
+    || (workerEmail && String(entry.workerEmail || "").toLowerCase() === workerEmail)
+    || (workerName && String(entry.worker || "").toLowerCase() === workerName)
+    || (entryJob && allowedJobs.has(entryJob));
+}
+
+function fileVisibleToCurrentWorker(file) {
+  if (!state.employeeMode) return true;
+  const profile = currentWorkerProfile();
+  const workerName = String(profile.name || "").trim().toLowerCase();
+  const workerEmail = String(profile.email || "").trim().toLowerCase();
+  const allowedJobs = currentWorkerAllowedJobRefs();
+  const relatedJob = String(file.relatedJob || "").trim();
+  return (relatedJob && allowedJobs.has(relatedJob))
+    || (workerName && String(file.owner || "").toLowerCase() === workerName)
+    || (workerEmail && String(file.ownerEmail || file.contractorEmail || "").toLowerCase() === workerEmail)
+    || (!relatedJob && fileLinkedModules(file).some((key) => employeeModuleKeys().includes(key)));
+}
+
+function visiblePhotoRecords() {
+  if (!state.employeeMode && (canViewAllCompanyData() || isFranchiseScopedRole())) return state.photoRecords || [];
+  const allowedJobs = new Set(visibleJobBoards().flatMap(jobReferenceValues));
+  const profile = currentWorkerProfile();
+  const workerId = String(profile.id || "").trim();
+  const workerEmail = String(profile.email || "").trim().toLowerCase();
+  const workerName = String(profile.name || "").trim().toLowerCase();
+  return (state.photoRecords || []).filter((record) => {
+    const jobId = String(record.jobId || record.relatedJob || "").trim();
+    return (jobId && allowedJobs.has(jobId))
+      || (workerId && record.workerId === workerId)
+      || (workerEmail && String(record.workerEmail || "").toLowerCase() === workerEmail)
+      || (workerName && String(record.workerName || "").toLowerCase() === workerName);
+  });
+}
+
 function taskMatchesCurrentContractor(task) {
   const assignedTaskIds = Array.isArray(currentSessionUser()?.assignedTaskIds) ? currentSessionUser().assignedTaskIds : [];
   const uid = currentUserUid();
@@ -3372,6 +3575,7 @@ function taskMatchesCurrentContractor(task) {
 }
 
 function visibleTasks() {
+  if (state.employeeMode) return state.tasks.filter(taskMatchesCurrentWorker);
   if (!state.authSession) return state.tasks;
   if (canViewAllCompanyData()) return state.tasks;
   if (isFranchiseScopedRole()) {
@@ -3384,12 +3588,18 @@ function visibleTasks() {
   if (isWorkerScopedRole()) {
     const assignedTaskIds = Array.isArray(currentSessionUser()?.assignedTaskIds) ? currentSessionUser().assignedTaskIds : [];
     const uid = currentUserUid();
-    return state.tasks.filter((task) => assignedTaskIds.includes(task.id) || task.assigneeId === uid);
+    const email = String(state.authSession?.email || currentSessionUser()?.email || "").toLowerCase();
+    const name = currentUserName().toLowerCase();
+    return state.tasks.filter((task) => assignedTaskIds.includes(task.id)
+      || (uid && task.assigneeId === uid)
+      || (email && String(task.assigneeEmail || "").toLowerCase() === email)
+      || (name && String(task.assigneeName || "").toLowerCase() === name));
   }
   return state.tasks;
 }
 
 function visibleJobBoards() {
+  if (state.employeeMode) return state.jobBoards.filter(jobMatchesCurrentWorker);
   if (!state.authSession) return state.jobBoards;
   if (canViewAllCompanyData()) return state.jobBoards;
   if (isFranchiseScopedRole()) {
@@ -3419,6 +3629,7 @@ function visibleJobBoards() {
 }
 
 function visibleTimeEntries() {
+  if (state.employeeMode) return state.timeEntries.filter(timeEntryMatchesCurrentWorker);
   if (!state.authSession) return state.timeEntries;
   if (canViewAllCompanyData() || isFranchiseScopedRole()) return state.timeEntries;
   if (isContractorScopedRole()) {
@@ -3434,10 +3645,24 @@ function visibleTimeEntries() {
   }
   if (isWorkerScopedRole()) {
     const workerName = currentUserName().toLowerCase();
+    const workerEmail = String(state.authSession?.email || currentSessionUser()?.email || "").toLowerCase();
     const allowedJobs = new Set(visibleJobBoards().map((job) => String(job.jobId || "").trim()));
-    return state.timeEntries.filter((entry) => String(entry.worker || "").toLowerCase() === workerName || allowedJobs.has(String(entry.job || "").trim()));
+    return state.timeEntries.filter((entry) => String(entry.worker || "").toLowerCase() === workerName
+      || (workerEmail && String(entry.workerEmail || "").toLowerCase() === workerEmail)
+      || allowedJobs.has(String(entry.job || "").trim()));
   }
   return state.timeEntries;
+}
+
+function visibleDryLogs() {
+  if (!state.employeeMode && (canViewAllCompanyData() || isFranchiseScopedRole())) return state.dryLogs;
+  const allowedJobs = new Set(visibleJobBoards().flatMap(jobReferenceValues));
+  const workerName = String(currentWorkerProfile().name || currentUserName() || "").trim().toLowerCase();
+  return state.dryLogs.filter((log) => {
+    const jobId = String(log.jobId || "").trim();
+    return (jobId && allowedJobs.has(jobId))
+      || (workerName && String(log.technician || "").toLowerCase() === workerName);
+  });
 }
 
 function businessRecordsByType(type) {
@@ -3544,8 +3769,15 @@ function upsertAccessRequest(request) {
 function upsertManagedUser(user) {
   if (!user) return;
   state.accessContext = state.accessContext || {};
-  state.accessContext.users = mergeById([user], state.accessContext.users || []);
-  state.teamMembers = mergeById([mapUserToTeamMember(user)], state.teamMembers || []);
+  state.accessContext.users = mergeById(state.accessContext.users || [], [user]);
+  state.teamMembers = mergeById(state.teamMembers || [], [mapUserToTeamMember(user)]).map(normalizeTeamMember);
+}
+
+function upsertLocalTeamMember(member) {
+  if (!member) return null;
+  const normalized = normalizeTeamMember(member);
+  state.teamMembers = mergeById(state.teamMembers || [], [normalized]).map(normalizeTeamMember);
+  return normalized;
 }
 
 function removeManagedUser(uid) {
@@ -3689,9 +3921,7 @@ async function bootstrapFirebaseAuth() {
     } : null;
     state.businessData = session?.businessData || [];
     state.communityPosts = session?.communityPosts || [];
-    if (session?.users?.length) {
-      state.teamMembers = session.users.map(mapUserToTeamMember);
-    }
+    mergeSessionTeamMembers(session?.users || []);
     await hydrateClientFirebaseData();
     state.authChecked = true;
     state.authError = "";
@@ -3726,9 +3956,7 @@ async function refreshAccessContext() {
     } : null;
   state.businessData = session?.businessData || [];
   state.communityPosts = session?.communityPosts || [];
-  if (session?.users?.length) {
-    state.teamMembers = session.users.map(mapUserToTeamMember);
-  }
+  mergeSessionTeamMembers(session?.users || []);
   await hydrateClientFirebaseData();
 }
 
@@ -3972,13 +4200,35 @@ async function createSecureUser(formData) {
     accessExpiresAt: String(formData.get("accessExpiresAt") || "").trim(),
     accessScope: String(formData.get("accessScope") || "").trim()
   };
-  const result = await apiRequest("/api/rbac/users", {
-    method: "POST",
-    body: JSON.stringify(payload)
-  });
-  upsertManagedUser(result.user);
-  setToast("Firebase user created and added to managed users");
-  await refreshAccessContext().catch(() => render());
+  try {
+    const result = await apiRequest("/api/rbac/users", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    upsertManagedUser(result.user);
+    setToast("Firebase user created and added to managed users");
+    await refreshAccessContext().catch(() => render());
+  } catch (error) {
+    if (!isAdminCredentialGap(error)) throw error;
+    const member = upsertLocalTeamMember({
+      id: createId("TM"),
+      name: payload.displayName || payload.email || "Worker",
+      email: payload.email,
+      role: payload.roleId.replace(/_/g, " "),
+      accountType: payload.roleId === "contractor" ? "Contractor portal" : "Employee",
+      access: "Local field access until Firebase Admin user creation is enabled",
+      permissions: payload.roleId === "contractor" ? ["jobs", "time", "equipment", "photos", "communications"] : ["time", "drylogs", "jobs", "photos", "equipment", "communications"],
+      accessCode: payload.accessCode || createId(payload.roleId === "contractor" ? "CON" : "EMP"),
+      assignedJobIds: [],
+      assignedTaskIds: [],
+      status: "Local invite",
+      lastLogin: ""
+    });
+    addActivity(`Created local employee access profile for ${member.name}.`);
+    persist();
+    setToast("Local employee profile created");
+    render();
+  }
 }
 
 async function saveRolePermissions(formData) {
@@ -4088,6 +4338,9 @@ function mapUserToTeamMember(member) {
     accountType: roleId,
     access: roleId,
     permissions: Object.keys(member.permissionsOverride?.actions || {}).filter((key) => member.permissionsOverride.actions[key]),
+    accessCode: member.accessCode || "",
+    assignedJobIds: Array.isArray(member.assignedJobIds) ? member.assignedJobIds : [],
+    assignedTaskIds: Array.isArray(member.assignedTaskIds) ? member.assignedTaskIds : [],
     status: member.disabled ? "Disabled" : (member.status || "Active"),
     companyId: member.companyId || "",
     franchiseIds: Array.isArray(member.franchiseIds) ? member.franchiseIds : [],
@@ -4267,6 +4520,123 @@ function addDryLogRecord(formData) {
   addActivity(`Added dry log for ${log.jobId} ${log.room}.`);
   persist();
   setToast("Dry log saved and job gate updated");
+  render();
+}
+
+function selectedBrowserFile(formData, name) {
+  const file = formData.get(name);
+  return file && typeof file === "object" && file.name ? file : null;
+}
+
+function readImageDataUrl(file) {
+  if (!file || typeof FileReader === "undefined") return Promise.resolve("");
+  if (Number(file.size || 0) > 1800000) {
+    throw new Error("Photo is too large for local field storage. Use a compressed image or paste an evidence link.");
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Unable to read the selected photo."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function markJobGateDone(jobRef, gateId) {
+  const job = jobByJobId(jobRef);
+  const gate = job?.gates?.find((item) => item.id === gateId);
+  if (gate) gate.status = "Done";
+  const linkedModules = Array.isArray(job?.linkedModules) ? job.linkedModules : [];
+  if (job && !linkedModules.includes(gateId)) job.linkedModules = [...linkedModules, gateId];
+  return job;
+}
+
+async function addPhotoEvidence(formData) {
+  const file = selectedBrowserFile(formData, "photoFile");
+  const photoDataUrl = file ? await readImageDataUrl(file) : "";
+  const worker = currentWorkerProfile();
+  const taskId = String(formData.get("taskId") || "").trim();
+  const task = state.tasks.find((item) => item.id === taskId);
+  const record = {
+    id: createId("PHOTO"),
+    jobId: String(formData.get("jobId") || task?.relatedJob || "").trim(),
+    room: String(formData.get("room") || "Field area").trim(),
+    category: String(formData.get("category") || "Progress").trim(),
+    photoRef: String(formData.get("photoRef") || file?.name || "").trim(),
+    photoDataUrl,
+    photoSize: file?.size || 0,
+    photoType: file?.type || "",
+    notes: String(formData.get("notes") || "").trim(),
+    taskId,
+    workerId: worker.id || "",
+    workerName: worker.name || state.worker?.name || "Field worker",
+    workerEmail: worker.email || "",
+    createdAt: new Date().toISOString()
+  };
+  if (!record.jobId) {
+    setToast("Select a job before saving photo evidence");
+    return render();
+  }
+  state.photoRecords = [record, ...(state.photoRecords || [])];
+  const job = markJobGateDone(record.jobId, "photos");
+  if (task && task.moduleKey === "photos") {
+    task.status = "Complete";
+  }
+  createFile({
+    moduleKey: "photos",
+    linkedModuleKeys: ["jobs", "drylogs", "time", "equipment", "payments", "defensibility", "closeout"],
+    sourceType: "photoEvidence",
+    sourceId: record.id,
+    customer: job?.customer || "",
+    title: `${record.jobId} ${record.room} ${record.category} photo`,
+    type: "Photo evidence",
+    owner: record.workerName,
+    status: "Complete",
+    priority: task?.priority || "Medium",
+    due: today.toISOString().slice(0, 10),
+    relatedJob: record.jobId,
+    notes: [
+      `Photo reference: ${record.photoRef || "Uploaded local image"}`,
+      `Task: ${task?.title || "No task selected"}`,
+      `Room: ${record.room}`,
+      `Category: ${record.category}`,
+      `Worker: ${record.workerName} ${record.workerEmail || ""}`.trim(),
+      record.notes
+    ].filter(Boolean).join("\n")
+  });
+  addActivity(`${record.workerName} saved photo evidence for ${record.jobId}.`);
+  persist();
+  setToast("Photo evidence saved");
+  render();
+}
+
+function addJobNote(formData) {
+  const worker = currentWorkerProfile();
+  const jobId = String(formData.get("jobId") || "").trim();
+  const noteType = String(formData.get("noteType") || "Field note").trim();
+  const notes = String(formData.get("notes") || "").trim();
+  const job = jobByJobId(jobId);
+  if (!jobId || !notes) {
+    setToast("Job and note are required");
+    return render();
+  }
+  createFile({
+    moduleKey: "jobs",
+    linkedModuleKeys: ["photos", "time", "drylogs", "equipment", "communications", "closeout"],
+    sourceType: "jobNote",
+    sourceId: createId("NOTE"),
+    customer: job?.customer || "",
+    title: `${jobId} ${noteType}`,
+    type: "Field note",
+    owner: worker.name || state.worker?.name || "Field worker",
+    status: "Open",
+    priority: noteType === "Issue" ? "High" : "Medium",
+    due: today.toISOString().slice(0, 10),
+    relatedJob: jobId,
+    notes
+  });
+  addActivity(`${worker.name || "Field worker"} added a job note for ${jobId}.`);
+  persist();
+  setToast("Job note saved");
   render();
 }
 
@@ -5235,18 +5605,43 @@ function connectQuickBooks() {
 function addTeamMember(formData) {
   const accountType = String(formData.get("accountType") || "Employee");
   const permissions = formData.getAll("permissions").map(String);
-  const member = {
+  const accessCode = String(formData.get("accessCode") || createId(accountType === "Contractor portal" ? "CON" : "EMP")).trim().toUpperCase();
+  const assignedJobIds = csvValues(formData.get("assignedJobIds"));
+  const member = normalizeTeamMember({
     id: createId("TM"),
     name: String(formData.get("name") || "Team member").trim(),
     email: String(formData.get("email") || "").trim(),
     role: String(formData.get("role") || "User").trim(),
     accountType,
     access: String(formData.get("access") || "Assigned modules").trim(),
-    permissions: permissions.length ? permissions : accountType === "Administrator" ? ["owner-dashboard", "user-management", "billing", "exports", "ai-admin", "security"] : ["time", "drylogs", "jobs"],
+    permissions: permissions.length ? permissions : accountType === "Administrator" ? ["owner-dashboard", "user-management", "billing", "exports", "ai-admin", "security"] : ["time", "drylogs", "jobs", "photos", "equipment", "communications"],
+    accessCode,
+    assignedJobIds,
+    assignedTaskIds: [],
     status: "Invited",
     lastLogin: ""
-  };
-  state.teamMembers = [member, ...state.teamMembers];
+  });
+  state.teamMembers = [member, ...state.teamMembers.filter((item) => item.id !== member.id)];
+  createFile({
+    moduleKey: "team",
+    linkedModuleKeys: ["jobs", "time", "photos", "communications"],
+    sourceType: "teamMember",
+    sourceId: member.id,
+    title: `${member.name} employee access profile`,
+    type: "User access",
+    owner: "Super Admin",
+    status: member.status,
+    priority: assignedJobIds.length ? "Medium" : "High",
+    due: today.toISOString().slice(0, 10),
+    relatedJob: assignedJobIds[0] || "",
+    notes: [
+      `Email: ${member.email}`,
+      `Role: ${member.role}`,
+      `Portal code: ${member.accessCode}`,
+      `Modules: ${(member.permissions || []).join(", ")}`,
+      `Assigned jobs: ${assignedJobIds.join(", ") || "None yet"}`
+    ].join("\n")
+  });
   addActivity(`Created login invitation for ${member.name}.`);
   persist();
   setToast("Team login created");
@@ -5254,21 +5649,98 @@ function addTeamMember(formData) {
 }
 
 function addTask(formData) {
+  const assigneeId = String(formData.get("assigneeId") || assignableTeamMembers()[0]?.id || "");
+  const assignee = assignableTeamMembers().find((member) => member.id === assigneeId);
+  const relatedJob = String(formData.get("relatedJob") || "").trim();
   const task = {
     id: createId("TASK"),
     title: String(formData.get("title") || "Task").trim(),
-    assigneeId: String(formData.get("assigneeId") || state.teamMembers[0]?.id || ""),
+    assigneeId,
+    assigneeName: assignee?.name || "",
+    assigneeEmail: assignee?.email || "",
     moduleKey: String(formData.get("moduleKey") || "jobs"),
-    relatedJob: String(formData.get("relatedJob") || "").trim(),
+    relatedJob,
     due: String(formData.get("due") || ""),
     status: "Open",
     priority: String(formData.get("priority") || "Medium")
   };
   state.tasks = [task, ...state.tasks];
+  state.teamMembers = (state.teamMembers || []).map((member) => {
+    if (member.id !== assigneeId) return member;
+    const assignedTaskIds = [...new Set([task.id, ...normalizeListValue(member.assignedTaskIds)])];
+    const assignedJobIds = [...new Set([...(relatedJob ? [relatedJob] : []), ...normalizeListValue(member.assignedJobIds)])];
+    return normalizeTeamMember({ ...member, assignedTaskIds, assignedJobIds });
+  });
+  createFile({
+    moduleKey: "team",
+    linkedModuleKeys: ["jobs", task.moduleKey, "time", "photos"],
+    sourceType: "taskAssignment",
+    sourceId: task.id,
+    title: `${assignee?.name || "Unassigned"} task - ${task.title}`,
+    type: "Task assignment",
+    owner: assignee?.name || "Dispatcher",
+    status: task.status,
+    priority: task.priority,
+    due: task.due,
+    relatedJob: task.relatedJob,
+    notes: [
+      `Task: ${task.title}`,
+      `Assignee: ${assignee?.name || "Unassigned"} ${assignee?.email || ""}`.trim(),
+      `Module: ${moduleByKey(task.moduleKey)?.label || task.moduleKey}`,
+      `Related job: ${task.relatedJob || "None"}`
+    ].join("\n")
+  });
   addActivity(`Assigned task: ${task.title}.`);
   persist();
   setToast("Task assigned");
   render();
+}
+
+function fieldSessionForMember(member, accessCode) {
+  return {
+    id: member.id,
+    name: member.name,
+    email: member.email,
+    code: employeeAccessCodeFor(member),
+    accountType: member.accountType || "Employee",
+    role: member.role || "Worker",
+    permissions: (member.permissions || []).filter((key) => employeeAllowedModuleKeys.includes(key)),
+    assignedJobIds: normalizeListValue(member.assignedJobIds),
+    assignedTaskIds: normalizeListValue(member.assignedTaskIds),
+    accessCodeEntered: String(accessCode || "").trim()
+  };
+}
+
+function findEmployeeForPortalLogin(identifier, accessCode) {
+  const normalizedCode = normalizeLocalAccessCode(accessCode);
+  const normalizedIdentifier = String(identifier || "").trim().toLowerCase();
+  return assignableTeamMembers().find((member) => {
+    const codeMatches = normalizeLocalAccessCode(employeeAccessCodeFor(member)) === normalizedCode;
+    if (!codeMatches) return false;
+    if (!normalizedIdentifier) return true;
+    return [member.id, member.email, member.name]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .some((value) => value === normalizedIdentifier);
+  }) || null;
+}
+
+function loginEmployeePortal(formData) {
+  const identifier = String(formData.get("identifier") || formData.get("email") || formData.get("name") || "").trim();
+  const code = String(formData.get("code") || "").trim();
+  const member = findEmployeeForPortalLogin(identifier, code);
+  if (!member) {
+    setToast("Employee profile or access code was not accepted");
+    return render();
+  }
+  state.teamMembers = (state.teamMembers || []).map((item) =>
+    item.id === member.id ? normalizeTeamMember({ ...item, status: "Active", lastLogin: new Date().toISOString() }) : item
+  );
+  state.worker = fieldSessionForMember(member, code);
+  state.employeeMode = true;
+  state.modal = null;
+  addActivity(`${member.name} entered employee field access.`);
+  persist();
+  routeToModule(employeeModuleKeys()[0] || "time");
 }
 
 function completeTask(taskId) {
@@ -5510,7 +5982,7 @@ function askAiCopilot(promptText = "") {
     const lower = query.toLowerCase();
     return lower.startsWith("open ") && (lower.includes(module.key.toLowerCase()) || lower.includes(module.label.toLowerCase()));
   });
-  if (targetModule && (!state.employeeMode || employeeAllowedModuleKeys.includes(targetModule.key))) {
+  if (targetModule && (!state.employeeMode || employeeModuleKeys().includes(targetModule.key))) {
     state.activeKey = targetModule.key;
   }
   rememberCopilotExchange(query, answer);
@@ -5746,11 +6218,18 @@ function createEquipmentInvoice(deploymentId) {
 
 async function clockIn(formData) {
   const gps = await requestGps();
+  const selectedTaskValue = String(formData.get("task") || "").trim();
+  const selectedTask = state.tasks.find((task) => task.id === selectedTaskValue) || state.tasks.find((task) => task.title === selectedTaskValue);
+  const worker = currentWorkerProfile();
+  const job = String(formData.get("job") || selectedTask?.relatedJob || "Unassigned").trim();
   state.clockSession = {
     id: createId("T"),
-    worker: state.worker?.name || formData.get("worker") || "Employee",
-    job: formData.get("job") || "Unassigned",
-    task: formData.get("task") || "Field work",
+    workerId: worker.id || "",
+    workerEmail: worker.email || "",
+    worker: worker.name || formData.get("worker") || "Employee",
+    job,
+    taskId: selectedTask?.id || "",
+    task: selectedTask?.title || selectedTaskValue || "Field work",
     billable: formData.get("billable") === "on",
     start: new Date().toISOString(),
     startGps: gps
@@ -5774,7 +6253,7 @@ async function clockOut() {
   state.clockSession = null;
   createFile({
     moduleKey: "time",
-    linkedModuleKeys: ["jobs", "payments", "reports", "closeout"],
+    linkedModuleKeys: ["jobs", "payments", "reports", "closeout", "photos"],
     sourceType: "timeEntry",
     sourceId: entry.id,
     title: `${entry.worker} labor time - ${entry.job}`,
@@ -5958,7 +6437,7 @@ function renderSidebar() {
           </label>
         </div>
         <div class="quick-grid">
-          ${(state.employeeMode ? employeeAllowedModuleKeys : pinnedKeys())
+          ${(state.employeeMode ? employeeModuleKeys() : pinnedKeys())
             .map((key) => moduleByKey(key))
             .filter(Boolean)
             .map(
@@ -6010,10 +6489,10 @@ function renderTrialBanner() {
       <section class="trial-banner">
         <div>
           <strong>Employee field portal</strong>
-          <span>Restricted access: time, dry logs, jobs, photos, and equipment</span>
+          <span>Restricted access: time, dry logs, jobs, photos, equipment, and communication board</span>
         </div>
         <div class="trial-actions">
-          ${employeeAllowedModuleKeys
+          ${employeeModuleKeys()
             .map((key) => moduleByKey(key))
             .filter(Boolean)
             .map((module) => `<button type="button" data-action="set-active" data-key="${module.key}">${escapeHtml(module.label)}</button>`)
@@ -6122,6 +6601,7 @@ function renderScreen(module) {
   if (module.key === "time") return renderTimeModule(module);
   if (module.key === "equipment") return renderEquipmentModule(module);
   if (module.key === "drylogs") return renderDryLogsModule(module);
+  if (module.key === "photos") return renderPhotosModule(module);
   if (module.key === "jobs") return renderJobTrackerModule(module);
   if (module.key === "insurance") return renderInsuranceModule(module);
   if (module.key === "relationships") return renderRelationshipModule(module);
@@ -7532,9 +8012,11 @@ function renderJobForm() {
 }
 
 function renderDryLogsModule(module) {
-  const openReadings = state.dryLogs.filter((log) => dryLogGap(log) > 0).length;
-  const atTarget = state.dryLogs.filter((log) => dryLogGap(log) <= 0).length;
-  const avgGap = state.dryLogs.length ? state.dryLogs.reduce((sum, log) => sum + dryLogGap(log), 0) / state.dryLogs.length : 0;
+  const dryLogs = visibleDryLogs();
+  const jobs = visibleJobBoards();
+  const openReadings = dryLogs.filter((log) => dryLogGap(log) > 0).length;
+  const atTarget = dryLogs.filter((log) => dryLogGap(log) <= 0).length;
+  const avgGap = dryLogs.length ? dryLogs.reduce((sum, log) => sum + dryLogGap(log), 0) / dryLogs.length : 0;
   return `
     <section class="hero-band drylog-hero">
       <div>
@@ -7547,7 +8029,7 @@ function renderDryLogsModule(module) {
         </div>
       </div>
       <div class="metric-strip">
-        <div><strong>${state.dryLogs.length}</strong><span>Readings</span></div>
+        <div><strong>${dryLogs.length}</strong><span>Readings</span></div>
         <div><strong>${openReadings}</strong><span>Above target</span></div>
         <div><strong>${atTarget}</strong><span>At target</span></div>
         <div><strong>${avgGap.toFixed(1)}</strong><span>Avg gap</span></div>
@@ -7560,7 +8042,7 @@ function renderDryLogsModule(module) {
           <a class="text-link" href="#module/defensibility" data-action="set-active" data-key="defensibility">Defensibility</a>
         </div>
         <div class="drylog-job-grid">
-          ${state.jobBoards.map(renderDryLogJobCard).join("")}
+          ${jobs.map(renderDryLogJobCard).join("")}
         </div>
       </div>
       <div class="panel">
@@ -7573,7 +8055,7 @@ function renderDryLogsModule(module) {
         <div><h2>Reading history</h2><p>All readings stay tied to jobs, rooms, equipment, and invoice support.</p></div>
         <button type="button" data-action="open-export">Export</button>
       </div>
-      ${renderDryLogTable()}
+      ${renderDryLogTable(dryLogs)}
     </section>
     ${renderQueue(module.key)}
     ${renderModuleFiles(module)}
@@ -7605,10 +8087,11 @@ function renderDryLogJobCard(job) {
 }
 
 function renderDryLogForm() {
+  const jobs = visibleJobBoards();
   return `
     <form class="stack-form" data-form="dry-log">
       <div class="form-grid">
-        <label><span>Job</span><select name="jobId">${state.jobBoards.map((job) => `<option value="${job.jobId}">${escapeHtml(job.jobId)} - ${escapeHtml(job.title)}</option>`).join("")}</select></label>
+        <label><span>Job</span><select name="jobId">${jobs.map((job) => `<option value="${job.jobId}">${escapeHtml(job.jobId)} - ${escapeHtml(job.title)}</option>`).join("")}</select></label>
         <label><span>Reading date</span><input name="readingDate" type="date" value="${today.toISOString().slice(0, 10)}" /></label>
         <label><span>Technician</span><input name="technician" value="${escapeHtml(state.worker?.name || "")}" placeholder="Field tech" /></label>
         <label><span>Room</span><input name="room" required placeholder="Living room, hall, unit 2B" /></label>
@@ -7639,15 +8122,15 @@ function renderDryLogForm() {
   `;
 }
 
-function renderDryLogTable() {
-  if (!state.dryLogs.length) {
+function renderDryLogTable(logs = visibleDryLogs()) {
+  if (!logs.length) {
     return `<div class="empty-state"><strong>No dry logs yet</strong><span>Add a reading to start job-connected drying documentation.</span></div>`;
   }
   return `
     <table class="data-table drylog-table">
       <thead><tr><th>Job</th><th>Room/material</th><th>Reading</th><th>RH/temp</th><th>Equipment/photos</th><th>Status</th></tr></thead>
       <tbody>
-        ${state.dryLogs
+        ${logs
           .map(
             (log) => `
               <tr>
@@ -7663,6 +8146,99 @@ function renderDryLogTable() {
           .join("")}
       </tbody>
     </table>
+  `;
+}
+
+function renderPhotosModule(module) {
+  const photos = visiblePhotoRecords();
+  const jobs = visibleJobBoards();
+  const photoTasks = visibleTasks().filter((task) => task.moduleKey === "photos" && task.status !== "Complete");
+  return `
+    <section class="hero-band">
+      <div>
+        <span class="hero-eyebrow">Field evidence</span>
+        <h2>${escapeHtml(module.label)}</h2>
+        <p>Upload job photos, attach them to assigned tasks, and add job notes that flow into billing, defensibility, closeout, and the job gate board.</p>
+        <div class="hero-actions">
+          <a href="#module/jobs" data-action="set-active" data-key="jobs">Assigned jobs</a>
+          <a href="#module/time" data-action="set-active" data-key="time">Time log</a>
+          <a href="#module/drylogs" data-action="set-active" data-key="drylogs">Dry logs</a>
+          <button type="button" data-action="open-create-file" data-key="photos">Manual photo file</button>
+        </div>
+      </div>
+      <div class="metric-strip">
+        <div><strong>${photos.length}</strong><span>Photos</span></div>
+        <div><strong>${jobs.length}</strong><span>Assigned jobs</span></div>
+        <div><strong>${photoTasks.length}</strong><span>Open photo tasks</span></div>
+      </div>
+    </section>
+    <section class="team-layout">
+      <div class="panel">
+        <div class="panel-head"><div><h2>Upload job photo</h2><p>Save before, progress, completion, equipment, or invoice-support photos against a job and task.</p></div></div>
+        ${renderPhotoEvidenceForm(jobs, photoTasks)}
+      </div>
+      <div class="panel">
+        <div class="panel-head"><div><h2>Add job note</h2><p>Field notes become linked job files visible in related modules.</p></div></div>
+        ${renderJobNoteForm(jobs)}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <div><h2>Photo evidence board</h2><p>Photos are scoped to assigned jobs for workers and linked across the operating loop.</p></div>
+        <div class="workflow-links">${renderLinkedModuleChips(["jobs", "time", "drylogs", "equipment", "payments", "defensibility", "closeout"])}</div>
+      </div>
+      ${photos.length ? `<div class="business-record-grid">${photos.map(renderPhotoRecordCard).join("")}</div>` : `<div class="empty-state"><strong>No photo evidence yet</strong><span>Upload a photo or save a field note for an assigned job.</span></div>`}
+    </section>
+    ${renderQueue(module.key)}
+    ${renderModuleFiles(module)}
+    ${renderFileDetail(module)}
+  `;
+}
+
+function renderPhotoEvidenceForm(jobs, photoTasks) {
+  return `
+    <form class="stack-form" data-form="photo-evidence">
+      <div class="form-grid">
+        <label><span>Job</span><select name="jobId" required>${jobs.length ? jobs.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.jobId)} - ${escapeHtml(job.title)}</option>`).join("") : `<option value="">No assigned jobs</option>`}</select></label>
+        <label><span>Task</span><select name="taskId"><option value="">No task selected</option>${photoTasks.map((task) => `<option value="${escapeHtml(task.id)}">${escapeHtml(task.title)}${task.relatedJob ? ` - ${escapeHtml(task.relatedJob)}` : ""}</option>`).join("")}</select></label>
+        <label><span>Room / area</span><input name="room" required placeholder="Kitchen, hall, equipment room" /></label>
+        <label><span>Category</span><select name="category"><option>Before</option><option>Progress</option><option>Completion</option><option>Equipment</option><option>Invoice support</option><option>Issue</option></select></label>
+        <label><span>Photo file</span><input name="photoFile" type="file" accept="image/*" /></label>
+        <label><span>Photo reference or link</span><input name="photoRef" placeholder="IMG_2042.jpg or cloud link" /></label>
+      </div>
+      <label><span>Notes</span><textarea name="notes" rows="3" placeholder="What this photo proves, affected material, location, equipment, or invoice support"></textarea></label>
+      <button type="submit">Save photo evidence</button>
+    </form>
+  `;
+}
+
+function renderJobNoteForm(jobs) {
+  return `
+    <form class="stack-form" data-form="job-note">
+      <div class="form-grid">
+        <label><span>Job</span><select name="jobId" required>${jobs.length ? jobs.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.jobId)} - ${escapeHtml(job.title)}</option>`).join("") : `<option value="">No assigned jobs</option>`}</select></label>
+        <label><span>Note type</span><select name="noteType"><option>Field note</option><option>Issue</option><option>Customer update</option><option>Scope note</option><option>Material note</option><option>Safety note</option></select></label>
+      </div>
+      <label><span>Note</span><textarea name="notes" rows="4" required placeholder="Add field update, condition note, customer communication, material issue, or next action"></textarea></label>
+      <button type="submit">Save job note</button>
+    </form>
+  `;
+}
+
+function renderPhotoRecordCard(record) {
+  const task = state.tasks.find((item) => item.id === record.taskId);
+  return `
+    <article class="business-card">
+      <div class="file-card-head"><span>${escapeHtml(record.category || "Photo")}</span><strong>${escapeHtml(formatTime(record.createdAt))}</strong></div>
+      ${record.photoDataUrl ? `<img src="${escapeHtml(record.photoDataUrl)}" alt="${escapeHtml(record.photoRef || record.room || "Job photo")}" style="width:100%;max-height:160px;object-fit:cover;border-radius:8px;" />` : ""}
+      <h3>${escapeHtml(record.jobId)} ${escapeHtml(record.room || "")}</h3>
+      <p>${escapeHtml(record.notes || record.photoRef || "Photo evidence saved")}</p>
+      <dl>
+        <div><dt>Worker</dt><dd>${escapeHtml(record.workerName || "Field")}</dd></div>
+        <div><dt>Task</dt><dd>${escapeHtml(task?.title || "No task selected")}</dd></div>
+        <div><dt>Reference</dt><dd>${escapeHtml(record.photoRef || "Uploaded image")}</dd></div>
+      </dl>
+    </article>
   `;
 }
 
@@ -8279,7 +8855,7 @@ function moduleNames(keys) {
 }
 
 function currentAccessModuleKeys() {
-  if (state.employeeMode) return employeeAllowedModuleKeys;
+  if (state.employeeMode) return employeeModuleKeys();
   if (state.accessContext?.tabs?.length) return state.accessContext.tabs.map((tab) => tab.key || tab.id).filter((key) => moduleByKey(key));
   return filteredModules().map((module) => module.key);
 }
@@ -8831,7 +9407,7 @@ function renderCommunityPost(post) {
 }
 
 function renderTeamModule(module) {
-  const displayedUsers = state.accessContext?.users?.length ? state.accessContext.users.map(mapUserToTeamMember) : state.teamMembers;
+  const displayedUsers = assignableTeamMembers();
   return `
     <section class="hero-band team-hero">
       <div>
@@ -8854,8 +9430,9 @@ function renderTeamModule(module) {
     ${renderRbacAdminPanel()}
     <section class="team-layout">
       <div class="panel">
-        <div class="panel-head"><div><h2>Owner-created logins</h2><p>Create user access and assign module permissions.</p></div></div>
-        ${state.firebase.enabled && state.authSession ? `<div class="empty-state"><strong>Secure login manager is active</strong><span>Use the User Login Manager above to create Firebase users, issue invite links, and control module access.</span></div>` : renderTeamForm()}
+        <div class="panel-head"><div><h2>Owner-created logins</h2><p>Create employees, issue individual portal codes, and assign field modules.</p></div></div>
+        ${state.firebase.enabled && state.authSession ? `<div class="empty-state"><strong>Secure login manager is active</strong><span>The local roster below remains available for immediate field task assignment while Firebase Admin user creation is configured.</span></div>` : ""}
+        ${renderTeamForm()}
         <div class="team-grid">${displayedUsers.map(renderTeamMemberCard).join("")}</div>
       </div>
       <div class="panel">
@@ -9127,10 +9704,15 @@ function renderTeamForm() {
         <label><span>Account type</span><select name="accountType"><option>Employee</option><option>Contractor portal</option><option>Manager</option><option>Administrator</option><option>Vendor portal</option></select></label>
         <label><span>Role</span><input name="role" placeholder="Estimator, field tech, admin, vendor" /></label>
         <label><span>Access summary</span><input name="access" placeholder="Jobs, dry logs, time, pricing, admin" /></label>
+        <label><span>Individual portal code</span><input name="accessCode" placeholder="Auto-generated if blank" autocomplete="one-time-code" /></label>
+        <label><span>Assigned job IDs</span><input name="assignedJobIds" list="team-job-options" placeholder="J-2039,J-2050" /></label>
       </div>
+      <datalist id="team-job-options">
+        ${state.jobBoards.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}
+      </datalist>
       <fieldset class="source-picker compact-picker">
         <legend>Module permissions</legend>
-        ${["jobs", "drylogs", "time", "equipment", "photos", "pricing", "payments", "reports", "settings"]
+        ${["jobs", "drylogs", "time", "equipment", "photos", "communications", "pricing", "payments", "reports", "settings"]
           .map((key) => moduleByKey(key))
           .filter(Boolean)
           .map((module) => `<label class="source-check"><input name="permissions" type="checkbox" value="${module.key}" ${employeeAllowedModuleKeys.includes(module.key) ? "checked" : ""} /><span><strong>${escapeHtml(module.label)}</strong><small>${escapeHtml(categoryLabels[module.category] || module.category)}</small></span></label>`)
@@ -9142,17 +9724,21 @@ function renderTeamForm() {
 }
 
 function renderTaskForm() {
+  const teamMembers = assignableTeamMembers();
   return `
     <form class="stack-form inline-section" data-form="task">
       <h3>Assign task</h3>
       <label><span>Task</span><input name="title" required placeholder="What needs to be done" /></label>
       <div class="form-grid">
-        <label><span>Assignee</span><select name="assigneeId">${state.teamMembers.map((member) => `<option value="${member.id}">${escapeHtml(member.name)}</option>`).join("")}</select></label>
+        <label><span>Assignee</span><select name="assigneeId">${teamMembers.map((member) => `<option value="${member.id}">${escapeHtml(member.name)}${member.email ? ` - ${escapeHtml(member.email)}` : ""}</option>`).join("")}</select></label>
         <label><span>Module</span><select name="moduleKey">${pinnedKeys().map((key) => moduleByKey(key)).filter(Boolean).map((item) => `<option value="${item.key}">${escapeHtml(item.label)}</option>`).join("")}</select></label>
-        <label><span>Job/file</span><input name="relatedJob" placeholder="J-2039, invoice, property" /></label>
+        <label><span>Job/file</span><input name="relatedJob" list="task-job-options" placeholder="J-2039, invoice, property" /></label>
         <label><span>Due</span><input name="due" type="date" /></label>
         <label><span>Priority</span><select name="priority"><option>High</option><option>Medium</option><option>Low</option></select></label>
       </div>
+      <datalist id="task-job-options">
+        ${state.jobBoards.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}
+      </datalist>
       <button type="submit">Assign task</button>
     </form>
   `;
@@ -9160,6 +9746,14 @@ function renderTaskForm() {
 
 function renderTeamMemberCard(member) {
   const canManage = canDo("manageUsers") && member.id;
+  const assignedTaskIds = new Set(normalizeListValue(member.assignedTaskIds));
+  const assignedTasks = state.tasks.filter((task) => {
+    return assignedTaskIds.has(task.id)
+      || task.assigneeId === member.id
+      || (member.email && String(task.assigneeEmail || "").toLowerCase() === String(member.email).toLowerCase())
+      || (member.name && String(task.assigneeName || "").toLowerCase() === String(member.name).toLowerCase());
+  });
+  const assignedJobs = [...new Set([...normalizeListValue(member.assignedJobIds), ...assignedTasks.map((task) => task.relatedJob).filter(Boolean)])];
   const cardActions = [
     canManage ? `<button type="button" data-action="open-user-manage" data-id="${member.id}">Manage</button>` : "",
     member.id && canDo("resetPermissions") ? `<button type="button" data-action="reset-user-permissions" data-id="${member.id}">Reset access</button>` : "",
@@ -9172,6 +9766,8 @@ function renderTeamMemberCard(member) {
       <h3>${escapeHtml(member.name)}</h3>
       <p>${escapeHtml(member.email)}</p>
       <span>${escapeHtml(member.role)} - ${escapeHtml(member.access)}</span>
+      <small>Portal code: ${escapeHtml(employeeAccessCodeFor(member))}</small>
+      <small>${assignedTasks.length} assigned task${assignedTasks.length === 1 ? "" : "s"}${assignedJobs.length ? ` | Jobs: ${escapeHtml(assignedJobs.join(", "))}` : ""}</small>
       <small>${escapeHtml((member.permissions || []).join(", ") || "No permissions set")}</small>
       ${member.companyId ? `<small>Company: ${escapeHtml(member.companyId)}${member.franchiseIds?.length ? ` | Franchise: ${escapeHtml(member.franchiseIds.join(", "))}` : ""}</small>` : ""}
       ${cardActions ? `<div class="card-actions">${cardActions}</div>` : ""}
@@ -9180,13 +9776,13 @@ function renderTeamMemberCard(member) {
 }
 
 function renderTaskItem(task) {
-  const assignee = (state.accessContext?.users?.length ? state.accessContext.users.map(mapUserToTeamMember) : state.teamMembers).find((member) => member.id === task.assigneeId);
+  const assignee = assignableTeamMembers().find((member) => member.id === task.assigneeId);
   const module = moduleByKey(task.moduleKey);
   return `
     <div class="task-item">
       <div>
         <strong>${escapeHtml(task.title)}</strong>
-        <span>${escapeHtml(assignee?.name || "Unassigned")} - ${escapeHtml(module?.label || task.moduleKey)} - ${escapeHtml(task.relatedJob || "No job")}</span>
+        <span>${escapeHtml(assignee?.name || task.assigneeName || "Unassigned")} - ${escapeHtml(module?.label || task.moduleKey)} - ${escapeHtml(task.relatedJob || "No job")}</span>
       </div>
       <div class="row-actions">
         <a href="#module/${task.moduleKey}" data-action="set-active" data-key="${task.moduleKey}">Open</a>
@@ -9502,7 +10098,7 @@ function renderTimeModule(module) {
     <section class="hero-band time-hero">
       <div>
         <p>${escapeHtml(module.purpose)}</p>
-        <div class="access-code">Employee field portal code: <strong>${workerAccessCode}</strong></div>
+        <div class="access-code">Employee field portal: <strong>individual codes issued in Team</strong></div>
       </div>
       <div class="metric-strip">
         <div><strong>${timeEntries.length}</strong><span>Entries</span></div>
@@ -9515,7 +10111,7 @@ function renderTimeModule(module) {
         <div class="panel-head">
           <div>
             <h2>GPS time clock</h2>
-            <p>Workers can use employee-only access for GPS time, dry logs, job reference, photos, and equipment without opening owner/admin software.</p>
+            <p>Workers can use employee-only access for GPS time, dry logs, job reference, photos, notes, equipment, and the communication board without opening owner/admin software.</p>
           </div>
           ${state.employeeMode ? `<button type="button" data-action="employee-logout">Owner view</button>` : `<button type="button" data-action="open-employee-login">Worker login</button>`}
         </div>
@@ -9554,7 +10150,7 @@ function renderClockInForm(taskOptions = []) {
         <span>Task</span>
         <select name="task">
           ${taskOptions.length
-            ? taskOptions.map((task) => `<option>${escapeHtml(task.title)}</option>`).join("")
+            ? taskOptions.map((task) => `<option value="${escapeHtml(task.id)}">${escapeHtml(task.title)}${task.relatedJob ? ` - ${escapeHtml(task.relatedJob)}` : ""}</option>`).join("")
             : `
               <option>Mitigation</option>
               <option>Inspection</option>
@@ -9597,7 +10193,7 @@ function renderTimeEntries(entries = state.timeEntries) {
   return `
     <table class="data-table">
       <thead>
-        <tr><th>Worker</th><th>Job</th><th>Start</th><th>End</th><th>Hours</th><th>GPS</th></tr>
+        <tr><th>Worker</th><th>Job</th><th>Task</th><th>Start</th><th>End</th><th>Hours</th><th>GPS</th></tr>
       </thead>
       <tbody>
         ${entries
@@ -9606,6 +10202,7 @@ function renderTimeEntries(entries = state.timeEntries) {
               <tr>
                 <td><strong>${escapeHtml(entry.worker)}</strong></td>
                 <td>${escapeHtml(entry.job)}</td>
+                <td>${escapeHtml(entry.task || "Field work")}</td>
                 <td>${escapeHtml(formatTime(entry.start))}</td>
                 <td>${escapeHtml(formatTime(entry.end))}</td>
                 <td>${escapeHtml(entry.hours)}</td>
@@ -9621,7 +10218,7 @@ function renderTimeEntries(entries = state.timeEntries) {
 
 function renderMobileDrawer() {
   const visibleModules = filteredModules();
-  const quickModules = (state.employeeMode ? employeeAllowedModuleKeys : pinnedKeys())
+  const quickModules = (state.employeeMode ? employeeModuleKeys() : pinnedKeys())
     .map((key) => moduleByKey(key))
     .filter(Boolean)
     .slice(0, 6);
@@ -9819,6 +10416,7 @@ function renderExportModal() {
     files: state.files.length,
     queue: state.queue.length,
     timeEntries: state.timeEntries.length,
+    photoRecords: (state.photoRecords || []).length,
     dryLogs: state.dryLogs.length,
     serviceRequests: state.serviceRequests.length,
     callouts: state.calloutSchedule.length,
@@ -9845,9 +10443,9 @@ function renderEmployeeLoginModal() {
         <div><span>Employee access</span><h2>Restricted field portal</h2></div>
         <button type="button" data-action="close-modal" aria-label="Close">Close</button>
       </div>
-      <p>Employees can clock in/out with GPS and access only approved field modules: time, dry logs, jobs, photos, and equipment.</p>
-      <label><span>Employee name</span><input name="name" required placeholder="Worker name" /></label>
-      <label><span>Business access code</span><input name="code" required placeholder="BROS-TIME" /></label>
+      <p>Employees can clock in/out with GPS, see only assigned jobs and tasks, upload photo evidence, and add job notes through approved field modules.</p>
+      <label><span>Employee email or name</span><input name="identifier" required placeholder="worker@company.com" autocomplete="username" /></label>
+      <label><span>Individual portal code</span><input name="code" required placeholder="FIELD-2039" autocomplete="one-time-code" /></label>
       <div class="modal-actions">
         <button type="button" data-action="close-modal">Cancel</button>
         <button type="submit">Enter field portal</button>
@@ -9964,6 +10562,7 @@ function downloadExport() {
     files: state.files,
     queue: state.queue,
     timeEntries: state.timeEntries,
+    photoRecords: state.photoRecords,
     standardsOutputs: state.standardsOutputs,
     learnedJargon: state.learnedJargon,
     equipmentDeployments: state.equipmentDeployments,
@@ -10260,6 +10859,15 @@ document.addEventListener("submit", (event) => {
   if (type === "dry-log") {
     addDryLogRecord(formData);
   }
+  if (type === "photo-evidence") {
+    return addPhotoEvidence(formData).catch((error) => {
+      setToast(error.message || "Unable to save photo evidence");
+      render();
+    });
+  }
+  if (type === "job-note") {
+    addJobNote(formData);
+  }
   if (type === "contact-record") {
     addContactRecord(formData);
   }
@@ -10309,18 +10917,7 @@ document.addEventListener("submit", (event) => {
     createWorkbenchRecord(formData);
   }
   if (type === "employee-login") {
-    const name = String(formData.get("name") || "").trim();
-    const code = String(formData.get("code") || "").trim();
-    if (code.toUpperCase() !== workerAccessCode) {
-      setToast("Access code not accepted");
-      return;
-    }
-    state.worker = { name, code: workerAccessCode };
-    state.employeeMode = true;
-    state.modal = null;
-    addActivity(`${name} entered employee time access.`);
-    persist();
-    routeToModule("time");
+    loginEmployeePortal(formData);
   }
   if (type === "insurance-admin-login") {
     return loginInsuranceAdmin(formData);

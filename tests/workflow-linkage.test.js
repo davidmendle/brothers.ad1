@@ -55,7 +55,7 @@ describe("cross-module workflow linkage", () => {
     expect(addEquipmentDeployment).toContain('moduleKey: "equipment"');
     expect(addEquipmentDeployment).toContain('linkedModuleKeys: ["jobs", "drylogs", "payments", "photos", "time"]');
     expect(addEquipmentDeployment).toContain('moduleKey: "payments"');
-    expect(clockOut).toContain('linkedModuleKeys: ["jobs", "payments", "reports", "closeout"]');
+    expect(clockOut).toContain('linkedModuleKeys: ["jobs", "payments", "reports", "closeout", "photos"]');
   });
 
   it("uses the real current browser date for new operating records", () => {

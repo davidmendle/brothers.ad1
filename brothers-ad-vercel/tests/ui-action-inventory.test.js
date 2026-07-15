@@ -61,9 +61,10 @@ describe("UI action inventory", () => {
     expect(source).not.toContain("editableRoles[0]");
   });
 
-  it("keeps the legacy local login invite hidden when Firebase auth is active", () => {
+  it("keeps the local employee builder available when Firebase auth is active", () => {
     expect(source).toContain("Secure login manager is active");
     expect(source).toContain("state.firebase.enabled && state.authSession");
+    expect(source).toContain("${renderTeamForm()}");
   });
 
   it("keeps module anchors wired through the router", () => {
