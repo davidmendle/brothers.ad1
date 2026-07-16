@@ -64,15 +64,6 @@ const nextConfig = {
             value: "public, max-age=31536000, immutable"
           }
         ]
-      },
-      {
-        source: "/:file*\\.(?:jpg|jpeg|png|gif|webp|svg|css|js|woff2|woff|ttf)",
-        headers: [
-          {
-            key: "Cache-Control",
-            value: "public, max-age=2592000, stale-while-revalidate=86400"
-          }
-        ]
       }
     ];
   }
