@@ -267,6 +267,12 @@ export async function createClientAccessGrant(payload = {}) {
     createdByUid: user.uid,
     createdByEmail: user.email || "",
     requestId: String(payload.requestId || "").trim(),
+    permissionsOverride: payload.permissionsOverride && typeof payload.permissionsOverride === "object" ? payload.permissionsOverride : {},
+    visibleTabIds: Array.isArray(payload.visibleTabIds) ? payload.visibleTabIds : [],
+    visiblePageIds: Array.isArray(payload.visiblePageIds) ? payload.visiblePageIds : [],
+    sectionOverrides: payload.sectionOverrides && typeof payload.sectionOverrides === "object" ? payload.sectionOverrides : {},
+    assignedJobIds: Array.isArray(payload.assignedJobIds) ? payload.assignedJobIds : [],
+    assignedTaskIds: Array.isArray(payload.assignedTaskIds) ? payload.assignedTaskIds : [],
     source: "client-firestore"
   };
   const ref = await addDoc(collection(db, "osAccessGrants"), grant);

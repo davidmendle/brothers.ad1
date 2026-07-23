@@ -60,6 +60,13 @@ describe("employee task, time, photo, and note workflow", () => {
     expect(addTask).toContain('linkedModuleKeys: ["jobs", task.moduleKey, "time", "photos"]');
   });
 
+  it("lets task assignment target field modules such as photos, payments, and communications", () => {
+    expect(source).toContain("function taskAssignableModules()");
+    expect(functionBody("taskAssignableModules")).toContain("employeeAllowedModuleKeys");
+    expect(functionBody("renderTaskForm")).toContain("const taskModules = taskAssignableModules()");
+    expect(functionBody("renderTaskForm")).toContain('value="${item.key}"');
+  });
+
   it("routes photos to an operational upload and notes workspace", () => {
     expect(source).toContain('if (module.key === "photos") return renderPhotosModule(module);');
     expect(source).toContain('data-form="photo-evidence"');

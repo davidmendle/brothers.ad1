@@ -1,0 +1,14 @@
+node_modules
+.next
+.env
+.env.local
+.secrets
+coverage
+dev.db
+logs
+uploads/insurance-intake/*
+!uploads/insurance-intake/.gitkeep
+brothers-ad-vercel/node_modules
+brothers-ad-vercel/.vercel
+brothers-ad-vercel/dev.db
+brothers-ad-vercel/logs

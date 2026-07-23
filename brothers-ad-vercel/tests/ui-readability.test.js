@@ -1,7 +1,7 @@
 import fs from "fs";
 import { describe, expect, it } from "vitest";
 
-const css = fs.readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+const css = fs.readFileSync(new URL("../styles.css", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
 function cssBlock(selectorStart) {
   const start = css.indexOf(selectorStart);

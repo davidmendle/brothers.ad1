@@ -1,23 +1,23 @@
 :root {
   color-scheme: light;
-  --ink: #18263a;
-  --muted: #66758a;
-  --line: #d9e1ec;
-  --panel: #ffffff;
-  --panel-soft: #f7f9fc;
-  --nav: #102a43;
-  --nav-2: #184463;
-  --blue: #245db3;
-  --blue-2: #3574cc;
-  --green: #1d7a58;
-  --amber: #c08a1b;
-  --red: #cf2b31;
+  --ink: #1f2d3d;
+  --muted: #647386;
+  --line: #dde6f0;
+  --panel: #fbfcfe;
+  --panel-soft: #f4f7fb;
+  --nav: #182c3f;
+  --nav-2: #264a62;
+  --blue: #2d62ad;
+  --blue-2: #4b7fc4;
+  --green: #24745d;
+  --amber: #b88218;
+  --red: #bf3037;
   --surface: #ffffff;
   --surface-soft: rgba(255, 255, 255, 0.86);
   --surface-strong: #f7fafd;
   --line-strong: rgba(17, 35, 63, 0.12);
-  --shadow: 0 16px 36px rgba(9, 27, 52, 0.1);
-  --shadow-soft: 0 7px 18px rgba(10, 26, 49, 0.07);
+  --shadow: 0 14px 30px rgba(9, 27, 52, 0.08);
+  --shadow-soft: 0 7px 16px rgba(10, 26, 49, 0.055);
   --radius-xl: 18px;
   --radius-lg: 14px;
   --radius-md: 10px;
@@ -31,7 +31,9 @@
   --sidebar-quick-min-height: 72px;
   --sidebar-nav-padding: 11px;
   --sidebar-card-radius: 10px;
-  font-family: "Segoe UI Variable", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: Inter, "Segoe UI Variable", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
 }
 
 * {
@@ -48,7 +50,7 @@ body {
 body {
   margin: 0;
   overflow: hidden;
-  background: linear-gradient(180deg, #f4f7fb 0%, #eef3f8 100%);
+  background: linear-gradient(180deg, #f7f9fc 0%, #edf2f7 100%);
   color: var(--ink);
 }
 
@@ -65,7 +67,7 @@ body::before {
   position: fixed;
   inset: 0 auto 0 0;
   width: var(--sidebar-width);
-  background: linear-gradient(180deg, #102a43 0%, #123b59 58%, #184f73 100%);
+  background: linear-gradient(180deg, #182c3f 0%, #203f55 58%, #28566d 100%);
   pointer-events: none;
   z-index: 0;
 }
@@ -100,7 +102,7 @@ button,
   justify-content: center;
   gap: 8px;
   padding: 0 15px;
-  font-weight: 700;
+  font-weight: 650;
   line-height: 1.2;
   text-align: center;
   white-space: normal;
@@ -322,7 +324,7 @@ textarea:focus-visible {
   align-self: stretch;
   height: 100vh;
   padding: 0;
-  background: linear-gradient(180deg, rgba(16, 42, 67, 0.98) 0%, rgba(18, 59, 89, 0.98) 62%, rgba(24, 79, 115, 0.98) 100%);
+  background: linear-gradient(180deg, rgba(24, 44, 63, 0.98) 0%, rgba(32, 63, 85, 0.98) 62%, rgba(40, 86, 109, 0.98) 100%);
   color: #f7fbff;
   overflow-x: hidden;
 }
@@ -392,7 +394,7 @@ textarea:focus-visible {
   margin-bottom: 18px;
   padding: 14px 16px;
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.09);
+  background: rgba(255, 255, 255, 0.075);
   border: 1px solid rgba(255, 255, 255, 0.12);
   box-shadow: none;
 }
@@ -480,7 +482,7 @@ textarea:hover {
   align-items: flex-start;
   flex-direction: column;
   text-align: left;
-  background: rgba(255, 255, 255, 0.075);
+  background: rgba(255, 255, 255, 0.062);
   border-color: rgba(255, 255, 255, 0.1);
   color: #fff;
   white-space: normal;
@@ -532,7 +534,7 @@ textarea:hover {
   padding: var(--sidebar-nav-padding);
   display: grid;
   gap: 4px;
-  background: rgba(255, 255, 255, 0.045);
+  background: rgba(255, 255, 255, 0.038);
   white-space: normal;
 }
 
@@ -588,13 +590,13 @@ textarea:hover {
   max-width: 100%;
   padding: 28px 28px 96px;
   overflow-y: auto;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.44), rgba(247, 249, 252, 0.64));
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(247, 249, 252, 0.78));
 }
 
 .topbar {
   min-height: 86px;
   max-width: 100%;
-  background: rgba(255, 255, 255, 0.96);
+  background: rgba(252, 253, 255, 0.96);
   backdrop-filter: blur(12px);
   border: 1px solid rgba(17, 35, 63, 0.08);
   border-radius: var(--radius-xl);
@@ -727,7 +729,17 @@ textarea:hover {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
-  letter-spacing: 0.02em;
+  letter-spacing: 0;
+}
+
+.sidebar-intro span,
+.sidebar-section-label,
+.sidebar-status span,
+.access-model-panel article > span,
+.panel h2,
+.access-model-panel h2 {
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .screen-title h1 {
@@ -800,7 +812,7 @@ textarea:hover {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 24px;
   align-items: center;
-  background: linear-gradient(180deg, #ffffff, #f8fbff);
+  background: linear-gradient(180deg, #ffffff, #f7fafc);
 }
 
 .hero-band h2 {
@@ -1519,13 +1531,14 @@ dd {
   padding: 12px;
   display: grid;
   gap: 8px;
+  background: #fff;
 }
 
 .source-picker legend {
   padding: 0 6px;
   color: var(--muted);
   font-size: 13px;
-  font-weight: 850;
+  font-weight: 700;
 }
 
 .source-check {
@@ -1550,6 +1563,38 @@ dd {
 .source-check small {
   color: var(--muted);
   margin-top: 2px;
+}
+
+.module-access-picker {
+  max-height: min(46vh, 430px);
+  padding: 14px;
+  gap: 14px;
+  background: #f9fbfd;
+}
+
+.module-access-group {
+  display: grid;
+  gap: 8px;
+}
+
+.module-access-group > strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.module-access-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 8px;
+}
+
+.module-access-options .source-check {
+  min-height: 58px;
+  padding: 9px 10px;
+  border: 1px solid rgba(17, 35, 63, 0.08);
+  border-radius: 8px;
+  background: #fff;
 }
 
 .standards-output {

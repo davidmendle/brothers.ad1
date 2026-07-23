@@ -10,3 +10,5 @@ uploads/insurance-intake/*
 !uploads/insurance-intake/.gitkeep
 coverage
 .vercel
+dev.db
+logs/

@@ -18,7 +18,8 @@ const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES
 const storageKey = "brothers-os-workspace-v2";
 const workerAccessCode = "BROS-TIME";
 const adminAccessCode = "Issued by Super Admin";
-const employeeAllowedModuleKeys = ["time", "drylogs", "jobs", "photos", "equipment", "communications"];
+const employeeAllowedModuleKeys = ["contractorportal", "daily", "jobs", "drylogs", "time", "equipment", "photos", "payments", "communications", "settings"];
+const defaultContractorModuleKeys = ["contractorportal", "daily", "jobs", "time", "equipment", "photos", "payments", "communications", "settings"];
 const brandLogoPath = brothersLogoDataUrl;
 const insuranceStatuses = ["all", "new", "reviewed", "in-progress", "completed", "rejected"];
 const rbacActionKeys = [
@@ -1103,6 +1104,63 @@ function normalizeListValue(value) {
     : String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+function moduleKeysFromList(value) {
+  return [...new Set(normalizeListValue(value))]
+    .filter((key) => moduleByKey(key));
+}
+
+function defaultModuleAccessForRole(roleId = "worker") {
+  const normalizedRole = String(roleId || "worker").toLowerCase();
+  if (normalizedRole === "contractor" || normalizedRole.includes("contractor")) return defaultContractorModuleKeys.filter((key) => moduleByKey(key));
+  if (normalizedRole === "franchise_owner") return ["daily", "contractorportal", "jobs", "drylogs", "time", "equipment", "team", "payments", "reports", "relationships", "communications", "settings"].filter((key) => moduleByKey(key));
+  if (normalizedRole === "company_admin" || normalizedRole === "super_admin" || normalizedRole.includes("admin")) return modules.map((module) => module.key);
+  return employeeAllowedModuleKeys.filter((key) => moduleByKey(key));
+}
+
+function visibleModuleKeysForMember(member = {}) {
+  const explicit = moduleKeysFromList(member.visiblePageIds?.length ? member.visiblePageIds : member.visibleTabIds);
+  if (explicit.length) return explicit;
+  const permissions = moduleKeysFromList(member.permissions || []);
+  if (permissions.length) return permissions;
+  return defaultModuleAccessForRole(member.roleId || member.accountType || member.role || "worker");
+}
+
+function moduleVisibilityPayload(formData) {
+  if (!formData.has("visibilityConfigured")) return {};
+  const selectedKeys = moduleKeysFromList(formData.getAll("visibleModuleKeys"));
+  return {
+    visibleTabIds: selectedKeys,
+    visiblePageIds: selectedKeys
+  };
+}
+
+function renderModuleAccessPicker({ selectedKeys = [], legend = "Allowed modules" } = {}) {
+  const selected = new Set(moduleKeysFromList(selectedKeys));
+  const groupedKeys = taskTypeGroups
+    .map((group) => ({
+      ...group,
+      moduleKeys: group.keys.filter((key) => moduleByKey(key))
+    }))
+    .filter((group) => group.moduleKeys.length);
+  return `
+    <fieldset class="source-picker compact-picker module-access-picker">
+      <legend>${escapeHtml(legend)}</legend>
+      <input type="hidden" name="visibilityConfigured" value="1" />
+      ${groupedKeys.map((group) => `
+        <div class="module-access-group">
+          <strong>${escapeHtml(group.label)}</strong>
+          <div class="module-access-options">
+            ${group.moduleKeys.map((key) => {
+              const module = moduleByKey(key);
+              return `<label class="source-check"><input name="visibleModuleKeys" type="checkbox" value="${module.key}" ${selected.has(module.key) ? "checked" : ""} /><span><strong>${escapeHtml(module.label)}</strong><small>${escapeHtml(categoryLabels[module.category] || module.category)}</small></span></label>`;
+            }).join("")}
+          </div>
+        </div>
+      `).join("")}
+    </fieldset>
+  `;
+}
+
 function fallbackAccessCodeForMember(member, accountType) {
   if (/admin/i.test(accountType)) return "OWNER-ADMIN";
   const seed = String(member.id || member.email || member.name || "worker")
@@ -1119,12 +1177,18 @@ function normalizeTeamMember(member) {
     ? member.permissions.map(String).filter(Boolean)
     : String(member.access || "").split(",").map((item) => item.trim()).filter(Boolean);
   const defaultPermissions = /admin/i.test(accountType)
-    ? ["owner-dashboard", "user-management", "billing", "exports", "ai-admin", "security"]
-    : ["time", "drylogs", "jobs", "photos", "equipment", "communications"];
+    ? modules.map((module) => module.key)
+    : /contractor/i.test(`${accountType} ${member.role} ${member.access}`)
+      ? defaultContractorModuleKeys
+      : employeeAllowedModuleKeys;
+  const visibleTabIds = moduleKeysFromList(member.visibleTabIds || member.visibleTabs || permissions);
+  const visiblePageIds = moduleKeysFromList(member.visiblePageIds || member.visiblePages || visibleTabIds);
   return {
     ...member,
     accountType,
     permissions: permissions.length ? permissions : defaultPermissions,
+    visibleTabIds: visibleTabIds.length ? visibleTabIds : defaultPermissions,
+    visiblePageIds: visiblePageIds.length ? visiblePageIds : visibleTabIds.length ? visibleTabIds : defaultPermissions,
     accessCode: String(member.accessCode || fallbackAccessCodeForMember(member, accountType)).trim().toUpperCase(),
     assignedJobIds: normalizeListValue(member.assignedJobIds || member.assignedJobs || ""),
     assignedTaskIds: normalizeListValue(member.assignedTaskIds || member.tasks || ""),
@@ -1697,6 +1761,31 @@ function filteredModules() {
 
 function availableModulesForDirectory() {
   return modules.filter((module) => isModuleAllowedByAccess(module.key));
+}
+
+function taskAssignableModules() {
+  const orderedKeys = [
+    ...employeeAllowedModuleKeys,
+    ...defaultContractorModuleKeys,
+    ...pinnedKeys(),
+    ...taskTypeGroups.flatMap((group) => group.keys || [])
+  ];
+  const available = availableModulesForDirectory();
+  const byKey = new Map(available.map((module) => [module.key, module]));
+  const picked = [];
+  const used = new Set();
+  orderedKeys.forEach((key) => {
+    const module = byKey.get(key);
+    if (module && !used.has(module.key)) {
+      picked.push(module);
+      used.add(module.key);
+    }
+  });
+  available
+    .filter((module) => !used.has(module.key))
+    .sort((left, right) => left.label.localeCompare(right.label))
+    .forEach((module) => picked.push(module));
+  return picked;
 }
 
 function modulesForTaskGroup(group, availableModules, usedKeys) {
@@ -3469,6 +3558,8 @@ function currentWorkerProfile() {
     ...(member || {}),
     ...(state.worker || {}),
     permissions: state.worker?.permissions?.length ? state.worker.permissions : (member?.permissions || []),
+    visibleTabIds: state.worker?.visibleTabIds?.length ? state.worker.visibleTabIds : (member?.visibleTabIds || []),
+    visiblePageIds: state.worker?.visiblePageIds?.length ? state.worker.visiblePageIds : (member?.visiblePageIds || []),
     assignedJobIds: state.worker?.assignedJobIds?.length ? state.worker.assignedJobIds : (member?.assignedJobIds || []),
     assignedTaskIds: state.worker?.assignedTaskIds?.length ? state.worker.assignedTaskIds : (member?.assignedTaskIds || [])
   };
@@ -3476,7 +3567,7 @@ function currentWorkerProfile() {
 
 function employeeModuleKeys() {
   const profile = currentWorkerProfile();
-  const requestedKeys = Array.isArray(profile.permissions) && profile.permissions.length ? profile.permissions : employeeAllowedModuleKeys;
+  const requestedKeys = visibleModuleKeysForMember(profile);
   return [...new Set(requestedKeys)]
     .filter((key) => employeeAllowedModuleKeys.includes(key))
     .filter((key) => moduleByKey(key));
@@ -4078,7 +4169,8 @@ async function createAccessGrant(formData) {
     franchiseIds: csvValues(formData.get("franchiseIds")),
     contractorId: String(formData.get("contractorId") || "").trim(),
     ttlHours: Number(formData.get("ttlHours") || 48),
-    sendEmail: formData.has("sendEmail")
+    sendEmail: formData.has("sendEmail"),
+    ...moduleVisibilityPayload(formData)
   };
   let result;
   let usedClientGrant = false;
@@ -4198,7 +4290,10 @@ async function createSecureUser(formData) {
     contractorId: String(formData.get("contractorId") || "").trim(),
     accessCode: String(formData.get("accessCode") || "").trim(),
     accessExpiresAt: String(formData.get("accessExpiresAt") || "").trim(),
-    accessScope: String(formData.get("accessScope") || "").trim()
+    accessScope: String(formData.get("accessScope") || "").trim(),
+    assignedJobIds: csvValues(formData.get("assignedJobIds")),
+    assignedTaskIds: csvValues(formData.get("assignedTaskIds")),
+    ...moduleVisibilityPayload(formData)
   };
   try {
     const result = await apiRequest("/api/rbac/users", {
@@ -4217,10 +4312,12 @@ async function createSecureUser(formData) {
       role: payload.roleId.replace(/_/g, " "),
       accountType: payload.roleId === "contractor" ? "Contractor portal" : "Employee",
       access: "Local field access until Firebase Admin user creation is enabled",
-      permissions: payload.roleId === "contractor" ? ["jobs", "time", "equipment", "photos", "communications"] : ["time", "drylogs", "jobs", "photos", "equipment", "communications"],
+      permissions: payload.visiblePageIds?.length ? payload.visiblePageIds : payload.roleId === "contractor" ? defaultContractorModuleKeys : employeeAllowedModuleKeys,
+      visibleTabIds: payload.visibleTabIds || [],
+      visiblePageIds: payload.visiblePageIds || [],
       accessCode: payload.accessCode || createId(payload.roleId === "contractor" ? "CON" : "EMP"),
-      assignedJobIds: [],
-      assignedTaskIds: [],
+      assignedJobIds: payload.assignedJobIds,
+      assignedTaskIds: payload.assignedTaskIds,
       status: "Local invite",
       lastLogin: ""
     });
@@ -4330,6 +4427,7 @@ async function saveCompanyBrand(formData) {
 
 function mapUserToTeamMember(member) {
   const roleId = member.roleId || member.role || "worker";
+  const visibleKeys = moduleKeysFromList(member.visiblePageIds?.length ? member.visiblePageIds : member.visibleTabIds);
   return {
     id: member.uid || member.id,
     name: member.displayName || member.name || member.email || "User",
@@ -4337,7 +4435,9 @@ function mapUserToTeamMember(member) {
     role: roleId.replace(/_/g, " "),
     accountType: roleId,
     access: roleId,
-    permissions: Object.keys(member.permissionsOverride?.actions || {}).filter((key) => member.permissionsOverride.actions[key]),
+    permissions: visibleKeys.length ? visibleKeys : defaultModuleAccessForRole(roleId),
+    visibleTabIds: moduleKeysFromList(member.visibleTabIds),
+    visiblePageIds: moduleKeysFromList(member.visiblePageIds),
     accessCode: member.accessCode || "",
     assignedJobIds: Array.isArray(member.assignedJobIds) ? member.assignedJobIds : [],
     assignedTaskIds: Array.isArray(member.assignedTaskIds) ? member.assignedTaskIds : [],
@@ -5615,6 +5715,8 @@ function addTeamMember(formData) {
     accountType,
     access: String(formData.get("access") || "Assigned modules").trim(),
     permissions: permissions.length ? permissions : accountType === "Administrator" ? ["owner-dashboard", "user-management", "billing", "exports", "ai-admin", "security"] : ["time", "drylogs", "jobs", "photos", "equipment", "communications"],
+    visibleTabIds: permissions,
+    visiblePageIds: permissions,
     accessCode,
     assignedJobIds,
     assignedTaskIds: [],
@@ -5697,6 +5799,7 @@ function addTask(formData) {
 }
 
 function fieldSessionForMember(member, accessCode) {
+  const visibleKeys = visibleModuleKeysForMember(member).filter((key) => employeeAllowedModuleKeys.includes(key));
   return {
     id: member.id,
     name: member.name,
@@ -5704,7 +5807,9 @@ function fieldSessionForMember(member, accessCode) {
     code: employeeAccessCodeFor(member),
     accountType: member.accountType || "Employee",
     role: member.role || "Worker",
-    permissions: (member.permissions || []).filter((key) => employeeAllowedModuleKeys.includes(key)),
+    permissions: visibleKeys,
+    visibleTabIds: visibleKeys,
+    visiblePageIds: visibleKeys,
     assignedJobIds: normalizeListValue(member.assignedJobIds),
     assignedTaskIds: normalizeListValue(member.assignedTaskIds),
     accessCodeEntered: String(accessCode || "").trim()
@@ -6278,7 +6383,8 @@ async function clockOut() {
 }
 
 function render() {
-  if (!state.authSession) {
+  const localPreviewAllowed = state.firebase.ready && !state.firebase.enabled && ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+  if (!state.authSession && !localPreviewAllowed) {
     app.className = "app-root auth-shell";
     app.innerHTML = renderAuthGate();
     return;
@@ -9336,7 +9442,7 @@ function renderPaymentRequestForm() {
 
 function renderCommunicationsModule(module) {
   const posts = [...(state.communityPosts || [])].sort((a, b) => String(b.pinned || "").localeCompare(String(a.pinned || "")) || new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-  const canPost = !state.authSession || canDo("postCommunityMessages");
+  const canPost = Boolean(state.authSession && canDo("postCommunityMessages"));
   return `
     ${renderManagedSection("communications-hero", `<section class="hero-band">
       <div>
@@ -9381,6 +9487,7 @@ function renderCommunicationsModule(module) {
 function renderCommunityPost(post) {
   const comments = Array.isArray(post.comments) ? post.comments : [];
   const tags = Array.isArray(post.tags) ? post.tags : [];
+  const canPost = Boolean(state.authSession && canDo("postCommunityMessages"));
   return `
     <article class="community-post">
       <div class="file-card-head"><span>${escapeHtml(post.authorRoleId || "member")}</span><strong>${escapeHtml(formatTime(post.createdAt))}</strong></div>
@@ -9397,11 +9504,13 @@ function renderCommunityPost(post) {
           </div>
         `).join("") : `<div class="empty-state compact-empty"><strong>No comments yet</strong><span>Be the first to answer.</span></div>`}
       </div>
-      <form class="stack-form inline-section compact-comment-form" data-form="community-comment">
-        <input type="hidden" name="postId" value="${escapeHtml(post.id)}" />
-        <label><span>Reply</span><input name="body" required placeholder="Add a comment" /></label>
-        <button type="submit">Comment</button>
-      </form>
+      ${canPost ? `
+        <form class="stack-form inline-section compact-comment-form" data-form="community-comment">
+          <input type="hidden" name="postId" value="${escapeHtml(post.id)}" />
+          <label><span>Reply</span><input name="body" required placeholder="Add a comment" /></label>
+          <button type="submit">Comment</button>
+        </form>
+      ` : ""}
     </article>
   `;
 }
@@ -9482,7 +9591,10 @@ function renderRbacAdminPanel(options = {}) {
             <label><span>Access code</span><input name="accessCode" placeholder="CON-123ABC" /></label>
             <label><span>Access expires</span><input name="accessExpiresAt" type="datetime-local" /></label>
             <label><span>Access scope</span><input name="accessScope" placeholder="48_hour_access" /></label>
+            <label><span>Assigned job IDs</span><input name="assignedJobIds" list="team-job-options" placeholder="J-2039,J-2050" /></label>
+            <label><span>Assigned task IDs</span><input name="assignedTaskIds" placeholder="TASK-1001,TASK-1002" /></label>
           </div>
+          ${renderModuleAccessPicker({ selectedKeys: defaultModuleAccessForRole("contractor"), legend: "Modules this user can open" })}
           <button type="submit">Create Firebase user</button>
         </form>
       ` : ""}
@@ -9581,6 +9693,7 @@ function renderAccessGrantPanel(accessRequests, accessGrants, roles) {
           <label><span>Contractor id</span><input name="contractorId" placeholder="contractor-company" /></label>
           <label><span>Hours</span><input name="ttlHours" type="number" min="1" max="48" value="48" /></label>
         </div>
+        ${renderModuleAccessPicker({ selectedKeys: defaultModuleAccessForRole("contractor"), legend: "Modules this invite can open" })}
         <label class="source-check"><input name="sendEmail" type="checkbox" checked /><span><strong>Send invite email</strong><small>Email includes the access link, code, expiration, and Google sign-in instructions.</small></span></label>
         <button type="submit">Send invite link and code</button>
       </form>
@@ -9725,13 +9838,14 @@ function renderTeamForm() {
 
 function renderTaskForm() {
   const teamMembers = assignableTeamMembers();
+  const taskModules = taskAssignableModules();
   return `
     <form class="stack-form inline-section" data-form="task">
       <h3>Assign task</h3>
       <label><span>Task</span><input name="title" required placeholder="What needs to be done" /></label>
       <div class="form-grid">
         <label><span>Assignee</span><select name="assigneeId">${teamMembers.map((member) => `<option value="${member.id}">${escapeHtml(member.name)}${member.email ? ` - ${escapeHtml(member.email)}` : ""}</option>`).join("")}</select></label>
-        <label><span>Module</span><select name="moduleKey">${pinnedKeys().map((key) => moduleByKey(key)).filter(Boolean).map((item) => `<option value="${item.key}">${escapeHtml(item.label)}</option>`).join("")}</select></label>
+        <label><span>Module</span><select name="moduleKey">${taskModules.map((item) => `<option value="${item.key}">${escapeHtml(item.label)}</option>`).join("")}</select></label>
         <label><span>Job/file</span><input name="relatedJob" list="task-job-options" placeholder="J-2039, invoice, property" /></label>
         <label><span>Due</span><input name="due" type="date" /></label>
         <label><span>Priority</span><select name="priority"><option>High</option><option>Medium</option><option>Low</option></select></label>
@@ -9754,6 +9868,9 @@ function renderTeamMemberCard(member) {
       || (member.name && String(task.assigneeName || "").toLowerCase() === String(member.name).toLowerCase());
   });
   const assignedJobs = [...new Set([...normalizeListValue(member.assignedJobIds), ...assignedTasks.map((task) => task.relatedJob).filter(Boolean)])];
+  const visibleModules = visibleModuleKeysForMember(member)
+    .map((key) => moduleByKey(key)?.label || key)
+    .filter(Boolean);
   const cardActions = [
     canManage ? `<button type="button" data-action="open-user-manage" data-id="${member.id}">Manage</button>` : "",
     member.id && canDo("resetPermissions") ? `<button type="button" data-action="reset-user-permissions" data-id="${member.id}">Reset access</button>` : "",
@@ -9768,7 +9885,7 @@ function renderTeamMemberCard(member) {
       <span>${escapeHtml(member.role)} - ${escapeHtml(member.access)}</span>
       <small>Portal code: ${escapeHtml(employeeAccessCodeFor(member))}</small>
       <small>${assignedTasks.length} assigned task${assignedTasks.length === 1 ? "" : "s"}${assignedJobs.length ? ` | Jobs: ${escapeHtml(assignedJobs.join(", "))}` : ""}</small>
-      <small>${escapeHtml((member.permissions || []).join(", ") || "No permissions set")}</small>
+      <small>Modules: ${escapeHtml(visibleModules.join(", ") || "No modules assigned")}</small>
       ${member.companyId ? `<small>Company: ${escapeHtml(member.companyId)}${member.franchiseIds?.length ? ` | Franchise: ${escapeHtml(member.franchiseIds.join(", "))}` : ""}</small>` : ""}
       ${cardActions ? `<div class="card-actions">${cardActions}</div>` : ""}
     </article>
@@ -10491,8 +10608,11 @@ function renderUserManageModal() {
         <label><span>Contractor id</span><input name="contractorId" value="${escapeHtml(member.contractorId || "")}" /></label>
         <label><span>Access expires</span><input name="accessExpiresAt" value="${escapeHtml(member.accessExpiresAt || "")}" /></label>
         <label><span>New access code</span><input name="accessCode" placeholder="Leave blank to keep current code" /></label>
+        <label><span>Assigned job IDs</span><input name="assignedJobIds" value="${escapeHtml((member.assignedJobIds || []).join(","))}" /></label>
+        <label><span>Assigned task IDs</span><input name="assignedTaskIds" value="${escapeHtml((member.assignedTaskIds || []).join(","))}" /></label>
         <label><span>Status</span><select name="disabled"><option value="false"${member.disabled ? "" : " selected"}>Active</option><option value="true"${member.disabled ? " selected" : ""}>Disabled</option></select></label>
       </div>
+      ${renderModuleAccessPicker({ selectedKeys: visibleModuleKeysForMember(member), legend: "Modules this user can open" })}
       <div class="modal-actions">
         <button type="button" data-action="close-modal">Cancel</button>
         <button type="submit">Save user</button>
@@ -10962,7 +11082,10 @@ document.addEventListener("submit", (event) => {
       contractorId: String(formData.get("contractorId") || "").trim(),
       accessExpiresAt: String(formData.get("accessExpiresAt") || "").trim(),
       accessCode: String(formData.get("accessCode") || "").trim(),
-      disabled: String(formData.get("disabled") || "false") === "true"
+      assignedJobIds: csvValues(formData.get("assignedJobIds")),
+      assignedTaskIds: csvValues(formData.get("assignedTaskIds")),
+      disabled: String(formData.get("disabled") || "false") === "true",
+      ...moduleVisibilityPayload(formData)
     }).then(() => {
       state.modal = null;
       render();

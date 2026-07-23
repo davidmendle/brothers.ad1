@@ -237,6 +237,12 @@ function buildGrantUserFields(grant) {
     accessExpiresAt: grant.expiresAt || "",
     accessScope: grant.accessScope || "48_hour_access",
     portalCodeHash: grant.portalCodeHash || "",
+    permissionsOverride: grant.permissionsOverride && typeof grant.permissionsOverride === "object" ? grant.permissionsOverride : {},
+    visibleTabIds: Array.isArray(grant.visibleTabIds) ? grant.visibleTabIds : [],
+    visiblePageIds: Array.isArray(grant.visiblePageIds) ? grant.visiblePageIds : [],
+    sectionOverrides: grant.sectionOverrides && typeof grant.sectionOverrides === "object" ? grant.sectionOverrides : {},
+    assignedJobIds: Array.isArray(grant.assignedJobIds) ? grant.assignedJobIds : [],
+    assignedTaskIds: Array.isArray(grant.assignedTaskIds) ? grant.assignedTaskIds : [],
     disabled: false,
     status: "active"
   };
@@ -679,6 +685,9 @@ function createFirebaseRbacRouter(deps) {
           accessScope: userRecord.accessScope || "",
           disabled: Boolean(userRecord.disabled),
           permissions: effectivePermissions,
+          visibleTabIds: Array.isArray(userRecord.visibleTabIds) ? userRecord.visibleTabIds : [],
+          visiblePageIds: Array.isArray(userRecord.visiblePageIds) ? userRecord.visiblePageIds : [],
+          sectionOverrides: userRecord.sectionOverrides || {},
           user: userRecord
         }
       };
@@ -728,6 +737,75 @@ function createFirebaseRbacRouter(deps) {
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean);
+  }
+
+  function parseStringList(value) {
+    if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
+    return String(value || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  function sanitizePermissionsOverride(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    const clean = {};
+    if (value.tabs && typeof value.tabs === "object" && !Array.isArray(value.tabs)) {
+      clean.tabs = {
+        mode: value.tabs.mode === "all" ? "all" : "allow",
+        allowed: parseStringList(value.tabs.allowed),
+        hidden: parseStringList(value.tabs.hidden)
+      };
+    }
+    if (value.pages && typeof value.pages === "object" && !Array.isArray(value.pages)) {
+      clean.pages = {
+        mode: value.pages.mode === "all" ? "all" : "allow",
+        allowed: parseStringList(value.pages.allowed),
+        hidden: parseStringList(value.pages.hidden)
+      };
+    }
+    if (value.sections && typeof value.sections === "object" && !Array.isArray(value.sections)) {
+      clean.sections = {
+        mode: value.sections.mode === "all" ? "all" : "allow",
+        allowed: parseStringList(value.sections.allowed),
+        hidden: parseStringList(value.sections.hidden)
+      };
+    }
+    if (value.actions && typeof value.actions === "object" && !Array.isArray(value.actions)) {
+      clean.actions = Object.fromEntries(
+        Object.entries(value.actions).map(([key, enabled]) => [String(key), Boolean(enabled)])
+      );
+    }
+    if (value.dataAccess && typeof value.dataAccess === "object" && !Array.isArray(value.dataAccess)) {
+      clean.dataAccess = Object.fromEntries(
+        Object.entries(value.dataAccess).map(([key, scope]) => [String(key), String(scope || "none")])
+      );
+    }
+    return clean;
+  }
+
+  function applyUserAccessControlFields(target, source = {}) {
+    if (Object.prototype.hasOwnProperty.call(source, "permissionsOverride")) {
+      target.permissionsOverride = sanitizePermissionsOverride(source.permissionsOverride);
+    }
+    if (Object.prototype.hasOwnProperty.call(source, "visibleTabIds")) {
+      target.visibleTabIds = parseStringList(source.visibleTabIds);
+    }
+    if (Object.prototype.hasOwnProperty.call(source, "visiblePageIds")) {
+      target.visiblePageIds = parseStringList(source.visiblePageIds);
+    }
+    if (Object.prototype.hasOwnProperty.call(source, "sectionOverrides")) {
+      target.sectionOverrides = source.sectionOverrides && typeof source.sectionOverrides === "object" && !Array.isArray(source.sectionOverrides)
+        ? source.sectionOverrides
+        : {};
+    }
+    if (Object.prototype.hasOwnProperty.call(source, "assignedJobIds")) {
+      target.assignedJobIds = parseStringList(source.assignedJobIds);
+    }
+    if (Object.prototype.hasOwnProperty.call(source, "assignedTaskIds")) {
+      target.assignedTaskIds = parseStringList(source.assignedTaskIds);
+    }
+    return target;
   }
 
   function validateRoleAssignment(session, nextRoleId, currentRoleId = "") {
@@ -819,6 +897,12 @@ function createFirebaseRbacRouter(deps) {
     const accessRequested = accessFields.some((field) => Object.prototype.hasOwnProperty.call(payload, field));
     if (accessRequested && !sessionHasAction(session, "manageAccessGrants") && !sessionHasAction(session, "issueContractorCodes")) {
       return { ok: false, statusCode: 403, message: "Issuing or changing portal codes requires access-grant permission." };
+    }
+
+    const overrideFields = ["permissionsOverride", "visibleTabIds", "visiblePageIds", "sectionOverrides"];
+    const overrideRequested = overrideFields.some((field) => Object.prototype.hasOwnProperty.call(payload, field) && payload[field] !== undefined);
+    if (overrideRequested && !isSuperAdminSession(session) && !sessionHasAction(session, "manageRolePermissions")) {
+      return { ok: false, statusCode: 403, message: "Changing user module visibility requires Super Admin permission." };
     }
 
     return validateUserScope(session, payload, current);
@@ -920,12 +1004,14 @@ function createFirebaseRbacRouter(deps) {
         contractorId: session.contractorId || "",
         accessExpiresAt: session.accessExpiresAt || "",
         accessScope: session.accessScope || "",
-        permissions: session.permissions
+        permissions: session.permissions,
+        visibleTabIds: session.visibleTabIds || [],
+        visiblePageIds: session.visiblePageIds || []
       },
       roles: getSystemRoles(),
       permissions: permissionDocs,
-      tabs: filterCollectionByPermission(seeds.tabs, session.permissions, "tabs"),
-      pages: filterCollectionByPermission(seeds.pages, session.permissions, "pages"),
+      tabs: filterCollectionByPermission(seeds.tabs, session.permissions, "tabs", "id", session.visibleTabIds || session.user?.visibleTabIds || []),
+      pages: filterCollectionByPermission(seeds.pages, session.permissions, "pages", "id", session.visiblePageIds || session.user?.visiblePageIds || []),
       pageSections: filterCollectionByPermission(seeds.sections, session.permissions, "sections"),
       companySettings: getDefaultCompanySettings(),
       franchiseSettings: [getDefaultFranchiseSettings()],
@@ -968,12 +1054,16 @@ function createFirebaseRbacRouter(deps) {
     const tabs = filterCollectionByPermission(
       tabsSnapshot.docs.map((doc) => doc.data()).filter((tab) => tab.visible !== false),
       session.permissions,
-      "tabs"
+      "tabs",
+      "id",
+      session.visibleTabIds || session.user?.visibleTabIds || []
     );
     const pages = filterCollectionByPermission(
       pagesSnapshot.docs.map((doc) => doc.data()).filter((page) => page.visible !== false),
       session.permissions,
-      "pages"
+      "pages",
+      "id",
+      session.visiblePageIds || session.user?.visiblePageIds || []
     );
     const visiblePageIds = new Set(pages.map((page) => page.id));
     const sections = filterCollectionByPermission(
@@ -993,7 +1083,9 @@ function createFirebaseRbacRouter(deps) {
         contractorId: session.contractorId || "",
         accessExpiresAt: session.accessExpiresAt || "",
         accessScope: session.accessScope || "",
-        permissions: session.permissions
+        permissions: session.permissions,
+        visibleTabIds: session.visibleTabIds || session.user?.visibleTabIds || [],
+        visiblePageIds: session.visiblePageIds || session.user?.visiblePageIds || []
       },
       roles: rolesSnapshot.docs.map((doc) => doc.data()),
       permissions: permissionsSnapshot.docs.map((doc) => doc.data()),
@@ -1067,7 +1159,9 @@ function createFirebaseRbacRouter(deps) {
             franchiseIds: session.franchiseIds || [],
             contractorId: session.contractorId || "",
             accessExpiresAt: session.accessExpiresAt || "",
-            accessScope: session.accessScope || ""
+            accessScope: session.accessScope || "",
+            visibleTabIds: session.visibleTabIds || session.user?.visibleTabIds || [],
+            visiblePageIds: session.visiblePageIds || session.user?.visiblePageIds || []
           }
         });
       }
@@ -1105,7 +1199,9 @@ function createFirebaseRbacRouter(deps) {
           franchiseIds: userRecord.franchiseIds || [],
           contractorId: userRecord.contractorId || "",
           accessExpiresAt: userRecord.accessExpiresAt || "",
-          accessScope: userRecord.accessScope || ""
+          accessScope: userRecord.accessScope || "",
+          visibleTabIds: userRecord.visibleTabIds || [],
+          visiblePageIds: userRecord.visiblePageIds || []
         }
       });
     } catch (error) {
@@ -1207,13 +1303,18 @@ function createFirebaseRbacRouter(deps) {
       createdByEmail: request.osSession.email,
       requestId: String(request.body?.requestId || "").trim()
     };
+    applyUserAccessControlFields(grant, request.body || {});
     const mutationResult = validateSensitiveUserMutation(request.osSession, {
       roleId,
       companyId: grant.companyId,
       franchiseIds: grant.franchiseIds,
       contractorId: grant.contractorId,
       accessExpiresAt: grant.expiresAt,
-      accessScope: grant.accessScope
+      accessScope: grant.accessScope,
+      permissionsOverride: grant.permissionsOverride,
+      visibleTabIds: grant.visibleTabIds,
+      visiblePageIds: grant.visiblePageIds,
+      sectionOverrides: grant.sectionOverrides
     });
     if (!mutationResult.ok) return jsonError(response, mutationResult.statusCode, mutationResult.message);
     const grantRef = await db.collection(COLLECTIONS.accessGrants).add(grant);
@@ -1404,6 +1505,7 @@ function createFirebaseRbacRouter(deps) {
       franchiseIds,
       contractorId: String(request.body?.contractorId || "").trim()
     };
+    applyUserAccessControlFields(mutationPayload, request.body || {});
     if (accessCode) mutationPayload.accessCode = accessCode;
     if (request.body?.accessExpiresAt) mutationPayload.accessExpiresAt = request.body.accessExpiresAt;
     if (request.body?.accessScope) mutationPayload.accessScope = request.body.accessScope;
@@ -1424,7 +1526,13 @@ function createFirebaseRbacRouter(deps) {
       accessExpiresAt: request.body?.accessExpiresAt ? toIso(request.body.accessExpiresAt) : "",
       accessScope: String(request.body?.accessScope || "").trim(),
       portalCodeHash: accessCode ? hashPortalCode(accessCode) : "",
-      status: "active"
+      status: "active",
+      permissionsOverride: mutationPayload.permissionsOverride || {},
+      visibleTabIds: mutationPayload.visibleTabIds || [],
+      visiblePageIds: mutationPayload.visiblePageIds || [],
+      sectionOverrides: mutationPayload.sectionOverrides || {},
+      assignedJobIds: mutationPayload.assignedJobIds || [],
+      assignedTaskIds: mutationPayload.assignedTaskIds || []
     });
     await db.collection(COLLECTIONS.users).doc(createdUser.uid).set(userRecord, { merge: true });
     await auth.setCustomUserClaims(createdUser.uid, {
@@ -1469,6 +1577,7 @@ function createFirebaseRbacRouter(deps) {
     if (Object.prototype.hasOwnProperty.call(updates, "franchiseIds")) {
       updates.franchiseIds = parseFranchiseIds(updates.franchiseIds);
     }
+    applyUserAccessControlFields(updates, updates);
     if (typeof updates.accessCode === "string" && updates.accessCode.trim()) {
       updates.portalCodeHash = hashPortalCode(updates.accessCode);
       updates.accessCodeId = `manual-${crypto.randomBytes(8).toString("hex")}`;
