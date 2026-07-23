@@ -1,10 +1,10 @@
-import AdminBlogDashboard from "../../components/AdminBlogDashboard";
+import BrothersOsShell from "../../components/BrothersOsShell";
 
 export const dynamic = "force-dynamic";
 
 export const metadata = {
-  title: "Login",
-  description: "Sign in to the Brothers.ad publishing dashboard.",
+  title: "Brothers OS Login",
+  description: "Secure Brothers Restoration operating system login.",
   robots: {
     index: false,
     follow: false
@@ -12,5 +12,5 @@ export const metadata = {
 };
 
 export default function LoginPage() {
-  return <AdminBlogDashboard />;
+  return <BrothersOsShell />;
 }

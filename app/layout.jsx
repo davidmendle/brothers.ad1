@@ -1,7 +1,4 @@
 import "./globals.css";
-import Header from "../components/Header";
-import Footer from "../components/Footer";
-import ChatWidget from "../components/ChatWidget";
 import { siteUrl } from "../lib/siteConfig";
 import { sanitizeJsonForDom } from "../lib/securityUtils";
 
@@ -92,10 +89,7 @@ export default function RootLayout({ children }) {
           dangerouslySetInnerHTML={{ __html: sanitizeJsonForDom(organizationJsonLd) }}
         />
         <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: sanitizeJsonForDom(websiteJsonLd) }} />
-        <Header />
         {children}
-        <Footer />
-        <ChatWidget />
       </body>
     </html>
   );

@@ -1,7 +1,6 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { DatabaseSync } = require("node:sqlite");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
@@ -48,7 +47,16 @@ const requiredFieldLabels = {
 
 let db;
 let blobSdkPromise;
+let DatabaseSyncCtor;
 const rateLimitBuckets = new Map();
+
+function getDatabaseSyncCtor() {
+  if (!DatabaseSyncCtor) {
+    const nativeRequire = eval("require");
+    DatabaseSyncCtor = nativeRequire("node:sqlite").DatabaseSync;
+  }
+  return DatabaseSyncCtor;
+}
 
 function clientRateLimitKey(request, bucketName) {
   const forwardedFor = String(request.get?.("x-forwarded-for") || "").split(",")[0].trim();
@@ -118,6 +126,7 @@ function getDatabase() {
   if (!db) {
     const databasePath = resolveDatabasePath();
     fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+    const DatabaseSync = getDatabaseSyncCtor();
     db = new DatabaseSync(databasePath);
     db.exec(`
       CREATE TABLE IF NOT EXISTS insurance_submissions (
