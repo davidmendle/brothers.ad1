@@ -62,7 +62,7 @@ describe("UI action inventory", () => {
   });
 
   it("keeps the local employee builder available when Firebase auth is active", () => {
-    expect(source).toContain("Secure login manager is active");
+    expect(source).toContain("Secure login manager");
     expect(source).toContain("state.firebase.enabled && state.authSession");
     expect(source).toContain("${renderTeamForm()}");
   });
@@ -88,5 +88,19 @@ describe("UI action inventory", () => {
     expect(source).toContain('if (module.key === "globalindexes") return renderGlobalIndexesModule(module);');
     expect(source).toContain('function renderGlobalBusinessIndexPanel()');
     expect(source).toContain('function renderCommunityPost(post)');
+  });
+
+  it("uses Google-only authentication in the browser UI", () => {
+    expect(source).toContain("loginWithFirebaseGoogle");
+    expect(source).not.toContain("loginWithFirebasePassword");
+    expect(source).not.toContain('data-form="firebase-login"');
+    expect(source).not.toContain('data-form="insurance-admin-login"');
+  });
+
+  it("provides operational contractor invoice and shared photo workflows", () => {
+    expect(source).toContain('data-form="contractor-invoice"');
+    expect(source).toContain("function addContractorInvoice(formData)");
+    expect(source).toContain('apiRequest("/api/workspace-assets"');
+    expect(source).toContain("photoUrl: uploadedAsset?.assetUrl");
   });
 });

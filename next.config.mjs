@@ -40,7 +40,7 @@ const nextConfig = {
           },
           {
             key: "Permissions-Policy",
-            value: "camera=(), microphone=(), geolocation=(), payment=()"
+            value: "camera=(), microphone=(), geolocation=(self), payment=()"
           },
           {
             key: "Cross-Origin-Opener-Policy",
@@ -53,15 +53,6 @@ const nextConfig = {
           {
             key: "Content-Security-Policy",
             value: contentSecurityPolicy
-          }
-        ]
-      },
-      {
-        source: "/_next/static/:path*",
-        headers: [
-          {
-            key: "Cache-Control",
-            value: "public, max-age=31536000, immutable"
           }
         ]
       }

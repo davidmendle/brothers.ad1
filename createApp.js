@@ -7,6 +7,7 @@ const multer = require("multer");
 const {
   getFirebaseAuth,
   getFirebasePublicConfig,
+  getFirebaseStorageBucket,
   getFirestore,
   isFirebaseConfigured
 } = require("./lib/firebase-admin");
@@ -24,6 +25,8 @@ const adminSessionDurationMs = 1000 * 60 * 60 * 12;
 const allowedStatuses = ["new", "reviewed", "in-progress", "completed", "rejected"];
 const blobSubmissionPrefix = "insurance-intake/submissions";
 const blobFilePrefix = "insurance-intake/files";
+const firebaseInsuranceCollection = "osInsuranceSubmissions";
+const firebaseInsuranceFilePrefix = "insurance-intake/files";
 const placeholderWebsiteOrigin = "https://YOUR-MAIN-WEBSITE-DOMAIN.com";
 const defaultAllowedWebsiteOrigin = "https://www.brothersrestoration.org";
 const defaultOsBaseUrl = "https://brothers.ad";
@@ -88,7 +91,12 @@ function hasBlobStorage() {
   return Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 }
 
+function hasFirebaseInsuranceStorage() {
+  return getFirebasePublicConfig().adminConfigured === true;
+}
+
 function getStorageBackend() {
+  if (hasFirebaseInsuranceStorage()) return "firebase-firestore";
   return hasBlobStorage() ? "vercel-blob" : "sqlite-file";
 }
 
@@ -121,7 +129,7 @@ function resolveDatabasePath() {
 }
 
 function getDatabase() {
-  if (hasBlobStorage()) return null;
+  if (hasFirebaseInsuranceStorage() || hasBlobStorage()) return null;
 
   if (!db) {
     const databasePath = resolveDatabasePath();
@@ -326,7 +334,8 @@ function getHealthStatus(request) {
   const adminConfig = getAdminAuthConfig();
   const firebaseConfig = getFirebasePublicConfig();
   const allowedOrigin = getAllowedWebsiteOrigin();
-  const storageDurable = hasBlobStorage();
+  const storageDurable = hasFirebaseInsuranceStorage() || hasBlobStorage();
+  const legacyAdminLoginEnabled = String(process.env.ENABLE_LEGACY_ADMIN_LOGIN || "").toLowerCase() === "true" && !process.env.VERCEL;
   const configuredOsBaseUrl = getConfiguredOsBaseUrl();
   const uploadUrl = `${getOsBaseUrl(request)}/api/insurance-intake`;
   const warnings = [];
@@ -335,7 +344,7 @@ function getHealthStatus(request) {
     warnings.push("INSURANCE_API_KEY is missing or still set to the placeholder value.");
   }
 
-  if (!adminConfig.configured) {
+  if (legacyAdminLoginEnabled && !adminConfig.configured) {
     warnings.push("Admin dashboard authentication is not fully configured. Set ADMIN_EMAILS, ADMIN_PASSWORD, and ADMIN_JWT_SECRET.");
   }
 
@@ -344,7 +353,7 @@ function getHealthStatus(request) {
   }
 
   if (!storageDurable) {
-    warnings.push("Insurance submissions are using sqlite-file storage. Configure BLOB_READ_WRITE_TOKEN for durable production storage on Vercel.");
+    warnings.push("Insurance submissions are using sqlite-file storage. Configure Firebase Admin credentials or BLOB_READ_WRITE_TOKEN for durable production storage on Vercel.");
   }
 
   if (isLegacyInsuranceProxyUrl(configuredOsBaseUrl)) {
@@ -366,11 +375,30 @@ function getHealthStatus(request) {
       missingAdminEnv: firebaseConfig.missingAdminEnv,
       missingWebEnv: firebaseConfig.missingWebEnv
     },
+    payments: {
+      stripeConfigured: Boolean(String(process.env.STRIPE_SECRET_KEY || "").trim()),
+      paypalConfigured: Boolean(
+        String(process.env.PAYPAL_CLIENT_ID || "").trim()
+        && String(process.env.PAYPAL_CLIENT_SECRET || "").trim()
+      ),
+      zelleConfigured: Boolean(String(process.env.ZELLE_BUSINESS_RECIPIENT || "").trim()),
+      wireConfigured: Boolean(String(process.env.WIRE_PAYMENT_INSTRUCTIONS || "").trim()),
+      quickBooksConfigured: Boolean(
+        String(process.env.QUICKBOOKS_CLIENT_ID || "").trim()
+        && String(process.env.QUICKBOOKS_CLIENT_SECRET || "").trim()
+        && String(process.env.QUICKBOOKS_REDIRECT_URI || "").trim()
+      )
+    },
     insuranceIntake: {
       intakeEnabled: true,
       apiKeyConfigured: Boolean(resolvedInsuranceApiKey && resolvedInsuranceApiKey !== "replace_me"),
-      adminConfigured: adminConfig.configured,
-      adminEmailsConfigured: adminConfig.emails.length,
+      adminConfigured: firebaseConfig.enabled,
+      adminAuthMode: "firebase-google",
+      legacyAdminLoginEnabled,
+      adminEmailsConfigured: String(process.env.FIREBASE_ALLOWED_LOGIN_EMAILS || process.env.SUPER_ADMIN_EMAILS || "david@brothersrestoration.org")
+        .split(",")
+        .map((email) => email.trim())
+        .filter(Boolean).length,
       allowedOrigin,
       allowedOriginConfigured: allowedOrigin !== placeholderWebsiteOrigin,
       osBaseUrlConfigured: Boolean(configuredOsBaseUrl),
@@ -380,6 +408,223 @@ function getHealthStatus(request) {
       storageDurable,
       legacyProxyMode: shouldProxyLegacyInsuranceIntake(request),
       warnings
+    }
+  };
+}
+
+function normalizePaymentPayload(body = {}) {
+  const amount = Math.round(Number(body.amount || 0) * 100) / 100;
+  const customer = String(body.customer || "").trim().slice(0, 160);
+  const job = String(body.job || "").trim().slice(0, 120);
+  const contact = String(body.contact || "").trim().slice(0, 200);
+  const requestId = String(body.requestId || crypto.randomUUID()).trim().replace(/[^a-zA-Z0-9._:-]+/g, "-").slice(0, 120);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000) {
+    return { ok: false, statusCode: 400, message: "Payment amount must be between $0.01 and $1,000,000." };
+  }
+  if (!customer) {
+    return { ok: false, statusCode: 400, message: "Customer name is required." };
+  }
+  return {
+    ok: true,
+    payment: {
+      amount,
+      amountCents: Math.round(amount * 100),
+      customer,
+      job,
+      contact,
+      requestId
+    }
+  };
+}
+
+function paymentConfigurationResponse(rail, payment, message) {
+  return {
+    statusCode: 202,
+    body: {
+      success: true,
+      rail,
+      status: "configuration_required",
+      message,
+      requestedAmount: payment.amount,
+      customer: payment.customer,
+      job: payment.job,
+      requestId: payment.requestId
+    }
+  };
+}
+
+async function createStripeCheckout(payment, request) {
+  const secretKey = String(process.env.STRIPE_SECRET_KEY || "").trim();
+  if (!secretKey) {
+    return paymentConfigurationResponse(
+      "Card",
+      payment,
+      "Card checkout is unavailable until STRIPE_SECRET_KEY is configured in Vercel."
+    );
+  }
+  const osBaseUrl = getOsBaseUrl(request).replace(/\/+$/, "");
+  const params = new URLSearchParams({
+    mode: "payment",
+    success_url: `${osBaseUrl}/?payment=success&provider=stripe#module/payments`,
+    cancel_url: `${osBaseUrl}/?payment=cancelled&provider=stripe#module/payments`,
+    client_reference_id: payment.requestId,
+    "line_items[0][price_data][currency]": String(process.env.PAYMENT_CURRENCY || "usd").toLowerCase(),
+    "line_items[0][price_data][product_data][name]": `Brothers payment - ${payment.customer}`.slice(0, 120),
+    "line_items[0][price_data][product_data][description]": (payment.job ? `Job or invoice ${payment.job}` : "Restoration services").slice(0, 500),
+    "line_items[0][price_data][unit_amount]": String(payment.amountCents),
+    "line_items[0][quantity]": "1",
+    "metadata[brothers_request_id]": payment.requestId,
+    "metadata[job]": payment.job
+  });
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payment.contact)) {
+    params.set("customer_email", payment.contact);
+  }
+  const upstream = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${secretKey}`,
+      "content-type": "application/x-www-form-urlencoded",
+      "idempotency-key": payment.requestId
+    },
+    body: params
+  });
+  const result = await upstream.json().catch(() => ({}));
+  if (!upstream.ok || !result.url) {
+    console.error("[payments] Stripe Checkout creation failed.", {
+      status: upstream.status,
+      type: result?.error?.type || "",
+      code: result?.error?.code || ""
+    });
+    throw new Error("Stripe could not create a secure checkout session.");
+  }
+  return {
+    statusCode: 201,
+    body: {
+      success: true,
+      rail: "Card",
+      status: "checkout_created",
+      providerId: result.id,
+      checkoutUrl: result.url,
+      expiresAt: result.expires_at ? new Date(result.expires_at * 1000).toISOString() : "",
+      requestedAmount: payment.amount,
+      customer: payment.customer,
+      job: payment.job,
+      requestId: payment.requestId
+    }
+  };
+}
+
+function paypalApiBaseUrl() {
+  return String(process.env.PAYPAL_ENVIRONMENT || "sandbox").trim().toLowerCase() === "live"
+    ? "https://api-m.paypal.com"
+    : "https://api-m.sandbox.paypal.com";
+}
+
+async function createPayPalOrder(payment, request) {
+  const clientId = String(process.env.PAYPAL_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env.PAYPAL_CLIENT_SECRET || "").trim();
+  if (!clientId || !clientSecret) {
+    return paymentConfigurationResponse(
+      "PayPal",
+      payment,
+      "PayPal checkout is unavailable until PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET are configured in Vercel."
+    );
+  }
+  const apiBaseUrl = paypalApiBaseUrl();
+  const tokenResponse = await fetch(`${apiBaseUrl}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+      "content-type": "application/x-www-form-urlencoded"
+    },
+    body: "grant_type=client_credentials"
+  });
+  const tokenResult = await tokenResponse.json().catch(() => ({}));
+  if (!tokenResponse.ok || !tokenResult.access_token) {
+    console.error("[payments] PayPal authentication failed.", { status: tokenResponse.status });
+    throw new Error("PayPal could not authenticate the business account.");
+  }
+  const osBaseUrl = getOsBaseUrl(request).replace(/\/+$/, "");
+  const orderResponse = await fetch(`${apiBaseUrl}/v2/checkout/orders`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${tokenResult.access_token}`,
+      "content-type": "application/json",
+      "paypal-request-id": payment.requestId
+    },
+    body: JSON.stringify({
+      intent: "CAPTURE",
+      purchase_units: [{
+        reference_id: payment.requestId,
+        custom_id: payment.job || payment.requestId,
+        description: `Brothers payment - ${payment.customer}`.slice(0, 127),
+        amount: {
+          currency_code: String(process.env.PAYMENT_CURRENCY || "USD").toUpperCase(),
+          value: payment.amount.toFixed(2)
+        }
+      }],
+      application_context: {
+        brand_name: String(process.env.PAYPAL_BRAND_NAME || "Brothers Restoration").slice(0, 127),
+        user_action: "PAY_NOW",
+        return_url: `${osBaseUrl}/?payment=success&provider=paypal#module/payments`,
+        cancel_url: `${osBaseUrl}/?payment=cancelled&provider=paypal#module/payments`
+      }
+    })
+  });
+  const order = await orderResponse.json().catch(() => ({}));
+  const approvalUrl = Array.isArray(order.links)
+    ? order.links.find((link) => link.rel === "approve")?.href
+    : "";
+  if (!orderResponse.ok || !order.id || !approvalUrl) {
+    console.error("[payments] PayPal order creation failed.", {
+      status: orderResponse.status,
+      name: order?.name || ""
+    });
+    throw new Error("PayPal could not create a secure payment order.");
+  }
+  return {
+    statusCode: 201,
+    body: {
+      success: true,
+      rail: "PayPal",
+      status: "approval_required",
+      providerId: order.id,
+      approvalUrl,
+      requestedAmount: payment.amount,
+      customer: payment.customer,
+      job: payment.job,
+      requestId: payment.requestId
+    }
+  };
+}
+
+function manualPaymentInstructions(rail, payment) {
+  const isZelle = rail === "Zelle";
+  const instructions = String(
+    isZelle
+      ? process.env.ZELLE_BUSINESS_RECIPIENT || ""
+      : process.env.WIRE_PAYMENT_INSTRUCTIONS || ""
+  ).trim();
+  if (!instructions) {
+    return paymentConfigurationResponse(
+      rail,
+      payment,
+      `${rail} instructions are unavailable until the verified business ${isZelle ? "recipient" : "wire instructions"} are configured in Vercel.`
+    );
+  }
+  return {
+    statusCode: 200,
+    body: {
+      success: true,
+      rail,
+      status: "instructions_ready",
+      instructions,
+      requestedAmount: payment.amount,
+      customer: payment.customer,
+      job: payment.job,
+      requestId: payment.requestId
     }
   };
 }
@@ -615,6 +860,7 @@ function normalizeStoredFileMeta(submissionId, file, fallbackIndex = 0) {
     mimeType: file.mimeType || "application/octet-stream",
     size: Number(file.size || 0),
     blobPath: file.blobPath || "",
+    objectPath: file.objectPath || "",
     storage: file.storage || "local",
     path: getFileDownloadPath(submissionId, encodeURIComponent(fileId))
   };
@@ -727,6 +973,55 @@ async function persistSubmissionRecord(record) {
   });
 }
 
+function getFirebaseInsuranceCollection() {
+  const firestore = getFirestore();
+  if (!firestore) {
+    throw new Error("Firebase Firestore is not configured for insurance storage.");
+  }
+  return firestore.collection(firebaseInsuranceCollection);
+}
+
+async function persistSubmissionRecordToFirebase(record) {
+  await getFirebaseInsuranceCollection().doc(record.id).set(record);
+}
+
+async function persistUploadedFilesToFirebase(submissionId, uploadedFiles) {
+  const bucket = getFirebaseStorageBucket();
+  if (!bucket) {
+    throw new Error("Firebase Storage is not configured for insurance uploads.");
+  }
+  const storedFiles = [];
+
+  for (const [index, file] of uploadedFiles.entries()) {
+    const fileId = crypto.randomUUID();
+    const safeName = sanitizeFileName(file.originalName || file.fileName || `attachment-${index + 1}`);
+    const objectPath = `${firebaseInsuranceFilePrefix}/${submissionId}/${fileId}-${safeName}`;
+    const fileBuffer = fs.readFileSync(file.tempPath);
+    await bucket.file(objectPath).save(fileBuffer, {
+      resumable: false,
+      metadata: {
+        contentType: file.mimeType || "application/octet-stream",
+        metadata: {
+          submissionId,
+          fileId
+        }
+      }
+    });
+
+    storedFiles.push({
+      id: fileId,
+      originalName: file.originalName || safeName,
+      fileName: file.fileName || safeName,
+      mimeType: file.mimeType || "application/octet-stream",
+      size: Number(file.size || fileBuffer.length || 0),
+      objectPath,
+      storage: "firebase"
+    });
+  }
+
+  return storedFiles;
+}
+
 async function persistUploadedFilesToBlob(submissionId, uploadedFiles) {
   const { put } = await getBlobSdk();
   const storedFiles = [];
@@ -774,6 +1069,28 @@ async function createInsuranceSubmission(payload, uploadedFiles = []) {
 
   const submissionId = crypto.randomUUID();
   const now = new Date().toISOString();
+
+  if (hasFirebaseInsuranceStorage()) {
+    const storedFiles = await persistUploadedFilesToFirebase(submissionId, uploadedFiles);
+    const record = {
+      id: submissionId,
+      fullName: validation.normalized.fullName,
+      phone: validation.normalized.phone,
+      email: validation.normalized.email,
+      propertyAddress: validation.normalized.propertyAddress,
+      insuranceCompanyName: validation.normalized.insuranceCompanyName,
+      claimNumber: validation.normalized.claimNumber,
+      policyNumber: validation.normalized.policyNumber,
+      damageDescription: validation.normalized.damageDescription,
+      uploadedFiles: storedFiles,
+      status: "new",
+      internalNotes: "",
+      createdAt: now,
+      updatedAt: now
+    };
+    await persistSubmissionRecordToFirebase(record);
+    return mapSubmissionRecord(record);
+  }
 
   if (hasBlobStorage()) {
     const storedFiles = await persistUploadedFilesToBlob(submissionId, uploadedFiles);
@@ -858,6 +1175,13 @@ function filterInsuranceSubmissions(submissions, filters = {}) {
 }
 
 async function listInsuranceSubmissions(filters = {}) {
+  if (hasFirebaseInsuranceStorage()) {
+    const snapshot = await getFirebaseInsuranceCollection().get();
+    const submissions = snapshot.docs
+      .map((document) => mapSubmissionRecord({ id: document.id, ...document.data() }));
+    return filterInsuranceSubmissions(submissions, filters);
+  }
+
   if (hasBlobStorage()) {
     const { list } = await getBlobSdk();
     const submissions = [];
@@ -885,6 +1209,11 @@ async function listInsuranceSubmissions(filters = {}) {
 }
 
 async function findInsuranceSubmissionById(id) {
+  if (hasFirebaseInsuranceStorage()) {
+    const snapshot = await getFirebaseInsuranceCollection().doc(id).get();
+    return snapshot.exists ? mapSubmissionRecord({ id: snapshot.id, ...snapshot.data() }) : null;
+  }
+
   if (hasBlobStorage()) {
     const record = await readBlobJson(getBlobSubmissionPath(id));
     return record ? mapSubmissionRecord(record) : null;
@@ -901,6 +1230,15 @@ async function updateInsuranceSubmissionStatus(id, nextStatus) {
     const error = new Error(`Status must be one of: ${allowedStatuses.join(", ")}.`);
     error.statusCode = 400;
     throw error;
+  }
+
+  if (hasFirebaseInsuranceStorage()) {
+    const reference = getFirebaseInsuranceCollection().doc(id);
+    const snapshot = await reference.get();
+    if (!snapshot.exists) return null;
+    const updatedAt = new Date().toISOString();
+    await reference.set({ status: nextStatus, updatedAt }, { merge: true });
+    return mapSubmissionRecord({ id: snapshot.id, ...snapshot.data(), status: nextStatus, updatedAt });
   }
 
   if (hasBlobStorage()) {
@@ -922,6 +1260,16 @@ async function updateInsuranceSubmissionStatus(id, nextStatus) {
 }
 
 async function updateInsuranceSubmissionNotes(id, notes) {
+  if (hasFirebaseInsuranceStorage()) {
+    const reference = getFirebaseInsuranceCollection().doc(id);
+    const snapshot = await reference.get();
+    if (!snapshot.exists) return null;
+    const internalNotes = String(notes || "").trim();
+    const updatedAt = new Date().toISOString();
+    await reference.set({ internalNotes, updatedAt }, { merge: true });
+    return mapSubmissionRecord({ id: snapshot.id, ...snapshot.data(), internalNotes, updatedAt });
+  }
+
   if (hasBlobStorage()) {
     const record = await readBlobJson(getBlobSubmissionPath(id));
     if (!record) return null;
@@ -947,6 +1295,16 @@ async function streamInsuranceSubmissionFile(response, submission, fileId) {
   );
 
   if (!file) return false;
+
+  if (file.storage === "firebase" && file.objectPath) {
+    const bucket = getFirebaseStorageBucket();
+    if (!bucket) return false;
+    const [buffer] = await bucket.file(file.objectPath).download();
+    response.setHeader("Content-Type", file.mimeType || "application/octet-stream");
+    response.setHeader("Content-Disposition", `inline; filename="${sanitizeFileName(file.originalName || file.fileName)}"`);
+    response.send(buffer);
+    return true;
+  }
 
   if (file.storage === "blob" && file.blobPath) {
     const { get } = await getBlobSdk();
@@ -1155,7 +1513,7 @@ async function proxyLegacyRequest(request, response, targetUrl, options = {}) {
 
 function createApp() {
   ensureStorageDirectories();
-  getDatabase();
+  if (!hasFirebaseInsuranceStorage() && !hasBlobStorage()) getDatabase();
 
   const app = express();
   const firebaseRbac = createFirebaseRbacRouter({
@@ -1164,9 +1522,13 @@ function createApp() {
     jsonError,
     getFirebaseAuth,
     getFirebasePublicConfig,
+    getFirebaseStorageBucket,
     getFirestore,
     isFirebaseConfigured
   });
+  const requireInsuranceDashboardSession = firebaseRbac.requireAction("viewCustomerDirectory");
+  const requireRevenueSession = firebaseRbac.requireAction("viewRevenueData");
+  const requireIntegrationAdminSession = firebaseRbac.requireAction("editCompanySettings");
 
   app.disable("x-powered-by");
   app.set("trust proxy", 1);
@@ -1228,11 +1590,14 @@ function createApp() {
       console.error("[insurance-intake] Failed to save submission.", error);
       return jsonError(response, 500, "Unable to save the insurance submission right now.");
     } finally {
-      if (hasBlobStorage()) cleanupTempFiles(uploadedFiles);
+      if (hasFirebaseInsuranceStorage() || hasBlobStorage()) cleanupTempFiles(uploadedFiles);
     }
   });
 
   app.post("/api/admin/login", rateLimit("admin-login", { max: 5, windowMs: 15 * 60 * 1000 }), (request, response) => {
+    if (String(process.env.ENABLE_LEGACY_ADMIN_LOGIN || "").toLowerCase() !== "true" || process.env.VERCEL) {
+      return jsonError(response, 410, "Password-only admin login is disabled. Sign in to Brothers OS with the approved Google account.");
+    }
     const authResult = authenticateAdminCredentials(request.body?.email, request.body?.password);
     if (!authResult.ok) return jsonError(response, authResult.statusCode, authResult.message);
 
@@ -1259,7 +1624,7 @@ function createApp() {
     });
   });
 
-  app.get("/api/insurance-intake", requireAdminSession, async (request, response) => {
+  app.get("/api/insurance-intake", requireInsuranceDashboardSession, async (request, response) => {
     try {
       const submissions = await listInsuranceSubmissions(request.query || {});
       return response.json({
@@ -1272,7 +1637,7 @@ function createApp() {
     }
   });
 
-  app.get("/api/insurance-intake/:id", requireAdminSession, async (request, response) => {
+  app.get("/api/insurance-intake/:id", requireInsuranceDashboardSession, async (request, response) => {
     try {
       const submission = await findInsuranceSubmissionById(request.params.id);
       if (!submission) return jsonError(response, 404, "Insurance submission not found.");
@@ -1287,7 +1652,7 @@ function createApp() {
     }
   });
 
-  app.get("/api/insurance-intake/:id/files/:fileId", requireAdminSession, async (request, response) => {
+  app.get("/api/insurance-intake/:id/files/:fileId", requireInsuranceDashboardSession, async (request, response) => {
     try {
       const submission = await findInsuranceSubmissionById(request.params.id);
       if (!submission) return jsonError(response, 404, "Insurance submission not found.");
@@ -1301,7 +1666,7 @@ function createApp() {
     }
   });
 
-  app.patch("/api/insurance-intake/:id/status", requireAdminSession, async (request, response) => {
+  app.patch("/api/insurance-intake/:id/status", requireInsuranceDashboardSession, async (request, response) => {
     try {
       const submission = await updateInsuranceSubmissionStatus(request.params.id, String(request.body?.status || "").trim());
       if (!submission) return jsonError(response, 404, "Insurance submission not found.");
@@ -1318,7 +1683,7 @@ function createApp() {
     }
   });
 
-  app.patch("/api/insurance-intake/:id/notes", requireAdminSession, async (request, response) => {
+  app.patch("/api/insurance-intake/:id/notes", requireInsuranceDashboardSession, async (request, response) => {
     try {
       const submission = await updateInsuranceSubmissionNotes(request.params.id, request.body?.notes || "");
       if (!submission) return jsonError(response, 404, "Insurance submission not found.");
@@ -1334,47 +1699,45 @@ function createApp() {
     }
   });
 
-  app.post("/api/payments/stripe/intent", (request, response) => {
-    return response.status(202).json({
-      success: true,
-      rail: "Card",
-      status: "configuration_required",
-      message: "Stripe payment intent route is online. Add live Stripe credentials before collecting card payments.",
-      requestedAmount: Number(request.body?.amount || 0),
-      customer: String(request.body?.customer || "")
-    });
+  app.post("/api/payments/stripe/intent", rateLimit("stripe-checkout", { max: 20, windowMs: 15 * 60 * 1000 }), requireRevenueSession, async (request, response) => {
+    const normalized = normalizePaymentPayload(request.body);
+    if (!normalized.ok) return jsonError(response, normalized.statusCode, normalized.message);
+    try {
+      const result = await createStripeCheckout(normalized.payment, request);
+      return response.status(result.statusCode).json(result.body);
+    } catch (error) {
+      console.error("[payments] Unable to create Stripe checkout.", error);
+      return jsonError(response, 502, error.message || "Unable to create card checkout.");
+    }
   });
 
-  app.post("/api/payments/paypal/order", (request, response) => {
-    return response.status(202).json({
-      success: true,
-      rail: "PayPal",
-      status: "configuration_required",
-      message: "PayPal order route is online. Add live PayPal credentials before collecting PayPal payments.",
-      requestedAmount: Number(request.body?.amount || 0),
-      customer: String(request.body?.customer || "")
-    });
+  app.post("/api/payments/paypal/order", rateLimit("paypal-order", { max: 20, windowMs: 15 * 60 * 1000 }), requireRevenueSession, async (request, response) => {
+    const normalized = normalizePaymentPayload(request.body);
+    if (!normalized.ok) return jsonError(response, normalized.statusCode, normalized.message);
+    try {
+      const result = await createPayPalOrder(normalized.payment, request);
+      return response.status(result.statusCode).json(result.body);
+    } catch (error) {
+      console.error("[payments] Unable to create PayPal order.", error);
+      return jsonError(response, 502, error.message || "Unable to create PayPal checkout.");
+    }
   });
 
-  app.get("/api/payments/zelle/instructions", (_request, response) => {
-    return response.status(202).json({
-      success: true,
-      rail: "Zelle",
-      status: "configuration_required",
-      message: "Zelle instructions route is online. Configure the approved business Zelle email or phone before sending customer instructions."
-    });
+  app.post("/api/payments/zelle/instructions", rateLimit("zelle-instructions", { max: 30, windowMs: 15 * 60 * 1000 }), requireRevenueSession, (request, response) => {
+    const normalized = normalizePaymentPayload(request.body);
+    if (!normalized.ok) return jsonError(response, normalized.statusCode, normalized.message);
+    const result = manualPaymentInstructions("Zelle", normalized.payment);
+    return response.status(result.statusCode).json(result.body);
   });
 
-  app.get("/api/payments/wire/instructions", (_request, response) => {
-    return response.status(202).json({
-      success: true,
-      rail: "Wire",
-      status: "configuration_required",
-      message: "Wire instructions route is online. Configure verified business banking instructions before sending payment details."
-    });
+  app.post("/api/payments/wire/instructions", rateLimit("wire-instructions", { max: 30, windowMs: 15 * 60 * 1000 }), requireRevenueSession, (request, response) => {
+    const normalized = normalizePaymentPayload(request.body);
+    if (!normalized.ok) return jsonError(response, normalized.statusCode, normalized.message);
+    const result = manualPaymentInstructions("Wire", normalized.payment);
+    return response.status(result.statusCode).json(result.body);
   });
 
-  app.get("/api/integrations/quickbooks/oauth/start", (_request, response) => {
+  app.get("/api/integrations/quickbooks/oauth/start", requireIntegrationAdminSession, (_request, response) => {
     return response.status(202).json({
       success: true,
       integration: "QuickBooks",
@@ -1414,6 +1777,8 @@ module.exports = {
   buildLegacyIntakeProxyBody,
   createAdminSessionToken,
   createInsuranceSubmission,
+  createPayPalOrder,
+  createStripeCheckout,
   createApp,
   ensureStorageDirectories,
   findInsuranceSubmissionById,
@@ -1422,8 +1787,11 @@ module.exports = {
   getInsurancePublicConfig,
   getRequestHost,
   getStorageBackend,
+  hasFirebaseInsuranceStorage,
   insuranceUploadsRoot,
   listInsuranceSubmissions,
+  manualPaymentInstructions,
+  normalizePaymentPayload,
   normalizeInsurancePayloadAliases,
   proxyLegacyRequest,
   readAdminSession,

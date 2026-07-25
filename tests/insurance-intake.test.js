@@ -2,7 +2,7 @@ import fs from "fs";
 import crypto from "crypto";
 import os from "os";
 import path from "path";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRequire } from "module";
 import request from "supertest";
 
@@ -78,6 +78,21 @@ function hashPortalCode(value) {
       .toUpperCase()
       .replace(/[\s-]+/g, "")
   );
+}
+
+function freshGoogleIdentity(overrides = {}) {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    uid: "owner-uid",
+    email: "david@brothersrestoration.org",
+    email_verified: true,
+    name: "David",
+    auth_time: now,
+    iat: now - 5,
+    exp: now + 3600,
+    firebase: { sign_in_provider: "google.com" },
+    ...overrides
+  };
 }
 
 function createFakeFirestore(seed = {}) {
@@ -181,11 +196,16 @@ beforeEach(() => {
     "ADMIN_EMAIL",
     "BLOB_READ_WRITE_TOKEN",
     "FIREBASE_ALLOWED_LOGIN_EMAILS",
+    "FIREBASE_OWNER_UID",
     "FIREBASE_OWNER_ONLY_LOGIN",
     "SUPER_ADMIN_EMAILS"
   ].forEach((key) => {
     delete process.env[key];
   });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 afterAll(() => {
@@ -443,11 +463,20 @@ describe("insurance intake logic", () => {
         ],
         missingWebEnv: []
       },
+      payments: {
+        stripeConfigured: false,
+        paypalConfigured: false,
+        zelleConfigured: false,
+        wireConfigured: false,
+        quickBooksConfigured: false
+      },
       insuranceIntake: {
         intakeEnabled: true,
         apiKeyConfigured: true,
         adminConfigured: true,
-        adminEmailsConfigured: 2,
+        adminAuthMode: "firebase-google",
+        legacyAdminLoginEnabled: false,
+        adminEmailsConfigured: 1,
         allowedOrigin: process.env.ALLOWED_WEBSITE_ORIGIN,
         allowedOriginConfigured: false,
         osBaseUrlConfigured: false,
@@ -458,7 +487,7 @@ describe("insurance intake logic", () => {
         legacyProxyMode: false,
         warnings: [
           "ALLOWED_WEBSITE_ORIGIN is still using the placeholder domain.",
-          "Insurance submissions are using sqlite-file storage. Configure BLOB_READ_WRITE_TOKEN for durable production storage on Vercel.",
+          "Insurance submissions are using sqlite-file storage. Configure Firebase Admin credentials or BLOB_READ_WRITE_TOKEN for durable production storage on Vercel.",
           "Firebase auth/RBAC is not fully configured. Missing admin env: FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY. Missing web env: none."
         ]
       }
@@ -483,6 +512,9 @@ describe("insurance intake logic", () => {
             uid: "non-owner-uid",
             email: "contractor@brothersrestoration.org",
             email_verified: true,
+            auth_time: Math.floor(Date.now() / 1000),
+            iat: Math.floor(Date.now() / 1000) - 5,
+            exp: Math.floor(Date.now() / 1000) + 3600,
             firebase: { sign_in_provider: "google.com" }
           })
         };
@@ -508,6 +540,379 @@ describe("insurance intake logic", () => {
       success: false,
       message: "Only david@brothersrestoration.org is approved to sign in to Brothers OS."
     });
+  });
+
+  it("never promotes an allowlisted non-owner through the REST fallback", async () => {
+    process.env.FIREBASE_OWNER_ONLY_LOGIN = "true";
+    process.env.FIREBASE_ALLOWED_LOGIN_EMAILS = "david@brothersrestoration.org,contractor@example.com";
+    process.env.SUPER_ADMIN_EMAILS = "david@brothersrestoration.org,contractor@example.com";
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies: () => ({}),
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifyIdToken: async () => freshGoogleIdentity({
+            uid: "contractor-uid",
+            email: "contractor@example.com",
+            name: "Contractor"
+          }),
+          createSessionCookie: async () => {
+            throw new Error("A fallback session must not be created for a non-owner.");
+          }
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: false,
+        webConfigured: true
+      }),
+      getFirestore: () => null,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .post("/api/auth/session/login")
+      .send({ idToken: "verified-google-token" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.message).toMatch(/non-owner account/i);
+  });
+
+  it("clears stale trial restrictions when the verified owner signs in", async () => {
+    process.env.FIREBASE_OWNER_UID = "owner-uid";
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "owner-uid": {
+          email: "david@brothersrestoration.org",
+          displayName: "David",
+          roleId: "worker",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          contractorId: "expired-contractor",
+          status: "expired",
+          disabled: true,
+          accessExpiresAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+          accessGrantId: "old-grant",
+          accessCodeId: "old-code",
+          portalCodeHash: hashPortalCode("CON-OLD-CODE")
+        }
+      }
+    });
+    let savedClaims = null;
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies: () => ({}),
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifyIdToken: async () => freshGoogleIdentity(),
+          getUser: async () => ({
+            uid: "owner-uid",
+            email: "david@brothersrestoration.org",
+            displayName: "David",
+            disabled: false
+          }),
+          setCustomUserClaims: async (_uid, claims) => {
+            savedClaims = claims;
+          },
+          createSessionCookie: async () => "owner-session-cookie"
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .post("/api/auth/session/login")
+      .send({ idToken: "verified-owner-google-token" });
+
+    expect(response.status).toBe(200);
+    expect(response.body.session).toMatchObject({
+      email: "david@brothersrestoration.org",
+      roleId: "super_admin",
+      accessExpiresAt: "",
+      accessScope: "owner"
+    });
+    expect(fakeDb.dump("osUsers")["owner-uid"]).toMatchObject({
+      roleId: "super_admin",
+      status: "active",
+      disabled: false,
+      accessExpiresAt: "",
+      accessGrantId: "",
+      accessCodeId: "",
+      portalCodeHash: "",
+      contractorId: "",
+      accessScope: "owner"
+    });
+    expect(savedClaims).toMatchObject({
+      roleId: "super_admin",
+      accessExpiresAt: "",
+      contractorId: ""
+    });
+  });
+
+  it("revokes a persisted Super Admin role from every non-owner Google account", async () => {
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "stale-admin-uid": {
+          email: "contractor@example.com",
+          displayName: "Stale Admin",
+          roleId: "super_admin",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies: () => ({}),
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifyIdToken: async () => freshGoogleIdentity({
+            uid: "stale-admin-uid",
+            email: "contractor@example.com",
+            name: "Stale Admin"
+          }),
+          getUser: async () => ({
+            uid: "stale-admin-uid",
+            email: "contractor@example.com",
+            displayName: "Stale Admin",
+            disabled: false
+          }),
+          setCustomUserClaims: async () => undefined,
+          createSessionCookie: async () => {
+            throw new Error("Unauthorized Super Admin must not receive a session cookie.");
+          }
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .post("/api/auth/session/login")
+      .send({ idToken: "verified-non-owner-google-token" });
+
+    expect(response.status).toBe(403);
+    expect(fakeDb.dump("osUsers")["stale-admin-uid"]).toMatchObject({
+      roleId: "worker",
+      status: "pending_access",
+      disabled: true,
+      accessScope: "unapproved"
+    });
+  });
+
+  it("keeps a valid owner session active when workspace context hydration fails", async () => {
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "owner-uid": {
+          email: "david@brothersrestoration.org",
+          displayName: "David",
+          roleId: "super_admin",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const baseCollection = fakeDb.collection.bind(fakeDb);
+    fakeDb.collection = (collectionName) => {
+      const collection = baseCollection(collectionName);
+      if (collectionName !== "osTabs") return collection;
+      return {
+        ...collection,
+        orderBy() {
+          return {
+            get: async () => {
+              throw new Error("Simulated Firestore index outage");
+            }
+          };
+        }
+      };
+    };
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async () => freshGoogleIdentity(),
+          getUser: async () => ({
+            uid: "owner-uid",
+            email: "david@brothersrestoration.org",
+            displayName: "David",
+            disabled: false
+          }),
+          setCustomUserClaims: async () => undefined
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=owner-session-cookie"]);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      success: true,
+      contextStatus: "degraded",
+      session: {
+        email: "david@brothersrestoration.org",
+        roleId: "super_admin"
+      }
+    });
+    expect(response.body.tabs.length).toBeGreaterThan(0);
+  });
+
+  it("hydrates page sections without requiring a compound Firestore index", async () => {
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "owner-uid": {
+          email: "david@brothersrestoration.org",
+          displayName: "David",
+          roleId: "super_admin",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const baseCollection = fakeDb.collection.bind(fakeDb);
+    fakeDb.collection = (collectionName) => {
+      const collection = baseCollection(collectionName);
+      if (collectionName !== "osPageSections") return collection;
+      return {
+        ...collection,
+        orderBy() {
+          throw new Error("A compound page-section index must not be required.");
+        }
+      };
+    };
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async () => freshGoogleIdentity(),
+          getUser: async () => ({
+            uid: "owner-uid",
+            email: "david@brothersrestoration.org",
+            displayName: "David",
+            disabled: false
+          }),
+          setCustomUserClaims: async () => undefined
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=owner-session-cookie"]);
+
+    expect(response.status).toBe(200);
+    expect(response.body.contextStatus).toBe("ready");
+    expect(response.body.pageSections.length).toBeGreaterThan(0);
+  });
+
+  it("requires a recent Google authentication before creating a session", async () => {
+    let sessionCookieCreated = false;
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies: () => ({}),
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifyIdToken: async () => freshGoogleIdentity({
+            auth_time: Math.floor(Date.now() / 1000) - 10 * 60
+          }),
+          createSessionCookie: async () => {
+            sessionCookieCreated = true;
+            return "session-cookie";
+          }
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: false,
+        webConfigured: true
+      }),
+      getFirestore: () => null,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const response = await request(app)
+      .post("/api/auth/session/login")
+      .send({ idToken: "stale-google-token" });
+
+    expect(response.status).toBe(401);
+    expect(response.body.message).toMatch(/sign in with Google again/i);
+    expect(sessionCookieCreated).toBe(false);
   });
 
   it("allows an issued contractor grant even when owner-only Super Admin login is enabled", async () => {
@@ -550,6 +955,9 @@ describe("insurance intake logic", () => {
             email: "contractor@brothersrestoration.org",
             email_verified: true,
             name: "Issued Contractor",
+            auth_time: Math.floor(Date.now() / 1000),
+            iat: Math.floor(Date.now() / 1000) - 5,
+            exp: Math.floor(Date.now() / 1000) + 3600,
             firebase: { sign_in_provider: "google.com" }
           }),
           getUser: async () => ({
@@ -588,6 +996,8 @@ describe("insurance intake logic", () => {
       contractorId: "contractor-demo"
     });
     expect(fakeDb.dump("osAccessGrants").grant1.status).toBe("active");
+    expect(fakeDb.dump("osAccessGrants").grant1.tokenHash).toBe("");
+    expect(fakeDb.dump("osUsers")["contractor-uid"].status).toBe("active");
   });
 
   it("does not open non-owner Google login when owner-only mode is disabled without Admin storage", async () => {
@@ -607,6 +1017,9 @@ describe("insurance intake logic", () => {
             uid: "any-google-uid",
             email: "anyone@example.com",
             email_verified: true,
+            auth_time: Math.floor(Date.now() / 1000),
+            iat: Math.floor(Date.now() / 1000) - 5,
+            exp: Math.floor(Date.now() / 1000) + 3600,
             firebase: { sign_in_provider: "google.com" }
           })
         };
@@ -671,6 +1084,9 @@ describe("insurance intake logic", () => {
             email: "contractor@brothersrestoration.org",
             email_verified: true,
             name: "Issued Contractor",
+            auth_time: Math.floor(Date.now() / 1000),
+            iat: Math.floor(Date.now() / 1000) - 5,
+            exp: Math.floor(Date.now() / 1000) + 3600,
             firebase: { sign_in_provider: "google.com" }
           }),
           getUser: async () => ({
@@ -704,6 +1120,7 @@ describe("insurance intake logic", () => {
     expect(response.status).toBe(403);
     expect(fakeDb.dump("osAccessGrants").grant1.status).toBe("issued");
     expect(fakeDb.dump("osAccessGrants").grant1.failedCodeAttempts).toBe(1);
+    expect(fakeDb.dump("osUsers")["contractor-uid"].status).toBe("pending_access");
   });
 
   it("allows a contractor session refresh after a grant has been issued", async () => {
@@ -773,6 +1190,125 @@ describe("insurance intake logic", () => {
       roleId: "contractor",
       contractorId: "contractor-demo"
     });
+  });
+
+  it("persists workspace records and scopes them to assigned workers", async () => {
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "owner-uid": {
+          email: "david@brothersrestoration.org",
+          displayName: "David",
+          roleId: "super_admin",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          status: "active",
+          disabled: false
+        },
+        "worker-uid": {
+          email: "worker@example.com",
+          displayName: "Assigned Worker",
+          roleId: "worker",
+          companyId: "default-company",
+          franchiseIds: ["default-franchise"],
+          assignedJobIds: ["J-ASSIGNED"],
+          assignedTaskIds: ["TASK-ASSIGNED"],
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const users = {
+      "owner-uid": {
+        uid: "owner-uid",
+        email: "david@brothersrestoration.org",
+        displayName: "David",
+        disabled: false
+      },
+      "worker-uid": {
+        uid: "worker-uid",
+        email: "worker@example.com",
+        displayName: "Assigned Worker",
+        disabled: false
+      }
+    };
+    const app = express();
+    app.use(express.json({ limit: "5mb" }));
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async (cookie) => cookie === "worker-cookie"
+            ? freshGoogleIdentity({
+                uid: "worker-uid",
+                email: "worker@example.com",
+                name: "Assigned Worker"
+              })
+            : freshGoogleIdentity(),
+          getUser: async (uid) => users[uid],
+          setCustomUserClaims: async () => undefined
+        };
+      },
+      getFirebasePublicConfig: () => ({
+        enabled: true,
+        adminConfigured: true,
+        webConfigured: true
+      }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const saveResponse = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=owner-cookie"])
+      .send({
+        workspaceState: {
+          files: [
+            { id: "file-assigned", moduleKey: "jobs", relatedJob: "J-ASSIGNED", title: "Assigned file", accessCode: "DO-NOT-STORE" },
+            { id: "file-other", moduleKey: "jobs", relatedJob: "J-OTHER", title: "Other file" }
+          ],
+          photoRecords: [
+            { id: "photo-assigned", jobId: "J-ASSIGNED", taskId: "TASK-ASSIGNED", workerEmail: "worker@example.com" },
+            { id: "photo-other", jobId: "J-OTHER", workerEmail: "other@example.com" }
+          ],
+          contractorBills: [
+            { id: "bill-1", invoiceId: "CINV-1", contractorId: "contractor-a", contractorEmail: "contractor@example.com", jobId: "J-ASSIGNED", amount: 1250 }
+          ],
+          estimateDraft: {
+            estimateNo: "EST-TEST",
+            customer: "Workspace Customer",
+            privateKey: "DO-NOT-STORE"
+          }
+        }
+      });
+
+    expect(saveResponse.status).toBe(200);
+    expect(saveResponse.body.savedRecords).toBe(5);
+
+    const ownerResponse = await request(app)
+      .get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=owner-cookie"]);
+    expect(ownerResponse.status).toBe(200);
+    expect(ownerResponse.body.durable).toBe(true);
+    expect(ownerResponse.body.workspaceState.files).toHaveLength(2);
+    expect(ownerResponse.body.workspaceState.files[0].accessCode).toBeUndefined();
+    expect(ownerResponse.body.workspaceState.estimateDraft.privateKey).toBeUndefined();
+    expect(ownerResponse.body.workspaceState.contractorBills[0].invoiceId).toBe("CINV-1");
+
+    const workerResponse = await request(app)
+      .get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=worker-cookie"]);
+    expect(workerResponse.status).toBe(200);
+    expect(workerResponse.body.workspaceState.files.map((file) => file.id)).toEqual(["file-assigned"]);
+    expect(workerResponse.body.workspaceState.photoRecords.map((photo) => photo.id)).toEqual(["photo-assigned"]);
+    expect(workerResponse.body.workspaceState.contractorBills).toBeUndefined();
+    expect(workerResponse.body.workspaceState.estimateDraft).toBeUndefined();
   });
 
   it("blocks franchise owners from escalating managed users into higher roles", async () => {
@@ -935,8 +1471,12 @@ describe("insurance intake logic", () => {
       email: "created.worker@example.com",
       roleId: "worker"
     });
+    expect(createResponse.body.user.portalCodeHash).toBeUndefined();
+    expect(createResponse.body.grant.tokenHash).toBeUndefined();
+    expect(createResponse.body.grant.portalCodeHash).toBeUndefined();
     expect(listResponse.status).toBe(200);
     expect(listResponse.body.users.map((user) => user.email)).toContain("created.worker@example.com");
+    expect(listResponse.body.users.every((user) => user.portalCodeHash === undefined)).toBe(true);
     expect(fakeDb.dump("osUsers")["created-worker-uid"].roleId).toBe("worker");
   });
 
@@ -1124,8 +1664,10 @@ describe("insurance intake logic", () => {
         }
       });
 
-      expect(payload.insuranceIntake.adminConfigured).toBe(false);
-      expect(payload.insuranceIntake.adminEmailsConfigured).toBe(0);
+      expect(payload.insuranceIntake.adminConfigured).toBe(true);
+      expect(payload.insuranceIntake.adminAuthMode).toBe("firebase-google");
+      expect(payload.insuranceIntake.legacyAdminLoginEnabled).toBe(false);
+      expect(payload.insuranceIntake.adminEmailsConfigured).toBe(1);
       expect(payload.insuranceIntake.allowedOrigin).toBe("https://www.brothersrestoration.org");
       expect(payload.insuranceIntake.allowedOriginConfigured).toBe(true);
       expect(payload.insuranceIntake.osBaseUrlConfigured).toBe(true);
@@ -1134,7 +1676,7 @@ describe("insurance intake logic", () => {
       expect(payload.insuranceIntake.warnings).not.toContain(
         "ALLOWED_WEBSITE_ORIGIN is still using the placeholder domain."
       );
-      expect(payload.insuranceIntake.warnings).toContain(
+      expect(payload.insuranceIntake.warnings).not.toContain(
         "Admin dashboard authentication is not fully configured. Set ADMIN_EMAILS, ADMIN_PASSWORD, and ADMIN_JWT_SECRET."
       );
     } finally {

@@ -73,6 +73,13 @@ describe("cross-module workflow linkage", () => {
     expect(source).toContain("function mergeCommunityComment");
     expect(functionBody("createCommunityPost")).toContain("state.communityPosts = mergeById([result.post], state.communityPosts || [])");
     expect(functionBody("addCommunityComment")).toContain("mergeCommunityComment(postId, result.comment)");
-    expect(functionBody("addCommunityComment")).toContain("usedLocalFallback || updatedFromApi");
+    expect(functionBody("addCommunityComment")).not.toContain("LocalFallback");
+  });
+
+  it("routes contractor invoices into accounting, jobs, vendors, and the contractor portal", () => {
+    const contractorInvoice = functionBody("addContractorInvoice");
+    expect(contractorInvoice).toContain("state.contractorBills = [invoice");
+    expect(contractorInvoice).toContain('linkedModuleKeys: ["vendors", "accounting", "jobs", "contractorportal"]');
+    expect(contractorInvoice).toContain('moduleKey: "accounting"');
   });
 });

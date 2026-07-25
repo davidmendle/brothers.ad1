@@ -1,14 +1,8 @@
+import "./module-data.js";
 import {
-  addClientCommunityComment,
-  createClientAccessGrant,
-  createClientAccessRequest,
-  createClientCommunityPost,
-  fetchClientBusinessRecords,
-  fetchClientCommunityPosts,
   fetchOsSession,
   loadFirebaseConfig,
   loginWithFirebaseGoogle,
-  loginWithFirebasePassword,
   logoutFirebaseSession
 } from "./firebase-client.js";
 import { brothersLogoDataUrl } from "./logo-data.js";
@@ -16,7 +10,16 @@ import { normalizeSectionButtonUrl } from "./ui-security.js";
 
 const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES : [];
 const storageKey = "brothers-os-workspace-v2";
-const workerAccessCode = "BROS-TIME";
+const remoteWorkspaceFields = [
+  "files", "queue", "activity", "standardsOutputs", "learnedJargon",
+  "equipmentDeployments", "dryLogs", "jobBoards", "contacts", "branches",
+  "priceItems", "xactimateImports", "estimateDraft", "quickBooksConnection",
+  "accountProfile", "teamMembers", "tasks", "photoRecords", "contractorBills", "sketchRooms",
+  "performanceMetrics", "actionDashboard", "skillPacks", "dataVaults",
+  "institutionalReview", "serviceSettings", "serviceRequests",
+  "calloutSchedule", "industryProfile", "aiCopilotProfile", "aiCopilotMemory",
+  "aiCopilotMessages", "timeEntries"
+];
 const adminAccessCode = "Issued by Super Admin";
 const employeeAllowedModuleKeys = ["contractorportal", "daily", "jobs", "drylogs", "time", "equipment", "photos", "payments", "communications", "settings"];
 const defaultContractorModuleKeys = ["contractorportal", "daily", "jobs", "time", "equipment", "photos", "payments", "communications", "settings"];
@@ -53,6 +56,12 @@ const rbacActionKeys = [
 
 const app = document.getElementById("app");
 const today = new Date();
+let workspaceSyncTimer = null;
+let workspaceSyncPromise = null;
+let workspaceSyncQueued = false;
+let workspaceHydrating = false;
+let lastWorkspacePayload = "";
+let modalReturnFocus = null;
 
 const categoryLabels = {
   ai: "AI",
@@ -750,15 +759,14 @@ const defaultAccountProfile = {
   activeRole: "Administrator",
   adminAccount: {
     name: "David",
-    email: "owner@example.com",
+    email: "david@brothersrestoration.org",
     accessCode: adminAccessCode,
     mfa: "Google required",
     scope: "Full Super Admin dashboard, every user, customer, revenue invoice, contractor invoice, billing, exports, security, integrations, and deletion controls."
   },
   employeePortal: {
-    accessCode: workerAccessCode,
     modules: employeeAllowedModuleKeys,
-    scope: "Restricted worker and contractor portals for assigned jobs, GPS time, dry logs, photos, equipment notes, contractor invoices, and board discussions without global indexes or owner controls."
+    scope: "Restricted Google-bound worker and contractor portals for assigned jobs, GPS time, dry logs, photos, equipment notes, contractor invoices, and board discussions without global indexes or owner controls."
   }
 };
 
@@ -997,6 +1005,7 @@ const defaultState = {
   teamMembers: defaultTeamMembers,
   tasks: defaultTasks,
   photoRecords: defaultPhotoRecords,
+  contractorBills: [],
   sketchRooms: defaultSketchRooms,
   performanceMetrics: defaultPerformanceMetrics,
   actionDashboard: defaultActionDashboard,
@@ -1028,14 +1037,20 @@ const defaultState = {
     enabled: false,
     ready: false
   },
+  workspacePersistence: {
+    durable: false,
+    loaded: false,
+    status: "browser-cache",
+    recordCount: 0,
+    lastSavedAt: "",
+    error: ""
+  },
   authSession: null,
   accessContext: null,
   authLoading: false,
   authChecked: false,
   authError: "",
   loginForm: {
-    email: "",
-    password: "",
     accessCode: ""
   },
   accessRequestStatus: null,
@@ -1084,7 +1099,12 @@ function normalizeFileRecord(file) {
     sourceType: file.sourceType || "",
     sourceId: file.sourceId || "",
     customer: file.customer || "",
-    amount: parseAmount(file.amount)
+    amount: parseAmount(file.amount),
+    paymentUrl: safePaymentUrl(file.paymentUrl),
+    paymentProviderId: String(file.paymentProviderId || ""),
+    paymentStatus: String(file.paymentStatus || ""),
+    paymentMethod: String(file.paymentMethod || ""),
+    paymentInstructions: String(file.paymentInstructions || "")
   };
 }
 
@@ -1161,16 +1181,6 @@ function renderModuleAccessPicker({ selectedKeys = [], legend = "Allowed modules
   `;
 }
 
-function fallbackAccessCodeForMember(member, accountType) {
-  if (/admin/i.test(accountType)) return "OWNER-ADMIN";
-  const seed = String(member.id || member.email || member.name || "worker")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, "")
-    .slice(0, 8)
-    .padEnd(8, "X");
-  return `EMP-${seed.slice(0, 4)}-${seed.slice(4, 8)}`;
-}
-
 function normalizeTeamMember(member) {
   const accountType = member.accountType || (/owner|admin/i.test(`${member.role} ${member.access}`) ? "Administrator" : "Employee");
   const permissions = Array.isArray(member.permissions)
@@ -1189,7 +1199,7 @@ function normalizeTeamMember(member) {
     permissions: permissions.length ? permissions : defaultPermissions,
     visibleTabIds: visibleTabIds.length ? visibleTabIds : defaultPermissions,
     visiblePageIds: visiblePageIds.length ? visiblePageIds : visibleTabIds.length ? visibleTabIds : defaultPermissions,
-    accessCode: String(member.accessCode || fallbackAccessCodeForMember(member, accountType)).trim().toUpperCase(),
+    accessCode: String(member.accessCode || "").trim().toUpperCase(),
     assignedJobIds: normalizeListValue(member.assignedJobIds || member.assignedJobs || ""),
     assignedTaskIds: normalizeListValue(member.assignedTaskIds || member.tasks || ""),
     status: member.status || "Invited",
@@ -1248,6 +1258,7 @@ function normalizeState(next) {
   next.tasks = Array.isArray(next.tasks) ? mergeDefaultsById(next.tasks, defaultTasks) : clone(defaultTasks);
   next.tasks = next.tasks.map((task) => normalizeTaskRecord(task, next.teamMembers));
   next.photoRecords = Array.isArray(next.photoRecords) ? mergeDefaultsById(next.photoRecords, defaultPhotoRecords) : clone(defaultPhotoRecords);
+  next.contractorBills = Array.isArray(next.contractorBills) ? next.contractorBills : [];
   next.sketchRooms = Array.isArray(next.sketchRooms) ? mergeDefaultsById(next.sketchRooms, defaultSketchRooms) : clone(defaultSketchRooms);
   next.performanceMetrics =
     next.performanceMetrics && typeof next.performanceMetrics === "object" ? { ...clone(defaultPerformanceMetrics), ...next.performanceMetrics } : clone(defaultPerformanceMetrics);
@@ -1288,12 +1299,13 @@ function normalizeState(next) {
   next.aiCopilotQuery = next.aiCopilotQuery || "";
   next.aiCopilotMessages = Array.isArray(next.aiCopilotMessages) ? mergeDefaultsById(next.aiCopilotMessages, defaultAiCopilotMessages) : clone(defaultAiCopilotMessages);
   next.firebase = { enabled: false, ready: false };
+  next.workspacePersistence = clone(defaultState.workspacePersistence);
   next.authSession = null;
   next.accessContext = null;
   next.authLoading = false;
   next.authChecked = false;
   next.authError = "";
-  next.loginForm = { email: "", password: "", accessCode: "" };
+  next.loginForm = { accessCode: "" };
   next.accessRequestStatus = null;
   next.lastAccessGrant = null;
   next.businessData = [];
@@ -1312,8 +1324,8 @@ function normalizeState(next) {
   return next;
 }
 
-function persist() {
-  const persisted = {
+function buildPersistedState() {
+  return {
     activeKey: state.activeKey,
     category: state.category,
     search: state.search,
@@ -1335,6 +1347,7 @@ function persist() {
     teamMembers: state.teamMembers,
     tasks: state.tasks,
     photoRecords: state.photoRecords,
+    contractorBills: state.contractorBills,
     sketchRooms: state.sketchRooms,
     performanceMetrics: state.performanceMetrics,
     actionDashboard: state.actionDashboard,
@@ -1358,6 +1371,167 @@ function persist() {
     worker: state.worker,
     selectedFileId: state.selectedFileId
   };
+}
+
+function sanitizeRemoteWorkspaceValue(value, key = "", depth = 0) {
+  if (depth > 12 || value === undefined) return undefined;
+  const normalizedKey = String(key || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (["accesscode", "password", "passwordhash", "portalcodehash", "privatekey", "refreshtoken", "sessioncookie", "tokenhash", "idtoken"].includes(normalizedKey)) {
+    return undefined;
+  }
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") {
+    if ((normalizedKey.endsWith("dataurl") || normalizedKey === "base64") && value.startsWith("data:")) return "";
+    return value.length > 200000 ? value.slice(0, 200000) : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeRemoteWorkspaceValue(item, key, depth + 1)).filter((item) => item !== undefined);
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .map(([nestedKey, nestedValue]) => [nestedKey, sanitizeRemoteWorkspaceValue(nestedValue, nestedKey, depth + 1)])
+        .filter(([, nestedValue]) => nestedValue !== undefined)
+    );
+  }
+  return String(value);
+}
+
+function buildRemoteWorkspaceState() {
+  const persisted = buildPersistedState();
+  return Object.fromEntries(
+    remoteWorkspaceFields
+      .filter((field) => Object.prototype.hasOwnProperty.call(persisted, field))
+      .map((field) => [field, sanitizeRemoteWorkspaceValue(persisted[field], field)])
+  );
+}
+
+function scheduleWorkspaceSync() {
+  if (workspaceHydrating || !state.authSession || !state.firebase?.adminConfigured) return;
+  workspaceSyncQueued = true;
+  window.clearTimeout(workspaceSyncTimer);
+  workspaceSyncTimer = window.setTimeout(() => {
+    workspaceSyncTimer = null;
+    syncWorkspaceState().catch((error) => {
+      console.warn("Brothers OS workspace sync failed.", error);
+    });
+  }, 300);
+}
+
+async function syncWorkspaceState({ force = false } = {}) {
+  if (!state.authSession || !state.firebase?.adminConfigured) return null;
+  if (workspaceSyncPromise) {
+    workspaceSyncQueued = true;
+    return workspaceSyncPromise;
+  }
+
+  workspaceSyncPromise = (async () => {
+    let lastResult = null;
+    let forceNextWrite = force;
+    do {
+      workspaceSyncQueued = false;
+      const workspaceState = buildRemoteWorkspaceState();
+      const serialized = JSON.stringify(workspaceState);
+      if (!forceNextWrite && serialized === lastWorkspacePayload) continue;
+      forceNextWrite = false;
+      state.workspacePersistence = {
+        ...state.workspacePersistence,
+        durable: true,
+        status: "saving",
+        error: ""
+      };
+      const result = await apiRequest("/api/workspace-state", {
+        method: "PUT",
+        body: JSON.stringify({ workspaceState })
+      });
+      lastWorkspacePayload = serialized;
+      state.workspacePersistence = {
+        durable: Boolean(result.durable),
+        loaded: true,
+        status: result.durable ? "saved" : "browser-cache",
+        recordCount: Number(result.savedRecords || state.workspacePersistence.recordCount || 0),
+        lastSavedAt: result.updatedAt || new Date().toISOString(),
+        error: ""
+      };
+      lastResult = result;
+    } while (workspaceSyncQueued);
+    return lastResult;
+  })()
+    .catch((error) => {
+      state.workspacePersistence = {
+        ...state.workspacePersistence,
+        status: "error",
+        error: error.message || "Workspace could not be saved."
+      };
+      throw error;
+    })
+    .finally(() => {
+      workspaceSyncPromise = null;
+    });
+  return workspaceSyncPromise;
+}
+
+async function hydrateWorkspaceState({ migrateIfEmpty = true } = {}) {
+  if (!state.authSession || !state.firebase?.adminConfigured) {
+    state.workspacePersistence = {
+      ...clone(defaultState.workspacePersistence),
+      loaded: true,
+      error: state.firebase?.adminConfigured ? "" : "Firebase Admin credentials are required for durable shared records."
+    };
+    return;
+  }
+  workspaceHydrating = true;
+  try {
+    const result = await apiRequest("/api/workspace-state");
+    if (result.exists && result.workspaceState && typeof result.workspaceState === "object") {
+      const runtimeState = {
+        activeKey: state.activeKey,
+        firebase: state.firebase,
+        authSession: state.authSession,
+        accessContext: state.accessContext,
+        authLoading: state.authLoading,
+        authChecked: state.authChecked,
+        authError: state.authError,
+        businessData: state.businessData,
+        communityPosts: state.communityPosts
+      };
+      state = normalizeState({ ...state, ...result.workspaceState });
+      Object.assign(state, runtimeState);
+      applyHighestPricingPolicy();
+      lastWorkspacePayload = JSON.stringify(buildRemoteWorkspaceState());
+    } else if (migrateIfEmpty) {
+      const workspaceState = buildRemoteWorkspaceState();
+      const saved = await apiRequest("/api/workspace-state", {
+        method: "PUT",
+        body: JSON.stringify({ workspaceState })
+      });
+      lastWorkspacePayload = JSON.stringify(workspaceState);
+      result.recordCount = saved.savedRecords || 0;
+      result.updatedAt = saved.updatedAt || "";
+    }
+    state.workspacePersistence = {
+      durable: Boolean(result.durable),
+      loaded: true,
+      status: result.durable ? "saved" : "browser-cache",
+      recordCount: Number(result.recordCount || 0),
+      lastSavedAt: result.updatedAt || "",
+      error: ""
+    };
+    persist();
+  } catch (error) {
+    state.workspacePersistence = {
+      ...state.workspacePersistence,
+      loaded: true,
+      status: "error",
+      error: error.message || "Workspace records could not be loaded."
+    };
+  } finally {
+    workspaceHydrating = false;
+  }
+}
+
+function persist() {
+  const persisted = buildPersistedState();
   try {
     localStorage.setItem(storageKey, JSON.stringify(persisted));
   } catch (error) {
@@ -1380,6 +1554,7 @@ function persist() {
       state.toast = "Browser storage is full; export or clear old local data";
     }
   }
+  scheduleWorkspaceSync();
 }
 
 function moduleByKey(key) {
@@ -1394,6 +1569,16 @@ function getRouteKey() {
 function getAccessTokenFromRoute() {
   const match = window.location.hash.match(/^#access\/([^/?#]+)/);
   return match ? decodeURIComponent(match[1]) : "";
+}
+
+function isLocalSmokePreview() {
+  return ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)
+    && new URLSearchParams(window.location.search).has("smoke");
+}
+
+function isOfflineSmokePreview() {
+  return isLocalSmokePreview()
+    && new URLSearchParams(window.location.search).get("smoke") === "offline";
 }
 
 function getLoginAccessOptions() {
@@ -1507,116 +1692,43 @@ function selectedInsuranceSubmission() {
 }
 
 function insuranceRequiresLogin() {
-  return !state.insuranceAdminSession && state.insuranceAuthChecked && !state.insuranceAuthLoading;
+  return !state.authSession || !canDo("viewCustomerDirectory");
 }
 
-async function fetchInsuranceAdminSession(force = false) {
-  if (state.insuranceAuthLoading) return state.insuranceAdminSession;
-  if (state.insuranceAuthChecked && !force) return state.insuranceAdminSession;
-
-  state.insuranceAuthLoading = true;
-  render();
-
+function safePaymentUrl(value) {
+  if (!value) return "";
   try {
-    const response = await fetch("/api/admin/session");
-    const result = await response.json();
-
-    if (response.status === 401) {
-      state.insuranceAdminSession = null;
-      state.insuranceAuthChecked = true;
-      state.insuranceAuthLoading = false;
-      state.insuranceError = "";
-      render();
-      return null;
-    }
-
-    if (!response.ok || !result.success) {
-      throw new Error(result.message || "Unable to verify the admin session.");
-    }
-
-    state.insuranceAdminSession = result.session || null;
-    state.insuranceAuthChecked = true;
-    state.insuranceAuthLoading = false;
-    state.insuranceError = "";
-    render();
-    return state.insuranceAdminSession;
-  } catch (error) {
-    state.insuranceAdminSession = null;
-    state.insuranceAuthChecked = true;
-    state.insuranceAuthLoading = false;
-    state.insuranceError = error.message || "Unable to verify the admin session.";
-    render();
-    return null;
+    const parsed = new URL(String(value));
+    const host = parsed.hostname.toLowerCase();
+    const allowed = host === "checkout.stripe.com"
+      || host === "paypal.com"
+      || host.endsWith(".paypal.com");
+    return parsed.protocol === "https:" && allowed ? parsed.toString() : "";
+  } catch {
+    return "";
   }
 }
 
 async function loadInsuranceWorkspace(force = false) {
-  const session = await fetchInsuranceAdminSession(force);
-  if (!session) return;
+  state.insuranceAuthChecked = true;
+  state.insuranceAdminSession = insuranceRequiresLogin()
+    ? null
+    : {
+        email: state.authSession.email,
+        role: state.authSession.roleId,
+        expiresAt: state.authSession.accessExpiresAt || ""
+      };
+  if (!state.insuranceAdminSession) {
+    state.insuranceError = "Your Google-authenticated role does not include insurance customer access.";
+    return render();
+  }
   return fetchInsuranceSubmissions(force);
-}
-
-async function loginInsuranceAdmin(formData) {
-  state.insuranceAuthLoading = true;
-  state.insuranceError = "";
-  render();
-
-  try {
-    const response = await fetch("/api/admin/login", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        email: String(formData.get("email") || "").trim(),
-        password: String(formData.get("password") || "")
-      })
-    });
-    const result = await response.json();
-    if (!response.ok || !result.success) throw new Error(result.message || "Unable to sign in.");
-
-    state.insuranceAdminSession = result.session || null;
-    state.insuranceAuthChecked = true;
-    state.insuranceAuthLoading = false;
-    state.insuranceError = "";
-    setToast("Insurance admin signed in.");
-    return fetchInsuranceSubmissions(true);
-  } catch (error) {
-    state.insuranceAdminSession = null;
-    state.insuranceAuthChecked = true;
-    state.insuranceAuthLoading = false;
-    state.insuranceError = error.message || "Unable to sign in.";
-    render();
-  }
-}
-
-async function logoutInsuranceAdmin() {
-  state.insuranceAuthLoading = true;
-  render();
-
-  try {
-    const response = await fetch("/api/admin/logout", {
-      method: "POST"
-    });
-    const result = await response.json();
-    if (!response.ok || !result.success) throw new Error(result.message || "Unable to sign out.");
-  } catch (error) {
-    state.insuranceError = error.message || "Unable to sign out.";
-  } finally {
-    state.insuranceAdminSession = null;
-    state.insuranceSubmissions = [];
-    state.selectedInsuranceId = "";
-    state.insuranceLoaded = false;
-    state.insuranceAuthChecked = true;
-    state.insuranceAuthLoading = false;
-    render();
-  }
 }
 
 async function fetchInsuranceSubmissions(force = false) {
   if (state.insuranceLoading) return;
   if (state.insuranceLoaded && !force) return;
-  if (!state.insuranceAdminSession) return;
+  if (insuranceRequiresLogin()) return;
   state.insuranceLoading = true;
   state.insuranceError = "";
   render();
@@ -2439,6 +2551,11 @@ function createFile(data) {
     sourceId: data.sourceId || "",
     customer: String(data.customer || "").trim(),
     amount: parseAmount(data.amount),
+    paymentUrl: safePaymentUrl(data.paymentUrl),
+    paymentProviderId: String(data.paymentProviderId || "").trim(),
+    paymentStatus: String(data.paymentStatus || "").trim(),
+    paymentMethod: String(data.paymentMethod || "").trim(),
+    paymentInstructions: String(data.paymentInstructions || "").trim(),
     title: data.title?.trim() || `${module.label} file`,
     type: data.type || suggestedFileType(module),
     owner: data.owner?.trim() || (state.worker?.name || "Office"),
@@ -2486,12 +2603,51 @@ function openCreateFile(moduleKey = state.activeKey) {
   render();
 }
 
+function rememberModalTrigger(element) {
+  if (!element) return;
+  modalReturnFocus = {
+    action: element.dataset.action || "",
+    key: element.dataset.key || "",
+    id: element.dataset.id || ""
+  };
+}
+
+function restoreModalTrigger(descriptor) {
+  const candidates = [...document.querySelectorAll("[data-action]")];
+  const target = candidates.find((element) => {
+    return element.dataset.action === descriptor?.action
+      && (!descriptor.key || element.dataset.key === descriptor.key)
+      && (!descriptor.id || element.dataset.id === descriptor.id);
+  });
+  (target || document.getElementById("workspace-main"))?.focus();
+}
+
+function modalFocusableElements(dialog) {
+  return [...dialog.querySelectorAll(
+    'button:not([disabled]), a[href], input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )].filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+}
+
+function activateModalAccessibility() {
+  const backdrop = app.querySelector(".modal-backdrop");
+  const dialog = backdrop?.querySelector('[role="dialog"]');
+  if (!backdrop || !dialog) return;
+  [...app.children].forEach((element) => {
+    if (element !== backdrop) element.inert = true;
+  });
+  const preferredFocus = dialog.querySelector('input:not([disabled]):not([type="hidden"]), textarea:not([disabled]), select:not([disabled])');
+  (preferredFocus || modalFocusableElements(dialog)[0] || dialog).focus();
+}
+
 function closeModal() {
   if (state.modal?.type === "admin-edit") {
     state.adminEditMode = false;
   }
+  const returnFocus = modalReturnFocus;
+  modalReturnFocus = null;
   state.modal = null;
   render();
+  if (returnFocus) queueMicrotask(() => restoreModalTrigger(returnFocus));
 }
 
 function updateFileStatus(fileId, status) {
@@ -3527,7 +3683,7 @@ function normalizeLocalAccessCode(value) {
 }
 
 function employeeAccessCodeFor(member) {
-  return String(member?.accessCode || fallbackAccessCodeForMember(member || {}, member?.accountType || "Employee")).trim().toUpperCase();
+  return String(member?.accessCode || "").trim().toUpperCase();
 }
 
 function assignableTeamMembers() {
@@ -3783,6 +3939,7 @@ function localRevenueInvoiceRecords() {
 }
 
 function revenueInvoices() {
+  if (state.authSession && !canDo("viewRevenueData")) return [];
   const records = new Map();
   [...localRevenueInvoiceRecords(), ...businessRecordsByType("revenueInvoice")].forEach((record) => {
     const id = String(record.id || record.invoiceId || createId("invoice"));
@@ -3792,10 +3949,17 @@ function revenueInvoices() {
 }
 
 function contractorInvoices() {
-  return businessRecordsByType("contractorInvoice");
+  if (state.authSession && !canDo("viewContractorInvoices")) return [];
+  const records = new Map();
+  [...(state.contractorBills || []), ...businessRecordsByType("contractorInvoice")].forEach((record) => {
+    const id = String(record.id || record.invoiceId || createId("contractor-invoice"));
+    records.set(id, { ...record, id });
+  });
+  return Array.from(records.values());
 }
 
 function customerRecords() {
+  if (state.authSession && !canDo("viewCustomerDirectory")) return [];
   const records = new Map();
   businessRecordsByType("customer").forEach((record) => {
     const id = String(record.id || record.customerId || normalizePriceToken(record.name || "customer"));
@@ -3851,24 +4015,11 @@ function upsertAccessGrant(grant) {
   state.accessContext.accessGrants = mergeById([grant], state.accessContext.accessGrants || []);
 }
 
-function upsertAccessRequest(request) {
-  if (!request) return;
-  state.accessContext = state.accessContext || {};
-  state.accessContext.accessRequests = mergeById([request], state.accessContext.accessRequests || []);
-}
-
 function upsertManagedUser(user) {
   if (!user) return;
   state.accessContext = state.accessContext || {};
   state.accessContext.users = mergeById(state.accessContext.users || [], [user]);
   state.teamMembers = mergeById(state.teamMembers || [], [mapUserToTeamMember(user)]).map(normalizeTeamMember);
-}
-
-function upsertLocalTeamMember(member) {
-  if (!member) return null;
-  const normalized = normalizeTeamMember(member);
-  state.teamMembers = mergeById(state.teamMembers || [], [normalized]).map(normalizeTeamMember);
-  return normalized;
 }
 
 function removeManagedUser(uid) {
@@ -3878,49 +4029,6 @@ function removeManagedUser(uid) {
     state.accessContext.users = state.accessContext.users.filter((user) => !matchesUid(user));
   }
   state.teamMembers = (state.teamMembers || []).filter((member) => !matchesUid(member));
-}
-
-function localCommunityPost(payload) {
-  const now = new Date().toISOString();
-  const post = {
-    id: createId("POST"),
-    title: String(payload.title || "Contractor discussion").trim(),
-    body: String(payload.body || "").trim(),
-    tags: csvValues(payload.tags),
-    visibility: "contractors",
-    authorEmail: state.authSession?.email || "approved user",
-    authorRoleId: currentRoleId() || "member",
-    contractorId: currentContractorId(),
-    comments: [],
-    pinned: false,
-    createdAt: now,
-    updatedAt: now,
-    source: "local-browser"
-  };
-  state.communityPosts = [post, ...(state.communityPosts || [])];
-  persist();
-  return post;
-}
-
-function localCommunityComment(postId, body) {
-  const comment = {
-    id: createId("COMMENT"),
-    body: String(body || "").trim(),
-    authorEmail: state.authSession?.email || "approved user",
-    authorRoleId: currentRoleId() || "member",
-    createdAt: new Date().toISOString(),
-    source: "local-browser"
-  };
-  state.communityPosts = (state.communityPosts || []).map((post) => {
-    if (post.id !== postId) return post;
-    return {
-      ...post,
-      comments: [...(Array.isArray(post.comments) ? post.comments : []), comment],
-      updatedAt: new Date().toISOString()
-    };
-  });
-  persist();
-  return comment;
 }
 
 function mergeCommunityComment(postId, comment) {
@@ -3934,34 +4042,6 @@ function mergeCommunityComment(postId, comment) {
     };
   });
   persist();
-}
-
-function optionalFirebaseRead(promise, fallback = []) {
-  return Promise.race([
-    promise,
-    new Promise((resolve) => window.setTimeout(() => resolve(fallback), 2500))
-  ]).catch(() => fallback);
-}
-
-async function hydrateClientFirebaseData() {
-  if (!state.firebase.enabled || !state.authSession) return;
-  try {
-    const [businessData, communityPosts] = await Promise.all([
-      optionalFirebaseRead(fetchClientBusinessRecords()),
-      optionalFirebaseRead(fetchClientCommunityPosts())
-    ]);
-    if (businessData.length) {
-      state.businessData = mergeById(state.businessData || [], businessData);
-      if (state.accessContext) state.accessContext.businessData = state.businessData;
-    }
-    if (communityPosts.length) {
-      state.communityPosts = mergeById(state.communityPosts || [], communityPosts)
-        .sort((a, b) => String(b.pinned || "").localeCompare(String(a.pinned || "")) || new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-      if (state.accessContext) state.accessContext.communityPosts = state.communityPosts;
-    }
-  } catch (_error) {
-    // Server context remains the source of truth when Firestore browser reads are not available.
-  }
 }
 
 async function bootstrapFirebaseAuth() {
@@ -4012,8 +4092,8 @@ async function bootstrapFirebaseAuth() {
     } : null;
     state.businessData = session?.businessData || [];
     state.communityPosts = session?.communityPosts || [];
+    await hydrateWorkspaceState({ migrateIfEmpty: true });
     mergeSessionTeamMembers(session?.users || []);
-    await hydrateClientFirebaseData();
     state.authChecked = true;
     state.authError = "";
   } catch (error) {
@@ -4025,7 +4105,7 @@ async function bootstrapFirebaseAuth() {
   }
 }
 
-async function refreshAccessContext() {
+async function refreshAccessContext({ hydrateWorkspace = false } = {}) {
   if (!state.firebase.enabled) return;
   const session = await fetchOsSession();
   state.authSession = session?.session || null;
@@ -4044,30 +4124,13 @@ async function refreshAccessContext() {
       accessRequests: session.accessRequests || [],
       accessGrants: session.accessGrants || [],
       communityPosts: session.communityPosts || []
-    } : null;
+  } : null;
   state.businessData = session?.businessData || [];
   state.communityPosts = session?.communityPosts || [];
-  mergeSessionTeamMembers(session?.users || []);
-  await hydrateClientFirebaseData();
-}
-
-async function submitFirebaseLogin(formData) {
-  const email = String(formData.get("email") || "").trim();
-  const password = String(formData.get("password") || "");
-  const accessCode = String(formData.get("accessCode") || "").trim();
-  state.authLoading = true;
-  state.authError = "";
-  render();
-  try {
-    await loginWithFirebasePassword(email, password, { ...getLoginAccessOptions(), accessCode });
-    await refreshAccessContext();
-  } catch (error) {
-    state.authError = error.message || "Unable to sign in.";
-  } finally {
-    state.authLoading = false;
-    state.authChecked = true;
-    render();
+  if (hydrateWorkspace) {
+    await hydrateWorkspaceState({ migrateIfEmpty: true });
   }
+  mergeSessionTeamMembers(session?.users || []);
 }
 
 async function submitFirebaseGoogleLogin() {
@@ -4077,7 +4140,7 @@ async function submitFirebaseGoogleLogin() {
   render();
   try {
     await loginWithFirebaseGoogle(accessOptions);
-    await refreshAccessContext();
+    await refreshAccessContext({ hydrateWorkspace: true });
   } catch (error) {
     state.authError = error.message || "Unable to sign in with Google.";
   } finally {
@@ -4091,9 +4154,18 @@ async function signOutFirebaseAuth() {
   state.authLoading = true;
   render();
   try {
+    window.clearTimeout(workspaceSyncTimer);
+    workspaceSyncTimer = null;
+    await syncWorkspaceState({ force: true }).catch((error) => {
+      console.warn("Brothers OS could not finish its final workspace save before sign-out.", error);
+    });
     await logoutFirebaseSession();
     state.authSession = null;
     state.accessContext = null;
+    workspaceSyncPromise = null;
+    workspaceSyncQueued = false;
+    lastWorkspacePayload = "";
+    state.workspacePersistence = clone(defaultState.workspacePersistence);
   } finally {
     state.authLoading = false;
     state.authChecked = true;
@@ -4141,18 +4213,7 @@ async function requestTrialAccess(formData) {
     state.accessRequestStatus = result.message || "Access request sent.";
     setToast("Access request sent");
   } catch (error) {
-    if (!isAdminCredentialGap(error)) {
-      state.authError = error.message || "Unable to request access.";
-    } else {
-      try {
-        const result = await createClientAccessRequest(payload);
-        state.accessRequestStatus = `${result.message} Stored in Firebase from the login dashboard.`;
-        upsertAccessRequest(result.request);
-        setToast("Access request stored in Firebase");
-      } catch (fallbackError) {
-        state.authError = fallbackError.message || "Unable to request access.";
-      }
-    }
+    state.authError = error.message || "Unable to request access.";
   } finally {
     state.authLoading = false;
     render();
@@ -4172,18 +4233,10 @@ async function createAccessGrant(formData) {
     sendEmail: formData.has("sendEmail"),
     ...moduleVisibilityPayload(formData)
   };
-  let result;
-  let usedClientGrant = false;
-  try {
-    result = await apiRequest("/api/access/grants", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-  } catch (error) {
-    if (!isAdminCredentialGap(error)) throw error;
-    usedClientGrant = true;
-    result = await createClientAccessGrant(payload);
-  }
+  const result = await apiRequest("/api/access/grants", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
   state.lastAccessGrant = {
     email: payload.email,
     accessCode: result.accessCode,
@@ -4193,11 +4246,7 @@ async function createAccessGrant(formData) {
   };
   upsertAccessGrant(result.grant);
   setToast(state.lastAccessGrant.emailDelivery?.status === "sent" ? "Invite email sent with access code" : "Access grant issued; send the link and code manually");
-  if (usedClientGrant) {
-    render();
-  } else {
-    await refreshAccessContext().catch(() => hydrateClientFirebaseData());
-  }
+  await refreshAccessContext();
 }
 
 async function createCommunityPost(formData) {
@@ -4210,80 +4259,37 @@ async function createCommunityPost(formData) {
     companyId: state.authSession?.companyId || "default-company",
     franchiseIds: currentUserFranchiseIds()
   };
-  let usedLocalFallback = false;
-  let updatedFromApi = false;
-  try {
-    const result = await apiRequest("/api/community/posts", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-    if (result.post) {
-      state.communityPosts = mergeById([result.post], state.communityPosts || []);
-      updatedFromApi = true;
-    }
-  } catch (error) {
-    if (!isAdminCredentialGap(error)) throw error;
-    try {
-      const result = await createClientCommunityPost(payload);
-      state.communityPosts = mergeById([result.post], state.communityPosts || []);
-      updatedFromApi = true;
-    } catch (_fallbackError) {
-      usedLocalFallback = true;
-      localCommunityPost(payload);
-    }
-  }
+  const result = await apiRequest("/api/community/posts", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+  if (result.post) state.communityPosts = mergeById([result.post], state.communityPosts || []);
   setToast("Board post published");
-  if (usedLocalFallback || updatedFromApi) {
-    render();
-  } else {
-    await refreshAccessContext().catch(() => hydrateClientFirebaseData());
-  }
+  await refreshAccessContext();
+  render();
 }
 
 async function addCommunityComment(formData) {
   const postId = String(formData.get("postId") || "").trim();
   const body = String(formData.get("body") || "").trim();
-  let usedLocalFallback = false;
-  let updatedFromApi = false;
-  try {
-    const result = await apiRequest(`/api/community/posts/${encodeURIComponent(postId)}/comments`, {
-      method: "POST",
-      body: JSON.stringify({ body })
-    });
-    if (result.post) {
-      state.communityPosts = mergeById([result.post], state.communityPosts || []);
-      updatedFromApi = true;
-    } else if (result.comment) {
-      mergeCommunityComment(postId, result.comment);
-      updatedFromApi = true;
-    }
-  } catch (error) {
-    if (!isAdminCredentialGap(error)) throw error;
-    try {
-      const result = await addClientCommunityComment(postId, {
-        body,
-        roleId: currentRoleId()
-      });
-      if (result?.comment) mergeCommunityComment(postId, result.comment);
-      updatedFromApi = Boolean(result?.comment);
-    } catch (_fallbackError) {
-      usedLocalFallback = true;
-      localCommunityComment(postId, body);
-    }
+  const result = await apiRequest(`/api/community/posts/${encodeURIComponent(postId)}/comments`, {
+    method: "POST",
+    body: JSON.stringify({ body })
+  });
+  if (result.post) {
+    state.communityPosts = mergeById([result.post], state.communityPosts || []);
+  } else if (result.comment) {
+    mergeCommunityComment(postId, result.comment);
   }
   setToast("Comment added");
-  if (usedLocalFallback || updatedFromApi) {
-    render();
-  } else {
-    await refreshAccessContext().catch(() => hydrateClientFirebaseData());
-  }
+  await refreshAccessContext();
+  render();
 }
 
 async function createSecureUser(formData) {
   const payload = {
     displayName: String(formData.get("displayName") || "").trim(),
     email: String(formData.get("email") || "").trim(),
-    password: String(formData.get("password") || ""),
     roleId: String(formData.get("roleId") || "worker").trim(),
     companyId: String(formData.get("companyId") || "default-company").trim(),
     franchiseIds: csvValues(formData.get("franchiseIds")),
@@ -4293,39 +4299,49 @@ async function createSecureUser(formData) {
     accessScope: String(formData.get("accessScope") || "").trim(),
     assignedJobIds: csvValues(formData.get("assignedJobIds")),
     assignedTaskIds: csvValues(formData.get("assignedTaskIds")),
+    ttlHours: 48,
+    sendEmail: formData.has("sendEmail"),
     ...moduleVisibilityPayload(formData)
   };
-  try {
-    const result = await apiRequest("/api/rbac/users", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-    upsertManagedUser(result.user);
-    setToast("Firebase user created and added to managed users");
-    await refreshAccessContext().catch(() => render());
-  } catch (error) {
-    if (!isAdminCredentialGap(error)) throw error;
-    const member = upsertLocalTeamMember({
-      id: createId("TM"),
-      name: payload.displayName || payload.email || "Worker",
-      email: payload.email,
-      role: payload.roleId.replace(/_/g, " "),
-      accountType: payload.roleId === "contractor" ? "Contractor portal" : "Employee",
-      access: "Local field access until Firebase Admin user creation is enabled",
-      permissions: payload.visiblePageIds?.length ? payload.visiblePageIds : payload.roleId === "contractor" ? defaultContractorModuleKeys : employeeAllowedModuleKeys,
-      visibleTabIds: payload.visibleTabIds || [],
-      visiblePageIds: payload.visiblePageIds || [],
-      accessCode: payload.accessCode || createId(payload.roleId === "contractor" ? "CON" : "EMP"),
-      assignedJobIds: payload.assignedJobIds,
-      assignedTaskIds: payload.assignedTaskIds,
-      status: "Local invite",
-      lastLogin: ""
-    });
-    addActivity(`Created local employee access profile for ${member.name}.`);
-    persist();
-    setToast("Local employee profile created");
-    render();
-  }
+  const localAccessCode = payload.accessCode || createId("EMP");
+  const result = isOfflineSmokePreview()
+    ? {
+        user: {
+          uid: createId("TM"),
+          email: payload.email,
+          displayName: payload.displayName,
+          roleId: payload.roleId,
+          companyId: payload.companyId,
+          franchiseIds: payload.franchiseIds,
+          contractorId: payload.contractorId,
+          accessCode: localAccessCode,
+          assignedJobIds: payload.assignedJobIds,
+          assignedTaskIds: payload.assignedTaskIds,
+          visibleTabIds: payload.visibleTabIds,
+          visiblePageIds: payload.visiblePageIds,
+          status: "Invited",
+          disabled: false,
+          accessExpiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+        },
+        accessCode: localAccessCode,
+        accessLink: "#local-smoke-preview",
+        grant: { expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString() },
+        emailDelivery: { status: "skipped", message: "Local smoke preview" }
+      }
+    : await apiRequest("/api/rbac/users", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+  upsertManagedUser(result.user);
+  state.lastAccessGrant = {
+    email: payload.email,
+    accessCode: result.accessCode,
+    accessLink: result.accessLink,
+    expiresAt: result.grant?.expiresAt || result.user?.accessExpiresAt || "",
+    emailDelivery: result.emailDelivery || null
+  };
+  setToast(result.emailDelivery?.status === "sent" ? "Google invite emailed and user added" : "Google invite created; send the link and code manually");
+  await refreshAccessContext();
 }
 
 async function saveRolePermissions(formData) {
@@ -4492,6 +4508,7 @@ async function uploadAdminAssetFile(file) {
     method: "POST",
     body: JSON.stringify({
       fileName: file.name,
+      contentType: file.type || "image/png",
       base64
     })
   });
@@ -4641,6 +4658,70 @@ function readImageDataUrl(file) {
   });
 }
 
+async function uploadWorkspacePhoto(file, { jobId = "", taskId = "" } = {}) {
+  if (!file) return null;
+  if (!state.authSession || !state.firebase?.adminConfigured) {
+    if (isOfflineSmokePreview()) {
+      return {
+        id: "",
+        assetUrl: "",
+        localDataUrl: await readImageDataUrl(file)
+      };
+    }
+    throw new Error("Firebase Admin storage must be configured before shared job photos can be uploaded.");
+  }
+  const prepared = await prepareWorkspacePhoto(file);
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Unable to read the selected photo."));
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.readAsDataURL(prepared.blob);
+  });
+  const result = await apiRequest("/api/workspace-assets", {
+    method: "POST",
+    body: JSON.stringify({
+      fileName: prepared.fileName,
+      contentType: prepared.contentType,
+      base64: dataUrl.split(",")[1] || "",
+      jobId,
+      taskId
+    })
+  });
+  return result.asset || null;
+}
+
+async function prepareWorkspacePhoto(file) {
+  const maxUploadBytes = 2.75 * 1024 * 1024;
+  if (Number(file.size || 0) <= maxUploadBytes || !String(file.type || "").startsWith("image/")) {
+    return {
+      blob: file,
+      fileName: file.name || "job-photo",
+      contentType: file.type || "image/jpeg"
+    };
+  }
+  if (Number(file.size || 0) > 25 * 1024 * 1024) {
+    throw new Error("Job photos must be 25 MB or smaller before compression.");
+  }
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, 2200 / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const context = canvas.getContext("2d");
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close?.();
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.82));
+  if (!blob || blob.size > 3 * 1024 * 1024) {
+    throw new Error("This photo could not be compressed below the secure upload limit.");
+  }
+  const baseName = String(file.name || "job-photo").replace(/\.[^.]+$/, "");
+  return {
+    blob,
+    fileName: `${baseName}.jpg`,
+    contentType: "image/jpeg"
+  };
+}
+
 function markJobGateDone(jobRef, gateId) {
   const job = jobByJobId(jobRef);
   const gate = job?.gates?.find((item) => item.id === gateId);
@@ -4652,17 +4733,24 @@ function markJobGateDone(jobRef, gateId) {
 
 async function addPhotoEvidence(formData) {
   const file = selectedBrowserFile(formData, "photoFile");
-  const photoDataUrl = file ? await readImageDataUrl(file) : "";
   const worker = currentWorkerProfile();
   const taskId = String(formData.get("taskId") || "").trim();
   const task = state.tasks.find((item) => item.id === taskId);
+  const jobId = String(formData.get("jobId") || task?.relatedJob || "").trim();
+  if (!jobId) {
+    setToast("Select a job before saving photo evidence");
+    return render();
+  }
+  const uploadedAsset = file ? await uploadWorkspacePhoto(file, { jobId, taskId }) : null;
   const record = {
     id: createId("PHOTO"),
-    jobId: String(formData.get("jobId") || task?.relatedJob || "").trim(),
+    jobId,
     room: String(formData.get("room") || "Field area").trim(),
     category: String(formData.get("category") || "Progress").trim(),
     photoRef: String(formData.get("photoRef") || file?.name || "").trim(),
-    photoDataUrl,
+    photoDataUrl: uploadedAsset?.localDataUrl || "",
+    photoUrl: uploadedAsset?.assetUrl || "",
+    assetId: uploadedAsset?.id || "",
     photoSize: file?.size || 0,
     photoType: file?.type || "",
     notes: String(formData.get("notes") || "").trim(),
@@ -4672,10 +4760,6 @@ async function addPhotoEvidence(formData) {
     workerEmail: worker.email || "",
     createdAt: new Date().toISOString()
   };
-  if (!record.jobId) {
-    setToast("Select a job before saving photo evidence");
-    return render();
-  }
   state.photoRecords = [record, ...(state.photoRecords || [])];
   const job = markJobGateDone(record.jobId, "photos");
   if (task && task.moduleKey === "photos") {
@@ -5528,6 +5612,20 @@ function downloadEstimate() {
   render();
 }
 
+async function copyPaymentLink(fileId) {
+  const file = state.files.find((item) => item.id === fileId);
+  const paymentUrl = safePaymentUrl(file?.paymentUrl);
+  if (!paymentUrl) {
+    setToast("No secure payment link is available");
+    return render();
+  }
+  await navigator.clipboard.writeText(paymentUrl);
+  addActivity(`Copied the secure payment link for ${file.title}.`);
+  persist();
+  setToast("Payment link copied");
+  render();
+}
+
 function createEstimateInvoice() {
   const lines = estimateLines();
   if (!lines.length) {
@@ -5587,7 +5685,7 @@ function createEstimateInvoice() {
   render();
 }
 
-function createPaymentRequest(formData) {
+async function createPaymentRequest(formData) {
   const amount = parseAmount(formData.get("amount"));
   const method = String(formData.get("method") || "Card");
   const routeMap = {
@@ -5598,38 +5696,60 @@ function createPaymentRequest(formData) {
   };
   const customer = String(formData.get("customer") || "Customer").trim();
   const job = String(formData.get("job") || "").trim();
-  const instructions =
-    method === "Wire"
-      ? "Generate secure wiring instructions from backend configuration and verify recipient before sending."
-      : method === "Zelle"
-        ? "Send Zelle instructions using the configured business email/phone."
-        : method === "PayPal"
-          ? "Create PayPal order from backend endpoint."
-          : "Create card payment intent from payment processor backend.";
+  const contact = String(formData.get("contact") || "").trim();
+  const requestId = createId("PAY");
+  if (!customer || amount <= 0) {
+    throw new Error("Customer and a positive payment amount are required.");
+  }
+  const route = routeMap[method];
+  if (!route) throw new Error("That payment method is not supported.");
+  const result = await apiRequest(route, {
+    method: "POST",
+    body: JSON.stringify({
+      amount,
+      customer,
+      job,
+      contact,
+      requestId
+    })
+  });
+  const paymentUrl = safePaymentUrl(result.checkoutUrl || result.approvalUrl || "");
+  const paymentStatus = String(result.status || "request_created");
+  const providerMessage = String(
+    result.message
+    || (paymentUrl ? "A secure provider payment link is ready." : "")
+  ).trim();
   createFile({
     moduleKey: "payments",
     linkedModuleKeys: ["accounting", "revenueengine", "jobs", "relationships"],
     sourceType: "paymentRequest",
-    sourceId: `${method}-${customer}-${job}-${Date.now()}`,
+    sourceId: requestId,
     customer,
     amount,
     title: `${method} payment request - ${customer}`,
     type: "Payment request",
     owner: "Bookkeeping",
-    status: "Open",
+    status: paymentStatus === "configuration_required" ? "Needs configuration" : "Open",
     priority: amount >= 1000 ? "High" : "Medium",
     due: String(formData.get("due") || today.toISOString().slice(0, 10)),
     relatedJob: job,
+    paymentUrl,
+    paymentProviderId: String(result.providerId || ""),
+    paymentStatus,
+    paymentMethod: method,
+    paymentInstructions: String(result.instructions || ""),
     notes: [
       `Amount: ${formatMoney(amount)}`,
       `Method: ${method}`,
       `Customer: ${customer}`,
       `Job: ${job}`,
-      `Email/phone: ${String(formData.get("contact") || "").trim()}`,
-      `Backend route: ${routeMap[method] || "/api/payments/manual-receipt"}`,
-      instructions,
+      `Email/phone: ${contact}`,
+      `Backend route: ${route}`,
+      `Provider status: ${paymentStatus}`,
+      providerMessage,
+      result.instructions ? `Verified instructions: ${result.instructions}` : "",
       "Security: never collect customer bank login credentials inside this app."
-    ].join("\n")
+    ].filter(Boolean).join("\n")
   });
   ensureWorkflowTask({
     title: `Record ${method} payment status for ${customer}`,
@@ -5638,9 +5758,97 @@ function createPaymentRequest(formData) {
     due: String(formData.get("due") || today.toISOString().slice(0, 10)),
     priority: amount >= 1000 ? "High" : "Medium",
     sourceType: "paymentRequest",
-    sourceId: `${method}-${customer}-${job}`
+    sourceId: requestId
   });
+  addActivity(
+    paymentStatus === "configuration_required"
+      ? `${method} payment request for ${customer} needs provider configuration.`
+      : `${method} payment request for ${customer} was created through the secured backend.`
+  );
   persist();
+  setToast(
+    paymentUrl
+      ? "Secure payment link created"
+      : paymentStatus === "instructions_ready"
+        ? `${method} instructions prepared`
+        : "Payment provider configuration is required"
+  );
+  render();
+}
+
+function addContractorInvoice(formData) {
+  const amount = parseAmount(formData.get("amount"));
+  const invoiceId = String(formData.get("invoiceId") || createId("CINV")).trim();
+  const sessionUser = currentSessionUser() || {};
+  const contractorId = isContractorScopedRole()
+    ? currentContractorId()
+    : String(formData.get("contractorId") || "").trim();
+  const contractorEmail = isContractorScopedRole()
+    ? String(state.authSession?.email || sessionUser.email || "").trim().toLowerCase()
+    : String(formData.get("contractorEmail") || "").trim().toLowerCase();
+  const invoice = {
+    id: createId("CONTRACTOR-INVOICE"),
+    type: "contractorInvoice",
+    invoiceId,
+    contractorId,
+    contractorEmail,
+    contractorName: String(formData.get("contractorName") || sessionUser.displayName || contractorEmail || "Contractor").trim(),
+    companyId: state.authSession?.companyId || "default-company",
+    franchiseId: currentUserFranchiseIds()[0] || "",
+    jobId: String(formData.get("jobId") || "").trim(),
+    amount,
+    balance: amount,
+    status: String(formData.get("status") || "Submitted").trim(),
+    dueDate: String(formData.get("dueDate") || today.toISOString().slice(0, 10)),
+    notes: String(formData.get("notes") || "").trim(),
+    createdByUid: currentUserUid(),
+    createdByEmail: state.authSession?.email || "",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    source: "workspace"
+  };
+  if (!invoice.contractorId && !invoice.contractorEmail) {
+    setToast("Choose a contractor ID or contractor email");
+    return render();
+  }
+  if (!invoice.jobId || amount <= 0) {
+    setToast("Job and a positive invoice amount are required");
+    return render();
+  }
+  state.contractorBills = [invoice, ...(state.contractorBills || [])];
+  createFile({
+    moduleKey: "payments",
+    linkedModuleKeys: ["vendors", "accounting", "jobs", "contractorportal"],
+    sourceType: "contractorInvoice",
+    sourceId: invoice.id,
+    amount,
+    title: `${invoiceId} contractor invoice`,
+    type: "Contractor invoice",
+    owner: invoice.contractorName,
+    status: invoice.status,
+    priority: amount >= 5000 ? "High" : "Medium",
+    due: invoice.dueDate,
+    relatedJob: invoice.jobId,
+    notes: [
+      `Contractor: ${invoice.contractorName}`,
+      `Contractor ID: ${invoice.contractorId || "Not assigned"}`,
+      `Contractor email: ${invoice.contractorEmail || "Not entered"}`,
+      `Amount: ${formatMoney(amount)}`,
+      invoice.notes
+    ].filter(Boolean).join("\n")
+  });
+  ensureWorkflowTask({
+    title: `Review contractor invoice ${invoiceId}`,
+    moduleKey: "accounting",
+    relatedJob: invoice.jobId,
+    due: invoice.dueDate,
+    priority: amount >= 5000 ? "High" : "Medium",
+    sourceType: "contractorInvoice",
+    sourceId: invoice.id
+  });
+  addActivity(`Contractor invoice ${invoiceId} was submitted for ${invoice.jobId}.`);
+  persist();
+  setToast("Contractor invoice saved and sent to accounting");
   render();
 }
 
@@ -5669,21 +5877,40 @@ function createPaymentRailSetup(method, route, detail) {
   });
 }
 
-function connectQuickBooks() {
+function preparePaymentRequest(method) {
+  const form = document.querySelector('form[data-form="payment-request"]');
+  if (!form) return;
+  if (form.elements.method) form.elements.method.value = method;
+  form.scrollIntoView({ behavior: "smooth", block: "center" });
+  form.elements.customer?.focus();
+  setToast(`${method} selected`);
+}
+
+async function connectQuickBooks() {
+  const result = await apiRequest("/api/integrations/quickbooks/oauth/start");
+  const authorizationUrl = String(result.authorizationUrl || "");
+  if (authorizationUrl) {
+    const parsed = new URL(authorizationUrl);
+    if (parsed.protocol !== "https:" || (parsed.hostname !== "appcenter.intuit.com" && !parsed.hostname.endsWith(".intuit.com"))) {
+      throw new Error("QuickBooks returned an invalid authorization URL.");
+    }
+    window.location.assign(parsed.toString());
+    return;
+  }
   state.quickBooksConnection = {
     ...state.quickBooksConnection,
     connected: false,
-    companyName: state.quickBooksConnection.companyName || "Connected contractor company",
-    realmId: state.quickBooksConnection.realmId || createId("QBO"),
+    companyName: state.quickBooksConnection.companyName || "",
+    realmId: state.quickBooksConnection.realmId || "",
     lastSync: new Date().toISOString(),
-    mode: "OAuth setup file created"
+    mode: result.status === "configuration_required" ? "OAuth credentials required" : "OAuth pending"
   };
   createFile({
     moduleKey: "accounting",
     linkedModuleKeys: ["payments", "integrations", "reports", "globalindexes"],
     sourceType: "quickBooksSetup",
-    sourceId: state.quickBooksConnection.realmId,
-    title: "QuickBooks OAuth setup",
+    sourceId: "quickbooks-oauth",
+    title: "QuickBooks connection status",
     type: "Integration setup",
     owner: "Bookkeeping",
     status: "Needs configuration",
@@ -5691,39 +5918,81 @@ function connectQuickBooks() {
     due: today.toISOString().slice(0, 10),
     relatedJob: "Accounting integration",
     notes: [
+      String(result.message || "QuickBooks OAuth is not ready."),
       "Connect QuickBooks through a secured OAuth backend before syncing invoices, expenses, projects, or profit data.",
       "Required production inputs: QuickBooks client id, client secret, redirect URI, company realm id, token storage, and webhook verification.",
       "No live accounting data is transmitted until those credentials and routes are configured."
     ].join("\n")
   });
-  addActivity("Created QuickBooks OAuth setup file for invoice, expense, project, and profit tracking.");
+  addActivity("Checked QuickBooks OAuth readiness.");
   persist();
-  setToast("QuickBooks setup file created");
+  setToast(result.message || "QuickBooks OAuth configuration is required");
   render();
 }
 
-function addTeamMember(formData) {
+async function addTeamMember(formData) {
   const accountType = String(formData.get("accountType") || "Employee");
   const permissions = formData.getAll("permissions").map(String);
-  const accessCode = String(formData.get("accessCode") || createId(accountType === "Contractor portal" ? "CON" : "EMP")).trim().toUpperCase();
   const assignedJobIds = csvValues(formData.get("assignedJobIds"));
-  const member = normalizeTeamMember({
-    id: createId("TM"),
-    name: String(formData.get("name") || "Team member").trim(),
+  const roleId = accountType === "Contractor portal"
+    ? "contractor"
+    : accountType === "Administrator"
+      ? "business_owner"
+      : "worker";
+  const payload = {
+    displayName: String(formData.get("name") || "Team member").trim(),
     email: String(formData.get("email") || "").trim(),
-    role: String(formData.get("role") || "User").trim(),
-    accountType,
-    access: String(formData.get("access") || "Assigned modules").trim(),
-    permissions: permissions.length ? permissions : accountType === "Administrator" ? ["owner-dashboard", "user-management", "billing", "exports", "ai-admin", "security"] : ["time", "drylogs", "jobs", "photos", "equipment", "communications"],
-    visibleTabIds: permissions,
-    visiblePageIds: permissions,
-    accessCode,
+    roleId,
+    companyId: state.authSession?.companyId || "default-company",
+    franchiseIds: currentUserFranchiseIds(),
+    contractorId: roleId === "contractor" ? `contractor-${normalizePriceToken(formData.get("email") || formData.get("name") || createId("company"))}` : "",
+    accessCode: String(formData.get("accessCode") || "").trim(),
     assignedJobIds,
     assignedTaskIds: [],
-    status: "Invited",
-    lastLogin: ""
-  });
+    visibleTabIds: permissions.length ? permissions : defaultModuleAccessForRole(roleId),
+    visiblePageIds: permissions.length ? permissions : defaultModuleAccessForRole(roleId),
+    ttlHours: 48,
+    sendEmail: true
+  };
+  const localAccessCode = payload.accessCode || createId("EMP");
+  const result = isOfflineSmokePreview()
+    ? {
+        user: {
+          uid: createId("TM"),
+          email: payload.email,
+          displayName: payload.displayName,
+          roleId,
+          companyId: payload.companyId,
+          franchiseIds: payload.franchiseIds,
+          contractorId: payload.contractorId,
+          accessCode: localAccessCode,
+          assignedJobIds,
+          assignedTaskIds: [],
+          visibleTabIds: payload.visibleTabIds,
+          visiblePageIds: payload.visiblePageIds,
+          status: "Invited",
+          disabled: false,
+          accessExpiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+        },
+        accessCode: localAccessCode,
+        accessLink: "#local-smoke-preview",
+        grant: { expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString() },
+        emailDelivery: { status: "skipped", message: "Local smoke preview" }
+      }
+    : await apiRequest("/api/rbac/users", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+  upsertManagedUser(result.user);
+  const member = normalizeTeamMember(mapUserToTeamMember(result.user));
   state.teamMembers = [member, ...state.teamMembers.filter((item) => item.id !== member.id)];
+  state.lastAccessGrant = {
+    email: payload.email,
+    accessCode: result.accessCode,
+    accessLink: result.accessLink,
+    expiresAt: result.grant?.expiresAt || result.user?.accessExpiresAt || "",
+    emailDelivery: result.emailDelivery || null
+  };
   createFile({
     moduleKey: "team",
     linkedModuleKeys: ["jobs", "time", "photos", "communications"],
@@ -5739,14 +6008,15 @@ function addTeamMember(formData) {
     notes: [
       `Email: ${member.email}`,
       `Role: ${member.role}`,
-      `Portal code: ${member.accessCode}`,
+      "An individual code was issued through secure access management.",
       `Modules: ${(member.permissions || []).join(", ")}`,
       `Assigned jobs: ${assignedJobIds.join(", ") || "None yet"}`
     ].join("\n")
   });
-  addActivity(`Created login invitation for ${member.name}.`);
+  addActivity(`Created a Google-bound 48-hour invitation for ${member.name}.`);
   persist();
-  setToast("Team login created");
+  setToast(result.emailDelivery?.status === "sent" ? "Team invite emailed" : "Team invite created; send the link and code manually");
+  await refreshAccessContext();
   render();
 }
 
@@ -5804,15 +6074,13 @@ function fieldSessionForMember(member, accessCode) {
     id: member.id,
     name: member.name,
     email: member.email,
-    code: employeeAccessCodeFor(member),
     accountType: member.accountType || "Employee",
     role: member.role || "Worker",
     permissions: visibleKeys,
     visibleTabIds: visibleKeys,
     visiblePageIds: visibleKeys,
     assignedJobIds: normalizeListValue(member.assignedJobIds),
-    assignedTaskIds: normalizeListValue(member.assignedTaskIds),
-    accessCodeEntered: String(accessCode || "").trim()
+    assignedTaskIds: normalizeListValue(member.assignedTaskIds)
   };
 }
 
@@ -5820,7 +6088,13 @@ function findEmployeeForPortalLogin(identifier, accessCode) {
   const normalizedCode = normalizeLocalAccessCode(accessCode);
   const normalizedIdentifier = String(identifier || "").trim().toLowerCase();
   return assignableTeamMembers().find((member) => {
-    const codeMatches = normalizeLocalAccessCode(employeeAccessCodeFor(member)) === normalizedCode;
+    const oneTimeInviteCode = String(state.lastAccessGrant?.email || "").trim().toLowerCase() === String(member.email || "").trim().toLowerCase()
+      ? state.lastAccessGrant?.accessCode
+      : "";
+    const acceptedCodes = [employeeAccessCodeFor(member), oneTimeInviteCode]
+      .map(normalizeLocalAccessCode)
+      .filter(Boolean);
+    const codeMatches = Boolean(normalizedCode && acceptedCodes.includes(normalizedCode));
     if (!codeMatches) return false;
     if (!normalizedIdentifier) return true;
     return [member.id, member.email, member.name]
@@ -6383,7 +6657,9 @@ async function clockOut() {
 }
 
 function render() {
-  const localPreviewAllowed = state.firebase.ready && !state.firebase.enabled && ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+  const localPreviewAllowed = state.firebase.ready
+    && ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)
+    && (!state.firebase.enabled || isLocalSmokePreview());
   if (!state.authSession && !localPreviewAllowed) {
     app.className = "app-root auth-shell";
     app.innerHTML = renderAuthGate();
@@ -6393,10 +6669,11 @@ function render() {
   const module = activeModule();
   app.className = `app-root${state.mobileOpen ? " nav-open" : ""}${state.modal ? " modal-open" : ""}`;
   app.innerHTML = `
+    <a class="skip-link" href="#workspace-main">Skip to workspace</a>
     ${renderMobileBar()}
     <div class="app-shell">
       ${renderSidebar()}
-      <main class="workspace">
+      <main class="workspace" id="workspace-main" tabindex="-1">
         ${renderTrialBanner()}
         ${renderTopbar(module)}
         ${renderScreen(module)}
@@ -6408,6 +6685,7 @@ function render() {
     ${renderSettingsDock()}
     ${state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
   `;
+  if (state.modal) queueMicrotask(activateModalAccessibility);
 }
 
 function renderAuthGate() {
@@ -6440,8 +6718,8 @@ function renderAuthGate() {
   }
 
   const accessTokenPresent = Boolean(getAccessTokenFromRoute());
-  const ttlLabel = state.firebase.sessionTtlHours ? `${state.firebase.sessionTtlHours} hours` : "48 hours";
-  const passwordAllowed = (state.firebase.allowedSignInProviders || []).includes("password");
+  const sessionHours = Number(state.firebase.sessionTtlHours || 48);
+  const ttlLabel = `${sessionHours} ${sessionHours === 1 ? "hour" : "hours"}`;
   const ownerEmails = (state.firebase.allowedLoginEmails || []).filter(Boolean);
   const ownerLabel = ownerEmails.length ? ownerEmails.join(", ") : "the Super Admin email";
   const adminCredentialWarning = state.firebase.restAuthFallback
@@ -6459,31 +6737,30 @@ function renderAuthGate() {
         <div class="auth-logo-wrap">${renderBrandLogo("auth-logo", "Brothers logo")}</div>
         <span>Secure company access</span>
         <h1>Sign in to Brothers OS</h1>
-        <p>Google verifies identity; Brothers OS authorizes access separately. Owner access is restricted to ${escapeHtml(ownerLabel)}. Every other Google account needs an active ${escapeHtml(ttlLabel)} invite link and an individual access code, or the session is denied.</p>
-        <div class="empty-state warning-state"><strong>Unapproved accounts are denied</strong><span>The Google button may open for any Google account, but the OS session is created only after the server approves the email, invite link, and contractor code.</span></div>
-        ${isAdminCredentialGap() ? `<div class="empty-state warning-state"><strong>${escapeHtml(adminCredentialWarning.title)}</strong><span>${escapeHtml(adminCredentialWarning.body)}</span></div>` : ""}
-        ${accessTokenPresent ? `<div class="empty-state"><strong>Access link detected</strong><span>Sign in with the same Google email that requested access, then enter the contractor code if one was issued.</span></div>` : ""}
+        <p>Owner access is restricted to ${escapeHtml(ownerLabel)}. Every other Google account needs an active 48-hour invitation and its individual code.</p>
+        ${accessTokenPresent ? `<div class="empty-state compact-empty"><strong>Access link detected</strong><span>Use the invited Google email and its code.</span></div>` : ""}
         <label><span>Contractor / trial access code</span><input data-field="login-access-code" name="accessCode" autocomplete="one-time-code" placeholder="CON-123ABC" /></label>
-        <button type="button" data-action="firebase-google-login">${state.authLoading ? "Connecting..." : "Sign in with Google"}</button>
-        ${passwordAllowed ? `
-          <div class="auth-divider"><span>super admin fallback</span></div>
-          <form class="stack-form" data-form="firebase-login">
-            <label><span>Email</span><input name="email" type="email" autocomplete="username" placeholder="name@company.com" /></label>
-            <label><span>Password</span><input name="password" type="password" autocomplete="current-password" placeholder="Enter your password" /></label>
-            <label><span>Access code</span><input name="accessCode" autocomplete="one-time-code" placeholder="Optional code" /></label>
-            <button type="submit">${state.authLoading ? "Signing in..." : "Sign in"}</button>
-          </form>
-        ` : ""}
-        <form class="stack-form access-request-form" data-form="access-request">
-          <h2>Request 48-hour trial access</h2>
-          <label><span>Name</span><input name="displayName" required placeholder="Your name" /></label>
-          <label><span>Google email</span><input name="email" type="email" required placeholder="name@company.com" /></label>
-          <label><span>Company</span><input name="companyName" placeholder="Contractor company" /></label>
-          <label><span>Access type</span><select name="roleId"><option value="contractor">Contractor portal</option><option value="worker">Worker portal</option><option value="franchise_owner">Franchise owner</option></select></label>
-          <button type="submit">${state.authLoading ? "Sending..." : "Request access"}</button>
-        </form>
-        ${state.accessRequestStatus ? `<div class="empty-state"><strong>Request received</strong><span>${escapeHtml(state.accessRequestStatus)}</span></div>` : ""}
+        <button class="google-login-button" type="button" data-action="firebase-google-login">${state.authLoading ? "Connecting to Google..." : "Continue with Google"}</button>
+        <small class="auth-session-note">Current secure session limit: ${escapeHtml(ttlLabel)}. Invitation access expires within 48 hours.</small>
         ${state.authError ? `<div class="empty-state"><strong>Sign-in failed</strong><span>${escapeHtml(state.authError)}</span></div>` : ""}
+        <details class="auth-disclosure">
+          <summary>Access and security status</summary>
+          <div class="auth-disclosure-body">
+            <div class="empty-state warning-state"><strong>Unapproved accounts are denied</strong><span>Google verifies identity first; the OS opens only after the server approves the owner email or the matching invite and code.</span></div>
+            ${isAdminCredentialGap() ? `<div class="empty-state warning-state"><strong>${escapeHtml(adminCredentialWarning.title)}</strong><span>${escapeHtml(adminCredentialWarning.body)}</span></div>` : ""}
+          </div>
+        </details>
+        <details class="auth-disclosure"${state.accessRequestStatus ? " open" : ""}>
+          <summary>Request 48-hour trial access</summary>
+          <form class="stack-form access-request-form auth-disclosure-body" data-form="access-request">
+            <label><span>Name</span><input name="displayName" required placeholder="Your name" /></label>
+            <label><span>Google email</span><input name="email" type="email" required placeholder="name@company.com" /></label>
+            <label><span>Company</span><input name="companyName" placeholder="Contractor company" /></label>
+            <label><span>Access type</span><select name="roleId"><option value="contractor">Contractor portal</option><option value="worker">Worker portal</option><option value="franchise_owner">Franchise owner</option></select></label>
+            <button type="submit">${state.authLoading ? "Sending..." : "Request access"}</button>
+            ${state.accessRequestStatus ? `<div class="empty-state"><strong>Request received</strong><span>${escapeHtml(state.accessRequestStatus)}</span></div>` : ""}
+          </form>
+        </details>
       </div>
     </section>
   `;
@@ -6501,6 +6778,7 @@ function renderMobileBar() {
         </span>
       </a>
       <button type="button" class="icon-button accent" data-action="open-create-file" aria-label="New file">New</button>
+      <button type="button" class="icon-button" data-action="toggle-ai-copilot" aria-label="${state.aiCopilotOpen ? "Close Brother assistant" : "Open Brother assistant"}" aria-expanded="${state.aiCopilotOpen ? "true" : "false"}">Ask</button>
     </div>
   `;
 }
@@ -7428,6 +7706,7 @@ function renderFileCard(file) {
         <div><dt>Status</dt><dd>${escapeHtml(file.status)}</dd></div>
         <div><dt>Owner</dt><dd>${escapeHtml(file.owner)}</dd></div>
         <div><dt>Due</dt><dd>${escapeHtml(formatDate(file.due))}</dd></div>
+        ${file.paymentStatus ? `<div><dt>Provider</dt><dd>${escapeHtml(file.paymentStatus.replace(/_/g, " "))}</dd></div>` : ""}
       </dl>
       <div class="card-actions">
         <button type="button" data-action="select-file" data-id="${file.id}">Open</button>
@@ -7455,6 +7734,16 @@ function renderFileDetail(module) {
         <div><strong>${escapeHtml(file.relatedJob || "None")}</strong><span>Related</span></div>
       </div>
       ${renderFileLinkedModuleChips(file)}
+      ${file.paymentUrl ? `
+        <div class="payment-link-box">
+          <div><strong>Secure provider link</strong><span>${escapeHtml(file.paymentMethod || "Payment")} - ${escapeHtml(file.paymentStatus || "ready")}</span></div>
+          <div class="row-actions">
+            <a href="${escapeHtml(file.paymentUrl)}" target="_blank" rel="noopener noreferrer">Open checkout</a>
+            <button type="button" data-action="copy-payment-link" data-id="${file.id}">Copy link</button>
+          </div>
+        </div>
+      ` : ""}
+      ${file.paymentInstructions ? `<div class="payment-instructions"><strong>Verified ${escapeHtml(file.paymentMethod)} instructions</strong><span>${escapeHtml(file.paymentInstructions)}</span></div>` : ""}
       <div class="detail-actions">
         <button type="button" data-action="status-review" data-id="${file.id}">Needs review</button>
         <button type="button" data-action="status-active" data-id="${file.id}">Active</button>
@@ -7804,7 +8093,6 @@ function renderInsuranceModule(module) {
     .filter((status) => status !== "all")
     .reduce((counts, status) => ({ ...counts, [status]: submissions.filter((submission) => submission.status === status).length }), {});
   const requiresLogin = insuranceRequiresLogin();
-  const setupError = state.insuranceError && state.insuranceError.includes("not configured");
 
   return `
     ${renderManagedSection("insurance-hero", `<section class="hero-band">
@@ -7813,12 +8101,8 @@ function renderInsuranceModule(module) {
         <h2>${escapeHtml(sectionTitle("insurance-hero", "Insurance submissions dashboard"))}</h2>
         <p>${escapeHtml(sectionBody("insurance-hero", "Review claim submissions from the public website, open uploaded files, update status, and save internal notes."))}</p>
         <div class="hero-actions">
-          <button type="button" data-action="refresh-insurance-intake">${state.insuranceAdminSession ? "Refresh submissions" : "Check admin access"}</button>
-          ${
-            state.insuranceAdminSession
-              ? `<button type="button" data-action="insurance-admin-logout">Sign out ${escapeHtml(state.insuranceAdminSession.email || "")}</button>`
-              : `<span>${state.insuranceAuthLoading ? "Checking admin access..." : "Admin sign-in required to view submissions."}</span>`
-          }
+          <button type="button" data-action="refresh-insurance-intake">Refresh submissions</button>
+          ${state.authSession ? `<span>Google session: ${escapeHtml(state.authSession.email || "")}</span>` : ""}
           <a href="#module/jobs" data-action="set-active" data-key="jobs">Link to jobs</a>
           <a href="#module/relationships" data-action="set-active" data-key="relationships">Open contacts</a>
           ${renderSectionButtons("insurance-hero")}
@@ -7839,20 +8123,7 @@ function renderInsuranceModule(module) {
       </div>
       ${
         requiresLogin
-          ? `
-            <form class="insurance-notes-form" data-form="insurance-admin-login">
-              <label><span>Admin email</span><input name="email" type="email" autocomplete="username" placeholder="owner@example.com" /></label>
-              <label><span>Admin password</span><input name="password" type="password" autocomplete="current-password" placeholder="Enter admin password" /></label>
-              <div class="modal-actions">
-                <button type="submit">${state.insuranceAuthLoading ? "Signing in..." : "Sign in to insurance dashboard"}</button>
-              </div>
-            </form>
-          `
-          : ""
-      }
-      ${
-        setupError
-          ? `<div class="insurance-banner insurance-banner-error">Set <code>ADMIN_EMAILS</code>, <code>ADMIN_PASSWORD</code>, and <code>ADMIN_JWT_SECRET</code> in the OS environment, then redeploy.</div>`
+          ? `<div class="insurance-banner insurance-banner-error">Insurance intake requires an approved Google session with customer-directory access.</div>`
           : ""
       }
       <div class="insurance-toolbar">
@@ -7874,7 +8145,7 @@ function renderInsuranceModule(module) {
         <div class="insurance-list">
           ${
             requiresLogin
-              ? `<div class="empty-state"><strong>Admin sign-in required</strong><span>Use the admin credentials configured on the OS backend to load live website submissions.</span></div>`
+              ? `<div class="empty-state"><strong>Google access required</strong><span>Ask the Super Admin to grant customer-directory access to this Google account.</span></div>`
               : submissions.length
               ? submissions.map(renderInsuranceSubmissionCard).join("")
               : `<div class="empty-state"><strong>No insurance submissions found</strong><span>New website uploads will appear here after they are posted to <code>/api/insurance-intake</code>.</span></div>`
@@ -7882,7 +8153,7 @@ function renderInsuranceModule(module) {
         </div>
         ${
           requiresLogin
-            ? `<div class="empty-state"><strong>Live intake is protected</strong><span>Once you sign in, this panel will show claim details, uploaded evidence, status changes, and internal notes.</span></div>`
+            ? `<div class="empty-state"><strong>Live intake is protected</strong><span>Approved Google roles can review claim details, uploaded evidence, status changes, and internal notes.</span></div>`
             : selected
               ? renderManagedSection("insurance-detail", renderInsuranceSubmissionDetail(selected))
               : `<div class="empty-state"><strong>Select a submission</strong><span>Choose an insurance submission to review files, change status, and add internal notes.</span></div>`
@@ -8336,7 +8607,7 @@ function renderPhotoRecordCard(record) {
   return `
     <article class="business-card">
       <div class="file-card-head"><span>${escapeHtml(record.category || "Photo")}</span><strong>${escapeHtml(formatTime(record.createdAt))}</strong></div>
-      ${record.photoDataUrl ? `<img src="${escapeHtml(record.photoDataUrl)}" alt="${escapeHtml(record.photoRef || record.room || "Job photo")}" style="width:100%;max-height:160px;object-fit:cover;border-radius:8px;" />` : ""}
+      ${record.photoUrl || record.photoDataUrl ? `<img src="${escapeHtml(record.photoUrl || record.photoDataUrl)}" alt="${escapeHtml(record.photoRef || record.room || "Job photo")}" style="width:100%;max-height:160px;object-fit:cover;border-radius:8px;" />` : ""}
       <h3>${escapeHtml(record.jobId)} ${escapeHtml(record.room || "")}</h3>
       <p>${escapeHtml(record.notes || record.photoRef || "Photo evidence saved")}</p>
       <dl>
@@ -9064,11 +9335,21 @@ function getLaunchCenterItems() {
     },
     {
       label: "Google login",
-      status: state.firebase.enabled ? "Unlock ready" : "Locked",
-      tone: state.firebase.enabled ? "ready" : "blocked",
-      detail: state.firebase.enabled
-        ? "Google sign-in can verify users and role-gated modules."
+      status: state.firebase.adminConfigured ? "Owner and invited users ready" : state.firebase.enabled ? "Owner-only fallback" : "Locked",
+      tone: state.firebase.adminConfigured ? "ready" : "blocked",
+      detail: state.firebase.adminConfigured
+        ? "Google sign-in, secure 48-hour sessions, revocation, invitation links, and individual codes are active."
+        : state.firebase.enabled
+          ? "Google can verify the owner, but invited-user sessions remain locked until Firebase Admin is configured."
         : "Add Firebase Admin credentials in Vercel before customer data, invoices, and global indexes can unlock."
+    },
+    {
+      label: "Shared workspace data",
+      status: state.workspacePersistence?.durable ? "Firestore saved" : "Browser cache only",
+      tone: state.workspacePersistence?.durable ? "ready" : "blocked",
+      detail: state.workspacePersistence?.durable
+        ? `${state.workspacePersistence.recordCount || 0} operational records are available across approved sessions.`
+        : state.workspacePersistence?.error || "Jobs, invoices, employees, tasks, photos, and notes need Firebase Admin before they can synchronize."
     },
     {
       label: "Authorized domains",
@@ -9263,12 +9544,10 @@ function renderGlobalBusinessIndexPanel() {
   const revenueTotal = sumRecords(invoices, "amount");
   const openBalance = sumRecords(invoices, "balance");
   const contractorTotal = sumRecords(contractorBills, "amount");
-  const sourceLabel = state.firebase.adminConfigured
-    ? "Server Firebase Admin"
-    : allRecords.some((record) => record.source === "client-firestore")
-      ? "Browser Firestore fallback"
-      : allRecords.some((record) => record.source === "local-file")
-        ? "Local operating files plus secured defaults"
+  const sourceLabel = state.workspacePersistence?.durable
+    ? "Authenticated Firestore workspace and role-scoped global records"
+    : allRecords.some((record) => record.source === "local-file")
+      ? "Browser cache plus secured defaults"
       : "Secure default seed / role-scoped API";
   return `
     <section class="panel global-business-index">
@@ -9288,7 +9567,7 @@ function renderGlobalBusinessIndexPanel() {
         <div><strong>${escapeHtml(formatMoney(openBalance))}</strong><span>Open balance</span></div>
         <div><strong>${escapeHtml(formatMoney(contractorTotal))}</strong><span>Contractor invoices</span></div>
       </div>
-      ${!state.firebase.adminConfigured ? `<div class="empty-state warning-state"><strong>Persistent Admin storage still needs Firebase service-account credentials</strong><span>The index is visible to Super Admin now, and browser Firestore can read/write allowed records, but server-side invite validation and durable admin writes require FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY in Vercel.</span></div>` : ""}
+      ${!state.firebase.adminConfigured ? `<div class="empty-state warning-state"><strong>Persistent Admin storage still needs Firebase service-account credentials</strong><span>Browser-only changes are not shared. Server-side workspace records, invite validation, user management, and board posts require FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY in Vercel.</span></div>` : ""}
       <div class="empty-state compact-empty"><strong>Data source</strong><span>${escapeHtml(sourceLabel)}</span></div>
       ${allRecords.length ? `
         <div class="business-record-grid">
@@ -9352,6 +9631,7 @@ function renderPaymentsModule(module) {
           ${renderPaymentRail("Future rails", "gateway-ready", "ACH, Plaid, Square, Venmo, check, financing")}
         </div>
         ${renderPaymentRequestForm()}
+        ${canDo("viewContractorInvoices") ? renderContractorInvoiceForm() : ""}
       </div>
       <div class="panel">
         <div class="panel-head">
@@ -9413,12 +9693,18 @@ function renderContractorInvoiceCard(invoice) {
 }
 
 function renderPaymentRail(method, route, detail) {
+  let actionButton = `<button type="button" data-action="prepare-payment-request" data-method="${escapeHtml(method)}" data-route="${escapeHtml(route)}" data-detail="${escapeHtml(detail)}">Use ${escapeHtml(method)}</button>`;
+  if (method === "QuickBooks") {
+    actionButton = `<button type="button" data-action="connect-quickbooks" data-method="${escapeHtml(method)}" data-route="${escapeHtml(route)}" data-detail="${escapeHtml(detail)}">Connect QuickBooks</button>`;
+  } else if (method === "Future rails") {
+    actionButton = `<button type="button" data-action="create-payment-rail" data-method="${escapeHtml(method)}" data-route="${escapeHtml(route)}" data-detail="${escapeHtml(detail)}">Create planning file</button>`;
+  }
   return `
     <article class="payment-rail">
       <span>${escapeHtml(route)}</span>
       <h3>${escapeHtml(method)}</h3>
       <p>${escapeHtml(detail)}</p>
-      <button type="button" data-action="create-payment-rail" data-method="${escapeHtml(method)}" data-route="${escapeHtml(route)}" data-detail="${escapeHtml(detail)}">Create setup file</button>
+      ${actionButton}
     </article>
   `;
 }
@@ -9436,6 +9722,31 @@ function renderPaymentRequestForm() {
         <label><span>Due</span><input name="due" type="date" value="${today.toISOString().slice(0, 10)}" /></label>
       </div>
       <button type="submit">Create payment file</button>
+    </form>
+  `;
+}
+
+function renderContractorInvoiceForm() {
+  const contractorLocked = isContractorScopedRole();
+  const sessionUser = currentSessionUser() || {};
+  const contractorId = contractorLocked ? currentContractorId() : "";
+  const contractorEmail = contractorLocked ? (state.authSession?.email || sessionUser.email || "") : "";
+  const jobs = visibleJobBoards();
+  return `
+    <form class="stack-form inline-section" data-form="contractor-invoice">
+      <h3>Submit contractor invoice</h3>
+      <div class="form-grid">
+        <label><span>Invoice number</span><input name="invoiceId" required placeholder="CINV-1042" /></label>
+        <label><span>Contractor name</span><input name="contractorName" required value="${escapeHtml(contractorLocked ? (sessionUser.displayName || sessionUser.name || "") : "")}" placeholder="Contractor or company" /></label>
+        <label><span>Contractor ID</span><input name="contractorId" value="${escapeHtml(contractorId)}" ${contractorLocked ? "readonly" : ""} placeholder="contractor-company" /></label>
+        <label><span>Contractor email</span><input name="contractorEmail" type="email" value="${escapeHtml(contractorEmail)}" ${contractorLocked ? "readonly" : ""} placeholder="contractor@company.com" /></label>
+        <label><span>Job</span><select name="jobId" required><option value="">Choose a job</option>${jobs.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.jobId)} - ${escapeHtml(job.title)}</option>`).join("")}</select></label>
+        <label><span>Amount</span><input name="amount" type="number" min="0.01" step="0.01" required placeholder="0.00" /></label>
+        <label><span>Status</span><select name="status"><option>Submitted</option><option>Under review</option><option>Approved</option><option>Paid</option><option>Disputed</option></select></label>
+        <label><span>Due date</span><input name="dueDate" type="date" value="${today.toISOString().slice(0, 10)}" /></label>
+      </div>
+      <label><span>Invoice notes</span><textarea name="notes" rows="3" placeholder="Labor, materials, supporting documents, or payment notes"></textarea></label>
+      <button type="submit">Submit contractor invoice</button>
     </form>
   `;
 }
@@ -9540,7 +9851,7 @@ function renderTeamModule(module) {
     <section class="team-layout">
       <div class="panel">
         <div class="panel-head"><div><h2>Owner-created logins</h2><p>Create employees, issue individual portal codes, and assign field modules.</p></div></div>
-        ${state.firebase.enabled && state.authSession ? `<div class="empty-state"><strong>Secure login manager is active</strong><span>The local roster below remains available for immediate field task assignment while Firebase Admin user creation is configured.</span></div>` : ""}
+        ${state.firebase.enabled && state.authSession ? `<div class="empty-state"><strong>Secure login manager</strong><span>Every new team member is created as a Google-bound 48-hour invitation with server-saved assignments and module access.</span></div>` : ""}
         ${renderTeamForm()}
         <div class="team-grid">${displayedUsers.map(renderTeamMemberCard).join("")}</div>
       </div>
@@ -9579,23 +9890,21 @@ function renderRbacAdminPanel(options = {}) {
       </div>
       ${canDo("manageUsers") ? `
         <form class="stack-form inline-section" data-form="rbac-user">
-          <h3>Create secure user</h3>
+          <h3>Invite Google user</h3>
           <div class="form-grid">
             <label><span>Name</span><input name="displayName" required placeholder="Full name" /></label>
             <label><span>Email</span><input name="email" type="email" required placeholder="user@company.com" /></label>
-            <label><span>Password</span><input name="password" type="password" required placeholder="Temporary password" /></label>
             <label><span>Role</span><select name="roleId">${assignableRoles.map((role) => `<option value="${role.id}">${escapeHtml(role.label || role.id)}</option>`).join("")}</select></label>
             <label><span>Company id</span><input name="companyId" placeholder="default-company" /></label>
             <label><span>Franchise ids</span><input name="franchiseIds" placeholder="franchise-a,franchise-b" /></label>
             <label><span>Contractor id</span><input name="contractorId" placeholder="contractor-company" /></label>
-            <label><span>Access code</span><input name="accessCode" placeholder="CON-123ABC" /></label>
-            <label><span>Access expires</span><input name="accessExpiresAt" type="datetime-local" /></label>
-            <label><span>Access scope</span><input name="accessScope" placeholder="48_hour_access" /></label>
+            <label><span>Individual access code</span><input name="accessCode" placeholder="Leave blank to generate securely" /></label>
             <label><span>Assigned job IDs</span><input name="assignedJobIds" list="team-job-options" placeholder="J-2039,J-2050" /></label>
             <label><span>Assigned task IDs</span><input name="assignedTaskIds" placeholder="TASK-1001,TASK-1002" /></label>
           </div>
           ${renderModuleAccessPicker({ selectedKeys: defaultModuleAccessForRole("contractor"), legend: "Modules this user can open" })}
-          <button type="submit">Create Firebase user</button>
+          <label class="source-check"><input name="sendEmail" type="checkbox" checked /><span><strong>Email the invite</strong><small>The Google-bound link and individual code expire after 48 hours.</small></span></label>
+          <button type="submit">Create user and 48-hour invite</button>
         </form>
       ` : ""}
       ${canDo("manageAccessGrants") ? renderAccessGrantPanel(accessRequests, accessGrants, assignableRoles) : ""}
@@ -9883,7 +10192,9 @@ function renderTeamMemberCard(member) {
       <h3>${escapeHtml(member.name)}</h3>
       <p>${escapeHtml(member.email)}</p>
       <span>${escapeHtml(member.role)} - ${escapeHtml(member.access)}</span>
-      <small>Portal code: ${escapeHtml(employeeAccessCodeFor(member))}</small>
+      <small>${employeeAccessCodeFor(member)
+        ? `Local portal code: ${escapeHtml(employeeAccessCodeFor(member))}`
+        : "Portal access: Google invite plus individual code"}</small>
       <small>${assignedTasks.length} assigned task${assignedTasks.length === 1 ? "" : "s"}${assignedJobs.length ? ` | Jobs: ${escapeHtml(assignedJobs.join(", "))}` : ""}</small>
       <small>Modules: ${escapeHtml(visibleModules.join(", ") || "No modules assigned")}</small>
       ${member.companyId ? `<small>Company: ${escapeHtml(member.companyId)}${member.franchiseIds?.length ? ` | Franchise: ${escapeHtml(member.franchiseIds.join(", "))}` : ""}</small>` : ""}
@@ -10014,7 +10325,7 @@ function renderAccountingModule(module) {
     </section>
     <section class="payments-layout">
       <div class="panel">
-        <div class="panel-head"><div><h2>QuickBooks login gateway</h2><p>Create the OAuth setup file before syncing invoices, expenses, projects, and job profit.</p></div><button type="button" data-action="connect-quickbooks">${qbo.connected ? "Sync now" : "Create setup file"}</button></div>
+        <div class="panel-head"><div><h2>QuickBooks login gateway</h2><p>Connect through Intuit OAuth before syncing invoices, expenses, projects, and job profit.</p></div><button type="button" data-action="connect-quickbooks">${qbo.connected ? "Sync now" : "Connect QuickBooks"}</button></div>
         <div class="quickbooks-card">
           <strong>${escapeHtml(qbo.companyName || "No company connected")}</strong>
           <span>${escapeHtml(qbo.mode)} - ${qbo.lastSync ? `Last sync ${formatTime(qbo.lastSync)}` : "Waiting for OAuth setup"}</span>
@@ -10378,6 +10689,10 @@ function renderMobileDrawer() {
             )
             .join("")}
         </div>
+        <div class="drawer-actions">
+          <button type="button" data-action="set-active" data-key="settings">Settings</button>
+          ${state.authSession ? `<button type="button" data-action="firebase-logout">Sign out</button>` : ""}
+        </div>
       </div>
     </div>
   `;
@@ -10455,10 +10770,16 @@ function renderModal() {
 }
 
 function modalShell(content) {
+  const fallbackTitleId = `modal-title-${String(state.modal?.type || "dialog").replace(/[^a-z0-9_-]/gi, "")}`;
+  const titleMatch = content.match(/<h2[^>]*\sid="([^"]+)"/i);
+  const titleId = titleMatch?.[1] || fallbackTitleId;
+  const labelledContent = titleMatch
+    ? content
+    : content.replace(/<h2(\s|>)/i, `<h2 id="${titleId}"$1`);
   return `
     <div class="modal-backdrop" role="presentation" data-action="close-modal">
-      <div class="modal-panel" role="dialog" aria-modal="true">
-        ${content}
+      <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="${titleId}">
+        ${labelledContent}
       </div>
     </div>
   `;
@@ -10468,9 +10789,9 @@ function renderCreateFileModal() {
   const module = moduleByKey(state.modal.moduleKey) || activeModule();
   return `
     <div class="modal-backdrop" role="presentation" data-action="close-modal">
-      <form class="modal-panel" data-form="create-file" role="dialog" aria-modal="true">
+      <form class="modal-panel" data-form="create-file" role="dialog" aria-modal="true" aria-labelledby="create-file-title">
         <div class="modal-head">
-          <div><span>${escapeHtml(module.label)}</span><h2>Create module file</h2></div>
+          <div><span>${escapeHtml(module.label)}</span><h2 id="create-file-title">Create module file</h2></div>
           <button type="button" data-action="close-modal" aria-label="Close">Close</button>
         </div>
         <input type="hidden" name="moduleKey" value="${module.key}" />
@@ -10524,7 +10845,7 @@ function renderActivityModal() {
       <button type="button" data-action="clear-activity">Clear read alerts</button>
       <button type="button" data-action="close-activity">Done</button>
     </div>
-  `).replace('class="modal-panel"', 'class="modal-panel" aria-labelledby="activity-title"');
+  `);
 }
 
 function renderExportModal() {
@@ -10550,7 +10871,7 @@ function renderExportModal() {
       <button type="button" data-action="download-export">Download JSON</button>
       <button type="button" data-action="close-export">Done</button>
     </div>
-  `).replace('class="modal-panel"', 'class="modal-panel" aria-labelledby="export-title"');
+  `);
 }
 
 function renderEmployeeLoginModal() {
@@ -10770,8 +11091,12 @@ document.addEventListener("click", (event) => {
     state.mobileOpen = false;
     return render();
   }
-  if (action === "open-create-file") return openCreateFile(key || state.activeKey);
+  if (action === "open-create-file") {
+    rememberModalTrigger(actionElement);
+    return openCreateFile(key || state.activeKey);
+  }
   if (action === "open-activity") {
+    rememberModalTrigger(actionElement);
     state.modal = { type: "activity" };
     return render();
   }
@@ -10780,14 +11105,17 @@ document.addEventListener("click", (event) => {
       setToast("Export is restricted to Super Admin access.");
       return render();
     }
+    rememberModalTrigger(actionElement);
     state.modal = { type: "export" };
     return render();
   }
   if (action === "open-service-request") {
+    rememberModalTrigger(actionElement);
     state.modal = { type: "service-request" };
     return render();
   }
   if (action === "open-employee-login") {
+    rememberModalTrigger(actionElement);
     state.modal = { type: "employee-login" };
     return render();
   }
@@ -10796,11 +11124,13 @@ document.addEventListener("click", (event) => {
       setToast("Admin edit mode is restricted.");
       return render();
     }
+    rememberModalTrigger(actionElement);
     state.adminEditMode = true;
     state.modal = { type: "admin-edit" };
     return render();
   }
   if (action === "open-user-manage") {
+    rememberModalTrigger(actionElement);
     state.modal = { type: "user-manage", userId: id };
     return render();
   }
@@ -10810,6 +11140,7 @@ document.addEventListener("click", (event) => {
       setToast("Admin edit mode is restricted.");
       return render();
     }
+    if (!state.adminEditMode) rememberModalTrigger(actionElement);
     state.adminEditMode = !state.adminEditMode;
     state.modal = state.adminEditMode ? { type: "admin-edit" } : null;
     return render();
@@ -10851,6 +11182,7 @@ document.addEventListener("click", (event) => {
   if (action === "mark-callout-scheduled") return markCalloutScheduled(id);
   if (action === "complete-service-request") return completeServiceRequest(id);
   if (action === "quick-note") {
+    rememberModalTrigger(actionElement);
     state.modal = { type: "quick-note", moduleKey: key || state.activeKey };
     return render();
   }
@@ -10864,6 +11196,12 @@ document.addEventListener("click", (event) => {
   if (action === "status-active") return updateFileStatus(id, "Active");
   if (action === "duplicate-file") return duplicateFile(id);
   if (action === "delete-file") return deleteFile(id);
+  if (action === "copy-payment-link") {
+    return copyPaymentLink(id).catch(() => {
+      setToast("Browser clipboard access was blocked");
+      render();
+    });
+  }
   if (action === "capture-equipment-gps") return captureEquipmentGps();
   if (action === "create-equipment-invoice") return createEquipmentInvoice(id);
   if (action === "generate-rebuttal") return generateStandardsFromButton(actionElement, "rebuttal", "Rebuttal generated");
@@ -10880,7 +11218,13 @@ document.addEventListener("click", (event) => {
   if (action === "create-estimate-invoice") return createEstimateInvoice();
   if (action === "remove-estimate-line") return removeEstimateLine(id);
   if (action === "import-sample-pricing") return importSamplePricing();
-  if (action === "connect-quickbooks") return connectQuickBooks();
+  if (action === "connect-quickbooks") {
+    return connectQuickBooks().catch((error) => {
+      setToast(error.message || "Unable to start QuickBooks");
+      render();
+    });
+  }
+  if (action === "prepare-payment-request") return preparePaymentRequest(actionElement.dataset.method || "Card");
   if (action === "create-payment-rail") return createPaymentRailSetup(actionElement.dataset.method || "Payment", actionElement.dataset.route || "gateway-ready", actionElement.dataset.detail || "Payment rail setup");
   if (action === "complete-task") return completeTask(id);
   if (action === "professionalize-sketch") return professionalizeSketch();
@@ -10912,7 +11256,6 @@ document.addEventListener("click", (event) => {
   if (action === "complete-queue") return completeQueue(id);
   if (action === "refresh-insurance-intake") return loadInsuranceWorkspace(true);
   if (action === "refresh-selected-insurance") return refreshSelectedInsuranceSubmission();
-  if (action === "insurance-admin-logout") return logoutInsuranceAdmin();
   if (action === "firebase-google-login") return submitFirebaseGoogleLogin();
   if (action === "select-insurance-submission") {
     state.selectedInsuranceId = id;
@@ -11007,10 +11350,19 @@ document.addEventListener("submit", (event) => {
     addEstimateLine(formData);
   }
   if (type === "payment-request") {
-    createPaymentRequest(formData);
+    return createPaymentRequest(formData).catch((error) => {
+      setToast(error.message || "Unable to create payment request");
+      render();
+    });
+  }
+  if (type === "contractor-invoice") {
+    addContractorInvoice(formData);
   }
   if (type === "team-member") {
-    addTeamMember(formData);
+    return addTeamMember(formData).catch((error) => {
+      setToast(error.message || "Unable to create team login");
+      render();
+    });
   }
   if (type === "task") {
     addTask(formData);
@@ -11039,18 +11391,12 @@ document.addEventListener("submit", (event) => {
   if (type === "employee-login") {
     loginEmployeePortal(formData);
   }
-  if (type === "insurance-admin-login") {
-    return loginInsuranceAdmin(formData);
-  }
-  if (type === "firebase-login") {
-    return submitFirebaseLogin(formData);
-  }
   if (type === "access-request") {
     return requestTrialAccess(formData);
   }
   if (type === "rbac-user") {
     return createSecureUser(formData).catch((error) => {
-      setToast(error.message || "Unable to create Firebase user");
+      setToast(error.message || "Unable to create Google-bound user");
       render();
     });
   }
@@ -11087,8 +11433,7 @@ document.addEventListener("submit", (event) => {
       disabled: String(formData.get("disabled") || "false") === "true",
       ...moduleVisibilityPayload(formData)
     }).then(() => {
-      state.modal = null;
-      render();
+      closeModal();
     }).catch((error) => {
       setToast(error.message || "Unable to save user");
       render();
@@ -11132,6 +11477,33 @@ document.addEventListener("submit", (event) => {
   }
   if (type === "insurance-notes") {
     updateInsuranceSubmissionNotes(String(formData.get("id") || ""), String(formData.get("notes") || ""));
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (!state.modal) return;
+  const dialog = app.querySelector('.modal-backdrop [role="dialog"]');
+  if (!dialog) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeModal();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = modalFocusableElements(dialog);
+  if (!focusable.length) {
+    event.preventDefault();
+    dialog.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
   }
 });
 
@@ -11198,6 +11570,15 @@ document.addEventListener("change", (event) => {
 window.addEventListener("hashchange", () => {
   const key = getRouteKey();
   if (key && key !== state.activeKey && moduleByKey(key)) routeToModule(key);
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "hidden" || workspaceHydrating) return;
+  window.clearTimeout(workspaceSyncTimer);
+  workspaceSyncTimer = null;
+  syncWorkspaceState().catch((error) => {
+    console.warn("Brothers OS workspace background save failed.", error);
+  });
 });
 
 if (!window.location.hash) {

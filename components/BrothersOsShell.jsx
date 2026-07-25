@@ -1,3 +1,7 @@
+"use client";
+
+import Script from "next/script";
+
 export default function BrothersOsShell() {
   return (
     <>
@@ -14,8 +18,7 @@ export default function BrothersOsShell() {
         }}
       />
       <div id="app" suppressHydrationWarning />
-      <script type="module" src="/module-data.js" />
-      <script type="module" src="/app.js" />
+      <Script id="brothers-os-runtime" type="module" src="/app.js" strategy="afterInteractive" />
     </>
   );
 }

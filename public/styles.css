@@ -18,9 +18,9 @@
   --line-strong: rgba(17, 35, 63, 0.12);
   --shadow: 0 14px 30px rgba(9, 27, 52, 0.08);
   --shadow-soft: 0 7px 16px rgba(10, 26, 49, 0.055);
-  --radius-xl: 18px;
-  --radius-lg: 14px;
-  --radius-md: 10px;
+  --radius-xl: 8px;
+  --radius-lg: 8px;
+  --radius-md: 8px;
   --radius-sm: 8px;
   --sidebar-width: clamp(272px, 24vw, 340px);
   --sidebar-padding-y: 24px;
@@ -30,9 +30,9 @@
   --sidebar-brand-title-size: 26px;
   --sidebar-quick-min-height: 72px;
   --sidebar-nav-padding: 11px;
-  --sidebar-card-radius: 10px;
+  --sidebar-card-radius: 8px;
   font-family: Inter, "Segoe UI Variable", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  font-size: 15px;
+  font-size: 16px;
   line-height: 1.45;
 }
 
@@ -56,6 +56,37 @@ body {
 
 #app {
   min-height: 100vh;
+}
+
+#app h2 {
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+#app h3 {
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+#app small {
+  font-size: 13px;
+}
+
+.skip-link {
+  position: fixed;
+  left: 12px;
+  top: -80px;
+  z-index: 200;
+  background: #fff;
+  border: 2px solid #1f4fa9;
+  border-radius: 6px;
+  color: #173f89;
+  font-weight: 700;
+  padding: 10px 14px;
+}
+
+.skip-link:focus {
+  top: 12px;
 }
 
 .app-root {
@@ -205,24 +236,24 @@ textarea:focus-visible {
 
 .auth-shell {
   min-height: 100vh;
-  background: linear-gradient(135deg, #081a30 0%, #12395f 46%, #eef3f8 100%);
+  background: #eef2f6;
 }
 
 .auth-gate {
   min-height: 100vh;
   display: grid;
-  place-items: center;
+  place-items: start center;
   padding: 24px;
 }
 
 .auth-card {
-  width: min(540px, 100%);
-  background: rgba(255, 255, 255, 0.94);
-  border: 1px solid rgba(17, 35, 63, 0.08);
-  border-radius: 18px;
-  box-shadow: var(--shadow);
-  padding: 28px;
-  backdrop-filter: blur(10px);
+  width: min(600px, 100%);
+  margin: 24px 0;
+  background: #fff;
+  border: 1px solid #d7dee7;
+  border-radius: 8px;
+  box-shadow: 0 16px 40px rgba(17, 35, 63, 0.12);
+  padding: 24px;
 }
 
 .auth-logo-wrap {
@@ -231,14 +262,13 @@ textarea:focus-visible {
 }
 
 .auth-logo {
-  width: 112px;
-  height: 112px;
+  width: 88px;
+  height: 88px;
   object-fit: contain;
   background: #fff;
   border: 1px solid rgba(17, 35, 63, 0.08);
-  border-radius: 12px;
+  border-radius: 8px;
   padding: 4px;
-  box-shadow: 0 10px 24px rgba(7, 26, 51, 0.12);
 }
 
 .auth-card > span {
@@ -249,14 +279,15 @@ textarea:focus-visible {
 }
 
 .auth-card h1 {
-  margin: 10px 0;
-  font-size: clamp(2rem, 4vw, 2.8rem);
-  line-height: 1.02;
+  margin: 8px 0 10px;
+  font-size: 32px;
+  line-height: 1.12;
 }
 
 .auth-card p {
   color: var(--muted);
-  line-height: 1.6;
+  line-height: 1.5;
+  margin: 0 0 14px;
 }
 
 .auth-card > label {
@@ -268,7 +299,57 @@ textarea:focus-visible {
 
 .auth-card > label span {
   color: var(--muted);
-  font-size: 0.8rem;
+  font-size: 13px;
+}
+
+.google-login-button {
+  width: 100%;
+  min-height: 48px;
+  background: #1f4fa9;
+  border-color: #1f4fa9;
+  color: #fff;
+  font-weight: 700;
+}
+
+.google-login-button:hover,
+.google-login-button:focus-visible {
+  background: #173f89;
+  border-color: #173f89;
+}
+
+.auth-session-note {
+  display: block;
+  margin: 9px 0 14px;
+  color: #526172;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.auth-disclosure {
+  border-top: 1px solid #d7dee7;
+}
+
+.auth-disclosure summary {
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 700;
+  padding: 14px 2px;
+}
+
+.auth-disclosure summary:focus-visible {
+  outline: 3px solid rgba(31, 79, 169, 0.28);
+  outline-offset: 2px;
+}
+
+.auth-disclosure-body {
+  display: grid;
+  gap: 10px;
+  padding: 0 0 16px;
+}
+
+.auth-disclosure-body.access-request-form {
+  margin-top: 0;
 }
 
 .auth-divider {
@@ -965,8 +1046,19 @@ textarea:hover {
   position: absolute;
   width: 1px;
   height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
   opacity: 0;
-  pointer-events: none;
+}
+
+.big-upload-button:focus-within,
+.xactimate-dropzone:focus-within,
+.upload-button:focus-within {
+  outline: 3px solid rgba(47, 111, 237, 0.38);
+  outline-offset: 2px;
 }
 
 .big-upload-button span,
@@ -2604,6 +2696,31 @@ dd {
   gap: 12px;
 }
 
+.payment-link-box,
+.payment-instructions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  border: 1px solid #b9ccec;
+  border-radius: 8px;
+  background: #f4f8ff;
+  padding: 12px;
+}
+
+.payment-link-box > div:first-child,
+.payment-instructions {
+  min-width: 0;
+}
+
+.payment-link-box span,
+.payment-instructions span {
+  display: block;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .job-card,
 .contact-card,
 .branch-card {
@@ -3287,8 +3404,12 @@ dd {
   position: absolute;
   width: 1px;
   height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
   opacity: 0;
-  pointer-events: none;
 }
 
 .estimate-panel {
@@ -3494,7 +3615,7 @@ dd {
   right: 18px;
   bottom: 18px;
   z-index: 70;
-  width: min(480px, calc(100vw - 36px));
+  width: min(400px, calc(100vw - 36px));
 }
 
 .copilot-toggle {
@@ -3507,13 +3628,19 @@ dd {
 .copilot-panel {
   clear: both;
   border: 1px solid rgba(17, 35, 63, 0.08);
-  border-radius: 22px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.96);
   backdrop-filter: blur(20px);
   box-shadow: var(--shadow);
   padding: 14px;
   display: grid;
   gap: 8px;
+}
+
+@media (min-width: 1101px) {
+  .app-shell:has(.ai-copilot.open) .workspace {
+    padding-right: 430px;
+  }
 }
 
 .copilot-head,
@@ -3990,8 +4117,8 @@ dd {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 10px;
-    padding: 12px 14px;
+    gap: 8px;
+    padding: 10px 12px;
     background: rgba(255, 255, 255, 0.96);
     backdrop-filter: blur(16px);
     border-bottom: 1px solid rgba(17, 35, 63, 0.08);
@@ -4001,7 +4128,8 @@ dd {
   }
 
   .icon-button {
-    min-width: 74px;
+    min-width: 50px;
+    padding: 0 10px;
     flex: 0 0 auto;
   }
 
@@ -4022,7 +4150,7 @@ dd {
 
   .workspace {
     height: auto;
-    padding: 12px 12px 84px;
+    padding: 12px 12px 92px;
     overflow: visible;
   }
 
@@ -4060,10 +4188,23 @@ dd {
 
   .topbar-actions-primary,
   .topbar-actions-secondary {
-    justify-content: flex-start;
-    overflow-x: auto;
-    flex-wrap: nowrap;
-    padding-bottom: 2px;
+    width: 100%;
+  }
+
+  .topbar-actions-primary {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .topbar-actions-primary > * {
+    width: 100%;
+    min-width: 0;
+    padding: 0 8px;
+  }
+
+  .topbar-actions-secondary {
+    display: none;
   }
 
   .topbar-actions-primary a,
@@ -4154,15 +4295,26 @@ dd {
   }
 
   .settings-dock {
-    left: 10px;
-    bottom: 10px;
-    max-width: calc(100vw - 20px);
+    display: none;
   }
 
   .ai-copilot {
     right: 10px;
-    bottom: 74px;
+    bottom: 10px;
     width: calc(100vw - 20px);
+  }
+
+  .ai-copilot.closed {
+    display: none;
+  }
+
+  .ai-copilot.open .copilot-toggle {
+    display: none;
+  }
+
+  .ai-copilot.open .copilot-panel {
+    max-height: calc(100vh - 88px);
+    overflow: auto;
   }
 
   .copilot-input {
@@ -4270,6 +4422,38 @@ dd {
   .drawer-list a:focus-visible {
     border-color: rgba(31, 79, 169, 0.22);
     background: linear-gradient(180deg, #ffffff 0%, #edf4ff 100%);
+  }
+
+  .drawer-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+
+  .mobile-brand-logo {
+    width: 42px;
+    height: 42px;
+  }
+
+  .auth-gate {
+    padding: 10px;
+  }
+
+  .auth-card {
+    margin: 0;
+    padding: 18px;
+  }
+
+  .auth-logo {
+    width: 72px;
+    height: 72px;
+  }
+
+  .auth-card h1 {
+    font-size: 28px;
   }
 
   .drawer-list span {

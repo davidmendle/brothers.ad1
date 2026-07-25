@@ -47,7 +47,7 @@ describe("pricing workflow", () => {
     expect(functionBody("localRevenueInvoiceRecords")).toContain('source: "local-file"');
     expect(functionBody("revenueInvoices")).toContain("localRevenueInvoiceRecords()");
     expect(functionBody("customerRecords")).toContain("localRevenueInvoiceRecords().forEach");
-    expect(source).toContain("Local operating files plus secured defaults");
+    expect(source).toContain("Authenticated Firestore workspace and role-scoped global records");
   });
 
   it("keeps browser storage quota from making controls feel dead", () => {

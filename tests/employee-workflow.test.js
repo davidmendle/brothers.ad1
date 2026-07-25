@@ -18,7 +18,7 @@ describe("employee task, time, photo, and note workflow", () => {
     const teamModule = functionBody("renderTeamModule");
     expect(source).toContain("function mergeSessionTeamMembers(users = [])");
     expect(teamModule).toContain("const displayedUsers = assignableTeamMembers()");
-    expect(teamModule).toContain("Secure login manager is active");
+    expect(teamModule).toContain("Secure login manager");
     expect(teamModule).toContain("${renderTeamForm()}");
   });
 
