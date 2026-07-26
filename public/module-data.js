@@ -1,4 +1,4 @@
-window.BROTHERS_MODULES = [
+const brothersModules = [
   {
     "key": "daily",
     "label": "Daily Owner Dashboard",
@@ -420,3 +420,11 @@ window.BROTHERS_MODULES = [
     "purpose": "Plan marketing campaigns, track sources, measure conversion, and coordinate partner outreach."
   }
 ];
+
+if (typeof window !== "undefined") {
+  window.BROTHERS_MODULES = brothersModules;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = brothersModules;
+}
