@@ -1201,6 +1201,20 @@ async function installLocalSmokeApi(context) {
       if (index > 0) users.splice(index, 1);
       return json(200, { success: true });
     }
+    if (/^\/api\/employees\/[^/]+\/assignments$/.test(url.pathname) && method === "PATCH") {
+      const uid = decodeURIComponent(url.pathname.split("/")[3]);
+      const payload = request.postDataJSON() || {};
+      const index = users.findIndex((user) => user.uid === uid);
+      if (index < 0 || users[index].roleId !== "worker") {
+        return json(404, { success: false, message: "Employee not found." });
+      }
+      users[index] = {
+        ...users[index],
+        assignedJobIds: payload.assignedJobIds || [],
+        assignedTaskIds: payload.assignedTaskIds || []
+      };
+      return json(200, { success: true, user: users[index] });
+    }
     if (url.pathname === "/api/access/grants" && method === "POST") {
       const payload = request.postDataJSON() || {};
       const accessCode = `GRANT${stamp}`;
