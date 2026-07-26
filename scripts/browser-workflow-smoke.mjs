@@ -259,7 +259,7 @@ async function submitGenericForm(page, formType) {
 
 async function submitRemainingForms(page) {
   const modalForms = new Set(["create-file", "quick-note", "service-request", "user-manage"]);
-  const separateContextForms = new Set(["access-request"]);
+  const separateContextForms = new Set(["access-request", "employee-profile", "ticket-signoff"]);
   for (const formType of [...actionCoverage.formsRendered]) {
     if (actionCoverage.formsSubmitted.has(formType) || modalForms.has(formType) || separateContextForms.has(formType)) continue;
     const location = actionCoverage.formLocations.get(formType);
@@ -743,12 +743,240 @@ async function testUnauthenticatedGate(browser) {
   console.log("[smoke] unauthenticated gate verified");
 }
 
+async function testEmployeePortal(browser) {
+  console.log("[smoke] starting employee portal verification");
+  const worker = {
+    id: "smoke-worker",
+    uid: "smoke-worker",
+    email: "employee.smoke@example.com",
+    displayName: "Employee Smoke",
+    roleId: "worker",
+    companyId: "default-company",
+    franchiseIds: ["default-franchise"],
+    contractorId: "contractor-smoke",
+    employerUid: "contractor-owner-smoke",
+    employerEmail: "contractor.smoke@example.com",
+    employerContractorId: "contractor-smoke",
+    jobTitle: "Field technician",
+    assignedJobIds: ["J-EMP-1"],
+    assignedTaskIds: ["TASK-EMP-1"],
+    visibleTabIds: ["time", "jobs", "photos", "equipment", "communications"],
+    visiblePageIds: ["time", "jobs", "photos", "equipment", "communications"],
+    status: "active",
+    disabled: false
+  };
+  const workerModuleKeys = ["time", "jobs", "photos", "equipment", "communications"];
+  const workerPermissions = {
+    tabs: { mode: "allow", allowed: workerModuleKeys, hidden: [] },
+    pages: { mode: "allow", allowed: workerModuleKeys, hidden: [] },
+    sections: { mode: "all", allowed: [], hidden: [] },
+    actions: {
+      uploadImages: true,
+      editAssignedTasks: true,
+      postCommunityMessages: true,
+      inviteWorkers: false,
+      manageUsers: false,
+      viewGlobalIndexes: false,
+      viewRevenueData: false
+    },
+    dataAccess: {
+      company: "none",
+      franchises: "assigned",
+      workers: "self",
+      auditLogs: "self",
+      customers: "none",
+      revenue: "none",
+      contractorInvoices: "none",
+      globalIndexes: "none",
+      community: "all"
+    }
+  };
+  let profileSaved = false;
+  let signoffPosted = false;
+  let workspaceState = {
+    tasks: [{
+      id: "TASK-EMP-1",
+      title: "Complete employee smoke ticket",
+      assigneeId: worker.uid,
+      assigneeEmail: worker.email,
+      assigneeName: worker.displayName,
+      moduleKey: "photos",
+      relatedJob: "J-EMP-1",
+      due: "2026-07-25",
+      status: "Open",
+      priority: "High"
+    }],
+    jobBoards: [{
+      id: "JOB-EMP-1",
+      jobId: "J-EMP-1",
+      title: "Employee smoke job",
+      customer: "Smoke Customer",
+      property: "1 Test Street",
+      stage: "Field work",
+      owner: worker.displayName,
+      gates: [],
+      linkedModules: ["photos", "time"]
+    }],
+    timeEntries: [],
+    files: []
+  };
+  const employeeContext = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    geolocation: { latitude: 42.45, longitude: -73.245 },
+    permissions: ["geolocation"]
+  });
+  await employeeContext.grantPermissions(["geolocation"], { origin });
+  const page = await employeeContext.newPage();
+  page.setDefaultTimeout(15000);
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const method = request.method();
+    const json = (status, body) => route.fulfill({
+      status,
+      contentType: "application/json",
+      body: JSON.stringify(body)
+    });
+    if (url.pathname === "/api/auth/config") {
+      return json(200, {
+        success: true,
+        firebase: {
+          enabled: true,
+          ready: true,
+          adminConfigured: true,
+          webConfigured: true,
+          allowedSignInProviders: ["google.com"],
+          ownerOnlyLogin: true,
+          allowedLoginEmails: ["david@brothersrestoration.org"],
+          sessionTtlHours: 48,
+          inviteEmailConfigured: true,
+          missingAdminEnv: [],
+          missingWebEnv: [],
+          apiKey: "smoke-api-key",
+          authDomain: "brothers-restoration-website.firebaseapp.com",
+          projectId: "brothers-restoration-website",
+          storageBucket: "brothers-restoration-website.firebasestorage.app",
+          appId: "smoke-app-id",
+          messagingSenderId: "80592032671"
+        }
+      });
+    }
+    if (url.pathname === "/api/auth/session" && method === "GET") {
+      return json(200, {
+        success: true,
+        session: {
+          uid: worker.uid,
+          email: worker.email,
+          roleId: worker.roleId,
+          companyId: worker.companyId,
+          franchiseIds: worker.franchiseIds,
+          contractorId: worker.contractorId,
+          accessScope: "employee_portal",
+          accessExpiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+          visibleTabIds: worker.visibleTabIds,
+          visiblePageIds: worker.visiblePageIds,
+          permissions: workerPermissions
+        },
+        user: worker,
+        users: [],
+        roles: [{ id: "worker", label: "Worker", rank: 10 }],
+        permissions: [{ roleId: "worker", ...workerPermissions }],
+        tabs: workerModuleKeys.map((key, index) => ({
+          id: key,
+          key,
+          label: smokeModuleDefinitions.find((module) => module.key === key)?.label || key,
+          order: index + 1,
+          visible: true
+        })),
+        pages: workerModuleKeys.map((key, index) => ({
+          id: key,
+          key,
+          moduleKey: key,
+          title: smokeModuleDefinitions.find((module) => module.key === key)?.label || key,
+          order: index + 1,
+          visible: true
+        })),
+        pageSections: [],
+        companySettings: {},
+        franchiseSettings: [],
+        auditLogs: [],
+        businessData: [],
+        accessRequests: [],
+        accessGrants: [],
+        ticketSignoffs: [],
+        communityPosts: []
+      });
+    }
+    if (url.pathname === "/api/workspace-state" && method === "GET") {
+      return json(200, {
+        success: true,
+        durable: true,
+        exists: true,
+        recordCount: workspaceState.tasks.length + workspaceState.jobBoards.length,
+        updatedAt: new Date().toISOString(),
+        workspaceState
+      });
+    }
+    if (url.pathname === "/api/workspace-state" && method === "PUT") {
+      workspaceState = request.postDataJSON()?.workspaceState || workspaceState;
+      return json(200, { success: true, durable: true, savedRecords: 1, ignoredRecords: 0, updatedAt: new Date().toISOString() });
+    }
+    if (url.pathname === "/api/employee/profile" && method === "PATCH") {
+      profileSaved = true;
+      Object.assign(worker, request.postDataJSON() || {});
+      return json(200, { success: true, user: worker });
+    }
+    if (url.pathname === "/api/employee/ticket-signoffs" && method === "POST") {
+      const payload = request.postDataJSON() || {};
+      signoffPosted = true;
+      return json(201, {
+        success: true,
+        signoff: {
+          id: "SIGNOFF-SMOKE-1",
+          taskId: payload.taskId,
+          taskTitle: "Complete employee smoke ticket",
+          jobId: "J-EMP-1",
+          employeeUid: worker.uid,
+          employeeEmail: worker.email,
+          employeeName: worker.displayName,
+          employerUid: worker.employerUid,
+          employerEmail: worker.employerEmail,
+          employerContractorId: worker.employerContractorId,
+          typedSignature: payload.typedSignature,
+          gps: payload.gps,
+          status: "signed",
+          signedAt: new Date().toISOString()
+        },
+        task: { ...workspaceState.tasks[0], status: "Complete" }
+      });
+    }
+    if (url.pathname === "/api/auth/session/logout" && method === "POST") return json(200, { success: true });
+    return json(404, { success: false, message: `Employee smoke route not configured: ${method} ${url.pathname}` });
+  });
+
+  await page.goto(`${baseUrl}/?employee-smoke=${Date.now()}#module/time`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector('form[data-form="employee-profile"]');
+  actionCoverage.formsRendered.add("employee-profile");
+  actionCoverage.formsRendered.add("ticket-signoff");
+  await fill(page, 'form[data-form="employee-profile"] input[name="phone"]', "555-444-1212");
+  await click(page, 'form[data-form="employee-profile"] button[type="submit"]');
+  await waitUntil("employee profile save", () => profileSaved);
+
+  await page.locator('form[data-form="ticket-signoff"] input[name="attested"]').check();
+  await click(page, 'form[data-form="ticket-signoff"] button[type="submit"]');
+  await waitUntil("employee ticket sign-off", () => signoffPosted);
+  await expectBody(page, "employee ticket completed", "No open assigned tickets");
+  results.workflowChecks.push({ label: "Employee portal", text: "restricted account, employer-bound task, GPS ticket sign-off" });
+  console.log("[smoke] employee portal verified");
+  await employeeContext.close();
+}
+
 const allOwnerActions = [
   "manageUsers", "removeUsers", "changeRoles", "disableAccounts", "resetPermissions",
   "manageRolePermissions", "manageTabs", "managePages", "manageSections", "manageButtons",
   "uploadImages", "editCompanySettings", "editFranchiseSettings", "viewCompanyReports",
   "viewFranchiseReports", "viewAuditLogs", "viewCustomerDirectory", "viewRevenueData",
-  "viewContractorInvoices", "viewGlobalIndexes", "manageAccessGrants", "issueContractorCodes",
+  "viewContractorInvoices", "viewGlobalIndexes", "manageAccessGrants", "inviteWorkers", "issueContractorCodes",
   "postCommunityMessages", "moderateCommunityMessages", "editAssignedTasks", "editAllTasks"
 ];
 
@@ -869,6 +1097,7 @@ async function installLocalSmokeApi(context) {
     businessData: [],
     accessRequests: [],
     accessGrants: [],
+    ticketSignoffs: [],
     communityPosts: posts
   });
 
@@ -985,6 +1214,29 @@ async function installLocalSmokeApi(context) {
         },
         accessCode,
         accessLink: `${origin}/#access/smoke-grant-${stamp}`,
+        emailDelivery: { status: "sent" }
+      });
+    }
+    if (url.pathname === "/api/employee-invitations" && method === "POST") {
+      const payload = request.postDataJSON() || {};
+      const grant = {
+        id: `employee-grant-${Date.now()}`,
+        email: payload.email,
+        displayName: payload.displayName,
+        roleId: "worker",
+        contractorId: payload.contractorId || `contractor-${stamp}`,
+        employerUid: owner.uid,
+        employerEmail: owner.email,
+        onboardingMode: "employee_link",
+        status: "issued",
+        assignedJobIds: payload.assignedJobIds || [],
+        assignedTaskIds: payload.assignedTaskIds || [],
+        expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+      };
+      return json(201, {
+        success: true,
+        grant,
+        accessLink: `${origin}/?portal=employee#access/employee-${stamp}`,
         emailDelivery: { status: "sent" }
       });
     }
@@ -1105,7 +1357,11 @@ async function installLocalSmokeApi(context) {
   };
 }
 
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({
+  headless: true,
+  timeout: 30000,
+  ...(process.platform === "win32" ? { channel: "msedge" } : {})
+});
 const context = await browser.newContext({
   viewport: { width: 1440, height: 900 },
   geolocation: { latitude: 42.45, longitude: -73.245 },
@@ -1144,6 +1400,7 @@ try {
   await exerciseRemainingActions(page);
   console.log("[smoke] action matrix complete");
   await testUnauthenticatedGate(browser);
+  await testEmployeePortal(browser);
   const allowedInteractiveActions = new Set(["firebase-google-login"]);
   const unexercisedActionTypes = staticActionTypes
     .filter((action) => !actionCoverage.exercised.has(action) && !allowedInteractiveActions.has(action));

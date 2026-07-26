@@ -21,7 +21,7 @@ const remoteWorkspaceFields = [
   "aiCopilotMessages", "timeEntries"
 ];
 const adminAccessCode = "Issued by Super Admin";
-const employeeAllowedModuleKeys = ["contractorportal", "daily", "jobs", "drylogs", "time", "equipment", "photos", "payments", "communications", "settings"];
+const employeeAllowedModuleKeys = ["jobs", "drylogs", "time", "equipment", "photos", "forms", "communications"];
 const defaultContractorModuleKeys = ["contractorportal", "daily", "jobs", "time", "equipment", "photos", "payments", "communications", "settings"];
 const brandLogoPath = brothersLogoDataUrl;
 const insuranceStatuses = ["all", "new", "reviewed", "in-progress", "completed", "rejected"];
@@ -47,6 +47,7 @@ const rbacActionKeys = [
   "viewContractorInvoices",
   "viewGlobalIndexes",
   "manageAccessGrants",
+  "inviteWorkers",
   "issueContractorCodes",
   "postCommunityMessages",
   "moderateCommunityMessages",
@@ -1055,8 +1056,10 @@ const defaultState = {
   },
   accessRequestStatus: null,
   lastAccessGrant: null,
+  lastEmployeeInvitation: null,
   businessData: [],
   communityPosts: [],
+  ticketSignoffs: [],
   adminEditMode: false,
   adminEditAssetUrl: "",
   timeEntries: [],
@@ -1308,8 +1311,10 @@ function normalizeState(next) {
   next.loginForm = { accessCode: "" };
   next.accessRequestStatus = null;
   next.lastAccessGrant = null;
+  next.lastEmployeeInvitation = null;
   next.businessData = [];
   next.communityPosts = [];
+  next.ticketSignoffs = Array.isArray(next.ticketSignoffs) ? next.ticketSignoffs : [];
   next.adminEditMode = false;
   next.adminEditAssetUrl = "";
   next.timeEntries = Array.isArray(next.timeEntries) ? next.timeEntries : [];
@@ -1569,6 +1574,11 @@ function getRouteKey() {
 function getAccessTokenFromRoute() {
   const match = window.location.hash.match(/^#access\/([^/?#]+)/);
   return match ? decodeURIComponent(match[1]) : "";
+}
+
+function isEmployeeInviteRoute() {
+  return new URLSearchParams(window.location.search).get("portal") === "employee"
+    && Boolean(getAccessTokenFromRoute());
 }
 
 function isLocalSmokePreview() {
@@ -2563,6 +2573,11 @@ function createFile(data) {
     priority: data.priority || "Medium",
     due: data.due || "",
     relatedJob: data.relatedJob?.trim() || "",
+    taskId: String(data.taskId || "").trim(),
+    workerId: String(data.workerId || "").trim(),
+    workerEmail: String(data.workerEmail || "").trim(),
+    contractorId: String(data.contractorId || "").trim(),
+    employerUid: String(data.employerUid || "").trim(),
     notes: data.notes?.trim() || "",
     createdAt: now,
     updatedAt: now,
@@ -3696,6 +3711,32 @@ function mergeSessionTeamMembers(users = []) {
   state.teamMembers = mergeById(state.teamMembers || [], users.map(mapUserToTeamMember)).map(normalizeTeamMember);
 }
 
+function applyAuthenticatedPortalMode(sessionPayload) {
+  const session = sessionPayload?.session || null;
+  if (!session) return;
+  if (session.roleId !== "worker") {
+    state.employeeMode = false;
+    state.worker = null;
+    return;
+  }
+  const secureUser = sessionPayload.user || currentSessionUser() || {
+    uid: session.uid,
+    email: session.email,
+    displayName: session.email,
+    roleId: "worker",
+    visibleTabIds: session.visibleTabIds || [],
+    visiblePageIds: session.visiblePageIds || []
+  };
+  const member = normalizeTeamMember(mapUserToTeamMember(secureUser));
+  state.worker = fieldSessionForMember(member, "");
+  state.employeeMode = true;
+  const allowedKeys = employeeModuleKeys();
+  state.activeKey = allowedKeys.includes(state.activeKey) ? state.activeKey : (allowedKeys.includes("time") ? "time" : allowedKeys[0] || "time");
+  if (getAccessTokenFromRoute()) {
+    window.history.replaceState({}, "", `${window.location.pathname}#module/${state.activeKey}`);
+  }
+}
+
 function currentWorkerMember() {
   const worker = state.worker || {};
   const workerId = String(worker.id || "").trim();
@@ -4088,12 +4129,15 @@ async function bootstrapFirebaseAuth() {
       businessData: session.businessData || [],
       accessRequests: session.accessRequests || [],
       accessGrants: session.accessGrants || [],
+      ticketSignoffs: session.ticketSignoffs || [],
       communityPosts: session.communityPosts || []
     } : null;
     state.businessData = session?.businessData || [];
     state.communityPosts = session?.communityPosts || [];
+    state.ticketSignoffs = session?.ticketSignoffs || [];
     await hydrateWorkspaceState({ migrateIfEmpty: true });
     mergeSessionTeamMembers(session?.users || []);
+    applyAuthenticatedPortalMode(session);
     state.authChecked = true;
     state.authError = "";
   } catch (error) {
@@ -4123,14 +4167,17 @@ async function refreshAccessContext({ hydrateWorkspace = false } = {}) {
       businessData: session.businessData || [],
       accessRequests: session.accessRequests || [],
       accessGrants: session.accessGrants || [],
+      ticketSignoffs: session.ticketSignoffs || [],
       communityPosts: session.communityPosts || []
   } : null;
   state.businessData = session?.businessData || [];
   state.communityPosts = session?.communityPosts || [];
+  state.ticketSignoffs = session?.ticketSignoffs || [];
   if (hydrateWorkspace) {
     await hydrateWorkspaceState({ migrateIfEmpty: true });
   }
   mergeSessionTeamMembers(session?.users || []);
+  applyAuthenticatedPortalMode(session);
 }
 
 async function submitFirebaseGoogleLogin() {
@@ -4162,6 +4209,9 @@ async function signOutFirebaseAuth() {
     await logoutFirebaseSession();
     state.authSession = null;
     state.accessContext = null;
+    state.employeeMode = false;
+    state.worker = null;
+    state.ticketSignoffs = [];
     workspaceSyncPromise = null;
     workspaceSyncQueued = false;
     lastWorkspacePayload = "";
@@ -4247,6 +4297,47 @@ async function createAccessGrant(formData) {
   upsertAccessGrant(result.grant);
   setToast(state.lastAccessGrant.emailDelivery?.status === "sent" ? "Invite email sent with access code" : "Access grant issued; send the link and code manually");
   await refreshAccessContext();
+}
+
+async function createEmployeeInvitation(formData) {
+  const payload = {
+    displayName: String(formData.get("displayName") || "").trim(),
+    email: String(formData.get("email") || "").trim(),
+    jobTitle: String(formData.get("jobTitle") || "Field employee").trim(),
+    companyId: String(formData.get("companyId") || state.authSession?.companyId || "default-company").trim(),
+    franchiseIds: csvValues(formData.get("franchiseIds")),
+    contractorId: String(formData.get("contractorId") || currentContractorId()).trim(),
+    assignedJobIds: csvValues(formData.get("assignedJobIds")),
+    assignedTaskIds: csvValues(formData.get("assignedTaskIds")),
+    visibleModuleKeys: formData.getAll("visibleModuleKeys").map(String),
+    sendEmail: formData.has("sendEmail")
+  };
+  const result = await apiRequest("/api/employee-invitations", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+  state.lastEmployeeInvitation = {
+    email: payload.email,
+    accessLink: result.accessLink,
+    expiresAt: result.grant?.expiresAt || "",
+    emailDelivery: result.emailDelivery || result.grant?.emailDelivery || null
+  };
+  upsertAccessGrant(result.grant);
+  setToast(state.lastEmployeeInvitation.emailDelivery?.status === "sent"
+    ? "Employee invitation emailed"
+    : "Employee link created for manual delivery");
+  await refreshAccessContext();
+  render();
+}
+
+async function updateEmployeeAssignments(uid, assignedJobIds, assignedTaskIds) {
+  if (!state.firebase.enabled || !state.authSession || !canDo("inviteWorkers") || !uid) return null;
+  const result = await apiRequest(`/api/employees/${encodeURIComponent(uid)}/assignments`, {
+    method: "PATCH",
+    body: JSON.stringify({ assignedJobIds, assignedTaskIds })
+  });
+  if (result.user) upsertManagedUser(result.user);
+  return result.user || null;
 }
 
 async function createCommunityPost(formData) {
@@ -4461,6 +4552,13 @@ function mapUserToTeamMember(member) {
     companyId: member.companyId || "",
     franchiseIds: Array.isArray(member.franchiseIds) ? member.franchiseIds : [],
     contractorId: member.contractorId || "",
+    employerUid: member.employerUid || "",
+    employerEmail: member.employerEmail || "",
+    employerContractorId: member.employerContractorId || member.contractorId || "",
+    employmentStatus: member.employmentStatus || "",
+    onboardingMode: member.onboardingMode || "",
+    phone: member.phone || "",
+    jobTitle: member.jobTitle || "",
     accessExpiresAt: member.accessExpiresAt || "",
     accessScope: member.accessScope || ""
   };
@@ -6020,7 +6118,7 @@ async function addTeamMember(formData) {
   render();
 }
 
-function addTask(formData) {
+async function addTask(formData) {
   const assigneeId = String(formData.get("assigneeId") || assignableTeamMembers()[0]?.id || "");
   const assignee = assignableTeamMembers().find((member) => member.id === assigneeId);
   const relatedJob = String(formData.get("relatedJob") || "").trim();
@@ -6036,12 +6134,16 @@ function addTask(formData) {
     status: "Open",
     priority: String(formData.get("priority") || "Medium")
   };
+  const nextAssignedTaskIds = [...new Set([task.id, ...normalizeListValue(assignee?.assignedTaskIds)])];
+  const nextAssignedJobIds = [...new Set([...(relatedJob ? [relatedJob] : []), ...normalizeListValue(assignee?.assignedJobIds)])];
+  const secureEmployee = (state.accessContext?.users || []).some((user) => (user.uid || user.id) === assigneeId && user.roleId === "worker");
+  if (secureEmployee) {
+    await updateEmployeeAssignments(assigneeId, nextAssignedJobIds, nextAssignedTaskIds);
+  }
   state.tasks = [task, ...state.tasks];
   state.teamMembers = (state.teamMembers || []).map((member) => {
     if (member.id !== assigneeId) return member;
-    const assignedTaskIds = [...new Set([task.id, ...normalizeListValue(member.assignedTaskIds)])];
-    const assignedJobIds = [...new Set([...(relatedJob ? [relatedJob] : []), ...normalizeListValue(member.assignedJobIds)])];
-    return normalizeTeamMember({ ...member, assignedTaskIds, assignedJobIds });
+    return normalizeTeamMember({ ...member, assignedTaskIds: nextAssignedTaskIds, assignedJobIds: nextAssignedJobIds });
   });
   createFile({
     moduleKey: "team",
@@ -6080,7 +6182,12 @@ function fieldSessionForMember(member, accessCode) {
     visibleTabIds: visibleKeys,
     visiblePageIds: visibleKeys,
     assignedJobIds: normalizeListValue(member.assignedJobIds),
-    assignedTaskIds: normalizeListValue(member.assignedTaskIds)
+    assignedTaskIds: normalizeListValue(member.assignedTaskIds),
+    contractorId: member.contractorId || "",
+    employerUid: member.employerUid || "",
+    employerEmail: member.employerEmail || "",
+    employerContractorId: member.employerContractorId || member.contractorId || "",
+    jobTitle: member.jobTitle || ""
   };
 }
 
@@ -6642,6 +6749,11 @@ async function clockOut() {
     priority: entry.billable ? "High" : "Medium",
     due: today.toISOString().slice(0, 10),
     relatedJob: entry.job,
+    taskId: entry.taskId,
+    workerId: entry.workerId,
+    workerEmail: entry.workerEmail,
+    contractorId: currentWorkerProfile().contractorId,
+    employerUid: currentWorkerProfile().employerUid,
     notes: [
       `Task: ${entry.task}`,
       `Hours: ${entry.hours}`,
@@ -6653,6 +6765,81 @@ async function clockOut() {
   addActivity(`${entry.worker} clocked out with GPS.`);
   persist();
   setToast("Clocked out");
+  render();
+}
+
+async function saveEmployeeProfile(formData) {
+  const result = await apiRequest("/api/employee/profile", {
+    method: "PATCH",
+    body: JSON.stringify({
+      phone: String(formData.get("phone") || "").trim(),
+      jobTitle: String(formData.get("jobTitle") || "").trim()
+    })
+  });
+  if (result.user) {
+    const member = normalizeTeamMember(mapUserToTeamMember(result.user));
+    state.worker = fieldSessionForMember(member, "");
+    upsertManagedUser(result.user);
+  }
+  setToast("Employee profile saved");
+  await refreshAccessContext();
+  render();
+}
+
+async function submitTicketSignoff(formData) {
+  if (!state.authSession || currentRoleId() !== "worker") {
+    throw new Error("Sign in through an employee invitation before signing a ticket.");
+  }
+  const gps = await requestGps();
+  if (!Number.isFinite(gps.latitude) || !Number.isFinite(gps.longitude)) {
+    throw new Error("Enable precise location access before signing this ticket.");
+  }
+  const taskId = String(formData.get("taskId") || "").trim();
+  const task = visibleTasks().find((item) => item.id === taskId);
+  const result = await apiRequest("/api/employee/ticket-signoffs", {
+    method: "POST",
+    body: JSON.stringify({
+      taskId,
+      typedSignature: String(formData.get("typedSignature") || "").trim(),
+      attested: formData.has("attested"),
+      gps
+    })
+  });
+  if (result.signoff) {
+    state.ticketSignoffs = mergeById([result.signoff], state.ticketSignoffs || []);
+  }
+  state.tasks = state.tasks.map((item) => item.id === taskId
+    ? { ...item, status: "Complete", ticketSignoffId: result.signoff?.id || "", signedOffAt: result.signoff?.signedAt || new Date().toISOString() }
+    : item);
+  createFile({
+    moduleKey: "time",
+    linkedModuleKeys: ["jobs", task?.moduleKey || "jobs", "photos", "closeout", "team"],
+    sourceType: "employeeTicketSignoff",
+    sourceId: result.signoff?.id || taskId,
+    taskId,
+    workerId: currentUserUid(),
+    workerEmail: state.authSession.email,
+    contractorId: currentContractorId(),
+    employerUid: currentWorkerProfile().employerUid,
+    title: `${task?.title || "Work ticket"} - signed off`,
+    type: "Employee ticket sign-off",
+    owner: currentUserName() || state.authSession.email,
+    status: "Complete",
+    priority: task?.priority || "Medium",
+    due: task?.due || today.toISOString().slice(0, 10),
+    relatedJob: task?.relatedJob || result.signoff?.jobId || "",
+    notes: [
+      `Ticket: ${task?.title || taskId}`,
+      `Employee: ${result.signoff?.employeeName || currentUserName()}`,
+      `Employer: ${result.signoff?.employerEmail || currentWorkerProfile().employerEmail || "Assigned contractor"}`,
+      `Signed: ${formatTime(result.signoff?.signedAt)}`,
+      `GPS: ${result.signoff?.gps?.label || gps.label}`,
+      `Attestation: Employee confirmed the work ticket is accurate and complete.`
+    ].join("\n")
+  });
+  addActivity(`${task?.title || "Work ticket"} signed off with GPS.`);
+  persist();
+  setToast("Ticket signed and posted to the employer profile");
   render();
 }
 
@@ -6718,6 +6905,7 @@ function renderAuthGate() {
   }
 
   const accessTokenPresent = Boolean(getAccessTokenFromRoute());
+  const employeeInvite = isEmployeeInviteRoute();
   const sessionHours = Number(state.firebase.sessionTtlHours || 48);
   const ttlLabel = `${sessionHours} ${sessionHours === 1 ? "hour" : "hours"}`;
   const ownerEmails = (state.firebase.allowedLoginEmails || []).filter(Boolean);
@@ -6737,9 +6925,11 @@ function renderAuthGate() {
         <div class="auth-logo-wrap">${renderBrandLogo("auth-logo", "Brothers logo")}</div>
         <span>Secure company access</span>
         <h1>Sign in to Brothers OS</h1>
-        <p>Owner access is restricted to ${escapeHtml(ownerLabel)}. Every other Google account needs an active 48-hour invitation and its individual code.</p>
-        ${accessTokenPresent ? `<div class="empty-state compact-empty"><strong>Access link detected</strong><span>Use the invited Google email and its code.</span></div>` : ""}
-        <label><span>Contractor / trial access code</span><input data-field="login-access-code" name="accessCode" autocomplete="one-time-code" placeholder="CON-123ABC" /></label>
+        <p>${employeeInvite
+          ? "This one-time employee link creates a restricted account under the inviting contractor after Google verifies the exact invited email."
+          : `Owner access is restricted to ${escapeHtml(ownerLabel)}. Every other Google account needs an active 48-hour invitation and its individual code.`}</p>
+        ${accessTokenPresent ? `<div class="empty-state compact-empty"><strong>${employeeInvite ? "Employee invitation detected" : "Access link detected"}</strong><span>${employeeInvite ? "Continue with the exact Google email that received this link. No separate portal code is required." : "Use the invited Google email and its code."}</span></div>` : ""}
+        ${employeeInvite ? "" : `<label><span>Contractor / trial access code</span><input data-field="login-access-code" name="accessCode" autocomplete="one-time-code" placeholder="CON-123ABC" /></label>`}
         <button class="google-login-button" type="button" data-action="firebase-google-login">${state.authLoading ? "Connecting to Google..." : "Continue with Google"}</button>
         <small class="auth-session-note">Current secure session limit: ${escapeHtml(ttlLabel)}. Invitation access expires within 48 hours.</small>
         ${state.authError ? `<div class="empty-state"><strong>Sign-in failed</strong><span>${escapeHtml(state.authError)}</span></div>` : ""}
@@ -6881,7 +7071,7 @@ function renderTrialBanner() {
             .filter(Boolean)
             .map((module) => `<button type="button" data-action="set-active" data-key="${module.key}">${escapeHtml(module.label)}</button>`)
             .join("")}
-          <button type="button" data-action="employee-logout">Owner/admin login</button>
+          <button type="button" data-action="employee-logout">${state.authSession?.roleId === "worker" ? "Sign out" : "Exit worker preview"}</button>
         </div>
       </section>
     `;
@@ -6936,7 +7126,7 @@ function renderTopbar(module) {
     ? `
         ${renderModuleTextLink("drylogs", "Dry logs")}
         ${renderModuleTextLink("equipment", "Equipment")}
-        <button type="button" data-action="employee-logout">Owner/admin login</button>
+        <button type="button" data-action="employee-logout">${state.authSession?.roleId === "worker" ? "Sign out" : "Exit worker preview"}</button>
       `
     : `
         ${renderModuleTextLink("daily", "Module map", "text-link module-map-link")}
@@ -9068,6 +9258,83 @@ function contractorPortalChecklist() {
   ];
 }
 
+function renderEmployeeInvitationPanel() {
+  if (!state.authSession || !canDo("inviteWorkers")) return "";
+  const last = state.lastEmployeeInvitation;
+  const contractorLocked = currentRoleId() === "contractor";
+  const employees = (state.accessContext?.users || [])
+    .map(mapUserToTeamMember)
+    .filter((member) => member.accountType === "worker");
+  const employeeGrants = (state.accessContext?.accessGrants || [])
+    .filter((grant) => grant.onboardingMode === "employee_link");
+  return `
+    <section class="panel employee-invite-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Employee portal access</h2>
+          <p>Send a single-use link. The invited employee creates a restricted account with the exact Google email and is attached to the sending contractor profile.</p>
+        </div>
+      </div>
+      ${last ? `
+        <div class="empty-state grant-output">
+          <strong>Employee link issued for ${escapeHtml(last.email)}</strong>
+          <span>Expires ${escapeHtml(formatTime(last.expiresAt))} | Email ${escapeHtml(last.emailDelivery?.status || "not sent")}</span>
+          <code>${escapeHtml(last.accessLink)}</code>
+        </div>
+      ` : ""}
+      <form class="stack-form inline-section" data-form="employee-invitation">
+        <div class="form-grid">
+          <label><span>Employee name</span><input name="displayName" required placeholder="Full name" /></label>
+          <label><span>Google email</span><input name="email" type="email" required placeholder="employee@company.com" /></label>
+          <label><span>Job title</span><input name="jobTitle" placeholder="Technician, crew lead, estimator" /></label>
+          <label><span>Assigned job IDs</span><input name="assignedJobIds" list="employee-job-options" placeholder="J-2039,J-2050" /></label>
+          <label><span>Assigned ticket IDs</span><input name="assignedTaskIds" placeholder="TASK-1001,TASK-1002" /></label>
+          ${contractorLocked
+            ? `<input type="hidden" name="contractorId" value="${escapeHtml(currentContractorId())}" />`
+            : `<label><span>Employer contractor ID</span><input name="contractorId" value="${escapeHtml(currentContractorId())}" required placeholder="contractor-company" /></label>`}
+          <input type="hidden" name="companyId" value="${escapeHtml(state.authSession.companyId || "default-company")}" />
+          <input type="hidden" name="franchiseIds" value="${escapeHtml(currentUserFranchiseIds().join(","))}" />
+        </div>
+        <datalist id="employee-job-options">
+          ${state.jobBoards.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}
+        </datalist>
+        ${renderModuleAccessPicker({ selectedKeys: employeeAllowedModuleKeys, legend: "Employee modules" })}
+        <label class="source-check"><input name="sendEmail" type="checkbox" checked /><span><strong>Email the one-time link</strong><small>The link expires after 48 hours and accepts only the invited verified Google email.</small></span></label>
+        <button type="submit">Send employee portal link</button>
+      </form>
+      <div class="access-request-grid">
+        <div>
+          <h3>Employees under this profile</h3>
+          <div class="activity-list">${employees.length
+            ? employees.slice(0, 10).map((member) => `<div><strong>${escapeHtml(member.name)}</strong><span>${escapeHtml(member.email)} | ${escapeHtml(member.status)} | ${member.assignedTaskIds.length} ticket assignments</span></div>`).join("")
+            : `<div><strong>No employee accounts yet</strong><span>Accepted invitation accounts will appear here.</span></div>`}</div>
+        </div>
+        <div>
+          <h3>Recent employee links</h3>
+          <div class="activity-list">${employeeGrants.length
+            ? employeeGrants.slice(0, 10).map((grant) => `<div><strong>${escapeHtml(grant.email)}</strong><span>${escapeHtml(grant.status)} | expires ${escapeHtml(formatTime(grant.expiresAt))}</span></div>`).join("")
+            : `<div><strong>No employee links issued</strong><span>The first invite will be logged here.</span></div>`}</div>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderContractorEmployeeTaskPanel() {
+  if (!state.authSession || !canDo("inviteWorkers")) return "";
+  const employees = (state.accessContext?.users || [])
+    .filter((user) => user.roleId === "worker")
+    .map(mapUserToTeamMember);
+  return `
+    <section class="panel">
+      <div class="panel-head"><div><h2>Assign employee ticket</h2><p>Create a job-linked task that appears in the selected employee portal and can be completed with a GPS sign-off.</p></div></div>
+      ${employees.length
+        ? renderTaskForm(employees)
+        : `<div class="empty-state"><strong>Invite an employee first</strong><span>Ticket assignment becomes available after an employee accepts the Google invitation.</span></div>`}
+    </section>
+  `;
+}
+
 function renderContractorPortalModule(module) {
   const jobs = visibleJobBoards();
   const tasks = visibleTasks();
@@ -9096,6 +9363,12 @@ function renderContractorPortalModule(module) {
         <div><strong>${escapeHtml(formatMoney(sumRecords(invoices, "amount")))}</strong><span>Invoice value</span></div>
         <div><strong>${posts.length}</strong><span>Board posts</span></div>
       </div>
+    </section>
+    ${renderEmployeeInvitationPanel()}
+    ${renderContractorEmployeeTaskPanel()}
+    <section class="panel">
+      <div class="panel-head"><div><h2>Employee ticket sign-offs</h2><p>GPS-backed work tickets posted to this employer profile.</p></div></div>
+      ${renderTicketSignoffFeed()}
     </section>
     <section class="panel">
       <div class="panel-head">
@@ -9847,6 +10120,7 @@ function renderTeamModule(module) {
       </div>
     </section>
     ${renderManagedSection("team-access-panel", renderAccountSeparationPanel())}
+    ${renderEmployeeInvitationPanel()}
     ${renderRbacAdminPanel()}
     <section class="team-layout">
       <div class="panel">
@@ -10104,8 +10378,8 @@ function renderAccountSeparationPanel() {
       </article>
       <article>
         <span>Contractor and employee portals</span>
-        <h2>48-hour code-gated access</h2>
-        <p>Trial and contractor users receive a single-email access link plus an individual portal code. They cannot see global indexes or Super Admin controls.</p>
+        <h2>Google-bound restricted access</h2>
+        <p>Contractors use an individual code. Employees use a single-use link tied to the invited Google email and their employer profile. Neither can see global indexes or Super Admin controls.</p>
         <dl>
           <div><dt>Access code</dt><dd>${escapeHtml(portal.accessCode)}</dd></div>
           <div><dt>Modules</dt><dd>${portal.modules.map((key) => moduleByKey(key)?.label || key).join(", ")}</dd></div>
@@ -10145,8 +10419,8 @@ function renderTeamForm() {
   `;
 }
 
-function renderTaskForm() {
-  const teamMembers = assignableTeamMembers();
+function renderTaskForm(teamMemberOptions = null) {
+  const teamMembers = Array.isArray(teamMemberOptions) ? teamMemberOptions : assignableTeamMembers();
   const taskModules = taskAssignableModules();
   return `
     <form class="stack-form inline-section" data-form="task">
@@ -10177,6 +10451,10 @@ function renderTeamMemberCard(member) {
       || (member.name && String(task.assigneeName || "").toLowerCase() === String(member.name).toLowerCase());
   });
   const assignedJobs = [...new Set([...normalizeListValue(member.assignedJobIds), ...assignedTasks.map((task) => task.relatedJob).filter(Boolean)])];
+  const ticketSignoffs = (state.ticketSignoffs || []).filter((signoff) => {
+    return signoff.employeeUid === member.id
+      || (member.email && String(signoff.employeeEmail || "").toLowerCase() === String(member.email).toLowerCase());
+  });
   const visibleModules = visibleModuleKeysForMember(member)
     .map((key) => moduleByKey(key)?.label || key)
     .filter(Boolean);
@@ -10196,6 +10474,7 @@ function renderTeamMemberCard(member) {
         ? `Local portal code: ${escapeHtml(employeeAccessCodeFor(member))}`
         : "Portal access: Google invite plus individual code"}</small>
       <small>${assignedTasks.length} assigned task${assignedTasks.length === 1 ? "" : "s"}${assignedJobs.length ? ` | Jobs: ${escapeHtml(assignedJobs.join(", "))}` : ""}</small>
+      <small>${ticketSignoffs.length} GPS ticket sign-off${ticketSignoffs.length === 1 ? "" : "s"}${ticketSignoffs[0] ? ` | Last ${escapeHtml(formatTime(ticketSignoffs[0].signedAt))}` : ""}</small>
       <small>Modules: ${escapeHtml(visibleModules.join(", ") || "No modules assigned")}</small>
       ${member.companyId ? `<small>Company: ${escapeHtml(member.companyId)}${member.franchiseIds?.length ? ` | Franchise: ${escapeHtml(member.franchiseIds.join(", "))}` : ""}</small>` : ""}
       ${cardActions ? `<div class="card-actions">${cardActions}</div>` : ""}
@@ -10519,9 +10798,58 @@ function renderEquipmentDeploymentCard(deployment) {
   `;
 }
 
+function renderTicketSignoffFeed(signoffs = state.ticketSignoffs || []) {
+  if (!signoffs.length) {
+    return `<div class="empty-state"><strong>No signed tickets yet</strong><span>GPS-backed employee sign-offs will appear here for the assigned employer.</span></div>`;
+  }
+  return `
+    <div class="activity-list ticket-signoff-feed">
+      ${signoffs.slice(0, 12).map((signoff) => `
+        <div>
+          <strong>${escapeHtml(signoff.taskTitle || signoff.taskId || "Work ticket")}</strong>
+          <span>${escapeHtml(signoff.employeeName || signoff.employeeEmail || "Employee")} | ${escapeHtml(signoff.jobId || "No job")} | ${escapeHtml(formatTime(signoff.signedAt))}</span>
+          <small>${escapeHtml(signoff.gps?.label || "GPS recorded")} | Signature: ${escapeHtml(signoff.typedSignature || "Recorded")}</small>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderEmployeeTicketPanel(taskOptions = []) {
+  const openTasks = taskOptions.filter((task) => task.status !== "Complete");
+  const worker = currentWorkerProfile();
+  return `
+    <section class="team-layout employee-ticket-layout">
+      <div class="panel">
+        <div class="panel-head"><div><h2>Employee profile</h2><p>This account is attached to ${escapeHtml(worker.employerEmail || worker.employerContractorId || "the inviting contractor")}.</p></div></div>
+        <form class="stack-form" data-form="employee-profile">
+          <label><span>Google account</span><input value="${escapeHtml(worker.email || state.authSession?.email || "")}" readonly /></label>
+          <div class="form-grid">
+            <label><span>Job title</span><input name="jobTitle" value="${escapeHtml(worker.jobTitle || "")}" placeholder="Technician, crew lead, estimator" /></label>
+            <label><span>Phone</span><input name="phone" type="tel" value="${escapeHtml(currentSessionUser()?.phone || "")}" placeholder="Mobile number" /></label>
+          </div>
+          <button type="submit">Save employee profile</button>
+        </form>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><div><h2>Sign off assigned ticket</h2><p>Your verified identity, employer, timestamp, and precise GPS position are stored with the completed task.</p></div></div>
+        ${openTasks.length ? `
+          <form class="stack-form" data-form="ticket-signoff">
+            <label><span>Assigned ticket</span><select name="taskId" required>${openTasks.map((task) => `<option value="${escapeHtml(task.id)}">${escapeHtml(task.title)}${task.relatedJob ? ` - ${escapeHtml(task.relatedJob)}` : ""}</option>`).join("")}</select></label>
+            <label><span>Type your full name</span><input name="typedSignature" required value="${escapeHtml(currentUserName())}" autocomplete="name" /></label>
+            <label class="source-check"><input name="attested" type="checkbox" required /><span><strong>I confirm this ticket is accurate and complete</strong><small>Submitting records your Google identity, employer profile, time, and GPS position.</small></span></label>
+            <button type="submit">Sign ticket with GPS</button>
+          </form>
+        ` : `<div class="empty-state"><strong>No open assigned tickets</strong><span>Your employer can assign another ticket from the contractor or team portal.</span></div>`}
+      </div>
+    </section>
+  `;
+}
+
 function renderTimeModule(module) {
   const timeEntries = visibleTimeEntries();
   const taskOptions = visibleTasks();
+  const authenticatedWorker = currentRoleId() === "worker";
   return `
     <section class="hero-band time-hero">
       <div>
@@ -10531,7 +10859,7 @@ function renderTimeModule(module) {
       <div class="metric-strip">
         <div><strong>${timeEntries.length}</strong><span>Entries</span></div>
         <div><strong>${state.clockSession ? "On" : "Off"}</strong><span>Clock</span></div>
-        <div><strong>${state.employeeMode ? "Worker" : "Owner"}</strong><span>Access</span></div>
+        <div><strong>${state.ticketSignoffs.length}</strong><span>Signed tickets</span></div>
       </div>
     </section>
     <section class="time-layout">
@@ -10541,7 +10869,7 @@ function renderTimeModule(module) {
             <h2>GPS time clock</h2>
             <p>Workers can use employee-only access for GPS time, dry logs, job reference, photos, notes, equipment, and the communication board without opening owner/admin software.</p>
           </div>
-          ${state.employeeMode ? `<button type="button" data-action="employee-logout">Owner view</button>` : `<button type="button" data-action="open-employee-login">Worker login</button>`}
+          ${authenticatedWorker ? `<button type="button" data-action="employee-logout">Sign out</button>` : `<button type="button" data-action="open-employee-login">Worker preview</button>`}
         </div>
         ${state.clockSession ? renderClockSession() : renderClockInForm(taskOptions)}
       </div>
@@ -10553,6 +10881,12 @@ function renderTimeModule(module) {
         ${renderTimeEntries(timeEntries)}
       </div>
     </section>
+    ${authenticatedWorker ? renderEmployeeTicketPanel(taskOptions) : `
+      <section class="panel">
+        <div class="panel-head"><div><h2>Employee ticket sign-offs</h2><p>Employer-visible task completion records with verified worker identity and GPS evidence.</p></div></div>
+        ${renderTicketSignoffFeed()}
+      </section>
+    `}
     ${renderQueue(module.key)}
     ${renderModuleFiles(module)}
     ${renderFileDetail(module)}
@@ -11281,6 +11615,12 @@ document.addEventListener("click", (event) => {
   }
   if (action === "clock-out") return clockOut();
   if (action === "employee-logout") {
+    if (state.authSession?.roleId === "worker") {
+      return signOutFirebaseAuth().catch((error) => {
+        setToast(error.message || "Unable to sign out");
+        render();
+      });
+    }
     state.employeeMode = false;
     state.worker = null;
     state.activeKey = "daily";
@@ -11365,7 +11705,10 @@ document.addEventListener("submit", (event) => {
     });
   }
   if (type === "task") {
-    addTask(formData);
+    return addTask(formData).catch((error) => {
+      setToast(error.message || "Unable to assign task");
+      render();
+    });
   }
   if (type === "sketch-room") {
     addSketchRoom(formData);
@@ -11403,6 +11746,24 @@ document.addEventListener("submit", (event) => {
   if (type === "access-grant") {
     return createAccessGrant(formData).catch((error) => {
       setToast(error.message || "Unable to issue access grant");
+      render();
+    });
+  }
+  if (type === "employee-invitation") {
+    return createEmployeeInvitation(formData).catch((error) => {
+      setToast(error.message || "Unable to send employee invitation");
+      render();
+    });
+  }
+  if (type === "employee-profile") {
+    return saveEmployeeProfile(formData).catch((error) => {
+      setToast(error.message || "Unable to save employee profile");
+      render();
+    });
+  }
+  if (type === "ticket-signoff") {
+    return submitTicketSignoff(formData).catch((error) => {
+      setToast(error.message || "Unable to sign off ticket");
       render();
     });
   }
