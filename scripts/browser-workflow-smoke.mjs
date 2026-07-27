@@ -469,8 +469,10 @@ async function runWorkflow(page) {
   await fill(page, 'form[data-form="employee-login"] input[name="code"]', ids.accessCode);
   await click(page, 'form[data-form="employee-login"] button[type="submit"]');
   await expectBody(page, "employee portal opened", "Field worker portal");
-  await page.goto(moduleUrl("globalindexes"), { waitUntil: "domcontentloaded" });
-  await page.waitForSelector(".app-shell", { timeout: 8000 });
+  await page.evaluate(() => {
+    window.location.hash = "module/globalindexes";
+  });
+  await page.waitForTimeout(200);
   const employeeGlobalView = await page.locator("h1").textContent();
   if (/Global Indexes/i.test(employeeGlobalView || "")) {
     throw new Error("Employee portal can open global indexes");
@@ -954,7 +956,16 @@ async function testEmployeePortal(browser) {
     return json(404, { success: false, message: `Employee smoke route not configured: ${method} ${url.pathname}` });
   });
 
-  await page.goto(`${baseUrl}/?employee-smoke=${Date.now()}#module/time`, { waitUntil: "domcontentloaded" });
+  const employeeSmokeUrl = `${baseUrl}/?employee-smoke=${Date.now()}`;
+  await page.goto(`${employeeSmokeUrl}#module/globalindexes`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".app-shell");
+  const secureEmployeeGlobalView = await page.locator("h1").textContent();
+  if (/Global Indexes/i.test(secureEmployeeGlobalView || "")) {
+    throw new Error("Authenticated worker can open global indexes after a hard reload");
+  }
+  await page.evaluate(() => {
+    window.location.hash = "module/time";
+  });
   await page.waitForSelector('form[data-form="employee-profile"]');
   actionCoverage.formsRendered.add("employee-profile");
   actionCoverage.formsRendered.add("ticket-signoff");
