@@ -20,6 +20,8 @@ const ids = {
   priceCode: `AI-LAB-${stamp}`,
   priceName: `AI labor line ${stamp}`,
   paymentCustomer: `AI Payment Customer ${stamp}`,
+  sketchRoom: `AI Office ${stamp}`,
+  sketchSeparateRoom: `AI Utility ${stamp}`,
   dryRoom: `Kitchen ${stamp}`,
   photoRef: `IMG-AI-${stamp}.jpg`,
   equipmentName: `AI Dehumidifier ${stamp}`,
@@ -332,6 +334,82 @@ async function runWorkflow(page) {
   await click(page, 'form[data-form="job-record"] button[type="submit"]');
   await expectBody(page, "job created", ids.jobId);
 
+  await go(page, "sketch");
+  const initialSketchRooms = await page.locator(".sketch-room-shape").count();
+  const initialSketchWalls = await page.locator(".sketch-wall-shape").count();
+  const initialSharedWalls = await page.locator(".sketch-wall-shape.shared").count();
+  await click(page, '[data-action="select-sketch-wall"][data-id="WALL-1003"]');
+  if (!await page.locator('form[data-form="sketch-connected-room"] button[type="submit"]').isDisabled()) {
+    throw new Error("Sketch editor allows a third room on an occupied shared boundary");
+  }
+  await expectBody(page, "occupied sketch boundary blocked", "Boundary occupied");
+  await click(page, '[data-action="select-sketch-wall"][data-id="WALL-1001"]');
+  await fill(page, 'form[data-form="sketch-wall-edit"] input[name="length"]', "22.25");
+  await click(page, 'form[data-form="sketch-wall-edit"] button[type="submit"]');
+  await expectBody(page, "exact sketch wall length saved", "22.25 ft");
+  await click(page, 'button[data-action="undo-sketch"]');
+  const restoredWallLength = await page.locator('form[data-form="sketch-wall-edit"] input[name="length"]').inputValue();
+  if (restoredWallLength !== "22") throw new Error(`Sketch undo restored ${restoredWallLength} ft instead of 22 ft`);
+
+  await fill(page, 'form[data-form="sketch-connected-room"] input[name="name"]', ids.sketchRoom);
+  await fill(page, 'form[data-form="sketch-connected-room"] input[name="depth"]', "8");
+  await fill(page, 'form[data-form="sketch-connected-room"] input[name="assignedJob"]', ids.jobId);
+  await fill(page, 'form[data-form="sketch-connected-room"] textarea[name="notes"]', "Automated connected-room verification");
+  await click(page, 'form[data-form="sketch-connected-room"] button[type="submit"]');
+  await expectBody(page, "connected sketch room created", ids.sketchRoom);
+  const connectedSketchCounts = {
+    rooms: await page.locator(".sketch-room-shape").count(),
+    walls: await page.locator(".sketch-wall-shape").count(),
+    sharedWalls: await page.locator(".sketch-wall-shape.shared").count()
+  };
+  if (connectedSketchCounts.rooms !== initialSketchRooms + 1
+    || connectedSketchCounts.walls !== initialSketchWalls + 3
+    || connectedSketchCounts.sharedWalls !== initialSharedWalls + 1) {
+    throw new Error(`Connected sketch geometry mismatch: ${JSON.stringify(connectedSketchCounts)}`);
+  }
+
+  await page.locator('details:has(form[data-form="sketch-wall"])').evaluate((element) => { element.open = true; });
+  const connectedRoomChip = page.locator(".sketch-room-chip").filter({ hasText: ids.sketchRoom });
+  const connectedRoomAreaBeforeWall = (await connectedRoomChip.textContent())?.match(/([\d.]+)\s+sq ft/)?.[1];
+  const assignedWallRoomId = await page.locator('form[data-form="sketch-wall"] select[name="roomId"]').inputValue();
+  if (!assignedWallRoomId) throw new Error("Individual wall form did not retain the selected room association");
+  await fill(page, 'form[data-form="sketch-wall"] input[name="x1"]', "40");
+  await fill(page, 'form[data-form="sketch-wall"] input[name="y1"]', "40");
+  await fill(page, 'form[data-form="sketch-wall"] input[name="x2"]', "48");
+  await fill(page, 'form[data-form="sketch-wall"] input[name="y2"]', "40");
+  await fill(page, 'form[data-form="sketch-wall"] textarea[name="notes"]', "Automated standalone-wall verification");
+  await click(page, 'form[data-form="sketch-wall"] button[type="submit"]');
+  if (await page.locator(".sketch-wall-shape").count() !== connectedSketchCounts.walls + 1) {
+    throw new Error("Standalone sketch wall was not added");
+  }
+  const connectedRoomAreaAfterWall = (await page.locator(".sketch-room-chip").filter({ hasText: ids.sketchRoom }).textContent())?.match(/([\d.]+)\s+sq ft/)?.[1];
+  if (connectedRoomAreaAfterWall !== connectedRoomAreaBeforeWall) {
+    throw new Error("An assigned partition changed the room perimeter or measured area");
+  }
+  await click(page, 'button[data-action="undo-sketch"]');
+  if (await page.locator(".sketch-wall-shape").count() !== connectedSketchCounts.walls) {
+    throw new Error("Standalone sketch wall undo did not restore the plan");
+  }
+
+  await page.locator('details:has(form[data-form="sketch-room"])').evaluate((element) => { element.open = true; });
+  await fill(page, 'form[data-form="sketch-room"] input[name="name"]', ids.sketchSeparateRoom);
+  await fill(page, 'form[data-form="sketch-room"] input[name="assignedJob"]', ids.jobId);
+  await fill(page, 'form[data-form="sketch-room"] input[name="width"]', "7");
+  await fill(page, 'form[data-form="sketch-room"] input[name="height"]', "6");
+  await fill(page, 'form[data-form="sketch-room"] textarea[name="notes"]', "Automated separate-room verification");
+  await click(page, 'form[data-form="sketch-room"] button[type="submit"]');
+  await expectBody(page, "separate sketch room created", ids.sketchSeparateRoom);
+  if (await page.locator(".sketch-room-shape").count() !== connectedSketchCounts.rooms + 1
+    || await page.locator(".sketch-wall-shape").count() !== connectedSketchCounts.walls + 4) {
+    throw new Error("Separate sketch room geometry did not create four measured walls");
+  }
+  await click(page, 'button[data-action="save-sketch-file"]');
+  await expectBody(page, "connected plan saved", `${ids.jobId} measured floor plan`);
+  await go(page, "pricing");
+  await expectBody(page, "connected plan linked to pricing", `${ids.jobId} measured floor plan`);
+  await go(page, "jobs");
+  await expectBody(page, "connected plan linked to jobs", `${ids.jobId} measured floor plan`);
+
   await go(page, "team");
   await fill(page, 'form[data-form="team-member"] input[name="name"]', ids.employeeName);
   await fill(page, 'form[data-form="team-member"] input[name="email"]', ids.employeeEmail);
@@ -497,6 +575,8 @@ async function verifyDurableReload(page, localSmokeApi) {
     ids.jobId,
     ids.employeeEmail,
     ids.taskTitle,
+    ids.sketchRoom,
+    ids.sketchSeparateRoom,
     ids.priceCode,
     ids.paymentCustomer,
     ids.photoRef,
@@ -514,6 +594,10 @@ async function verifyDurableReload(page, localSmokeApi) {
   await go(page, "team");
   await expectBody(page, "reload retained employee", ids.employeeEmail);
   await expectBody(page, "reload retained task", ids.taskTitle);
+  await go(page, "sketch");
+  await expectBody(page, "reload retained connected room", ids.sketchRoom);
+  await expectBody(page, "reload retained separate room", ids.sketchSeparateRoom);
+  await expectBody(page, "reload retained connected plan", `${ids.jobId} measured floor plan`);
   await go(page, "pricing");
   await expectBody(page, "reload retained price item", ids.priceCode);
   await go(page, "payments");
@@ -827,6 +911,14 @@ async function testEmployeePortal(browser) {
     geolocation: { latitude: 42.45, longitude: -73.245 },
     permissions: ["geolocation"]
   });
+  await employeeContext.addInitScript(() => {
+    if (sessionStorage.getItem("employee-cache-seeded")) return;
+    localStorage.setItem("brothers-os-workspace-v2", JSON.stringify({
+      files: [{ id: "OWNER-ONLY-CACHED-FILE", title: "Owner-only cached revenue file", moduleKey: "payments" }],
+      jobBoards: [{ id: "OWNER-ONLY-CACHED-JOB", jobId: "J-PRIVATE", title: "Owner-only cached job" }]
+    }));
+    sessionStorage.setItem("employee-cache-seeded", "1");
+  });
   await employeeContext.grantPermissions(["geolocation"], { origin });
   const page = await employeeContext.newPage();
   page.setDefaultTimeout(15000);
@@ -959,6 +1051,14 @@ async function testEmployeePortal(browser) {
   const employeeSmokeUrl = `${baseUrl}/?employee-smoke=${Date.now()}`;
   await page.goto(`${employeeSmokeUrl}#module/globalindexes`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector(".app-shell");
+  const staleOwnerCacheRetained = await page.evaluate(() => {
+    const stored = JSON.parse(localStorage.getItem("brothers-os-workspace-v2") || "{}");
+    return (stored.files || []).some((file) => file.id === "OWNER-ONLY-CACHED-FILE")
+      || (stored.jobBoards || []).some((job) => job.id === "OWNER-ONLY-CACHED-JOB");
+  });
+  if (staleOwnerCacheRetained || (await page.locator("body").innerText()).includes("Owner-only cached")) {
+    throw new Error("Authenticated worker retained owner records from the previous browser cache");
+  }
   const secureEmployeeGlobalView = await page.locator("h1").textContent();
   if (/Global Indexes/i.test(secureEmployeeGlobalView || "")) {
     throw new Error("Authenticated worker can open global indexes after a hard reload");

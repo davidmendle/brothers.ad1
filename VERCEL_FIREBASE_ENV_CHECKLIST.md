@@ -7,6 +7,8 @@ Official setup references:
 - Firebase web app config: https://firebase.google.com/docs/web/setup
 - Firebase Admin SDK credentials: https://firebase.google.com/docs/admin/setup
 - Vercel environment variables: https://vercel.com/docs/environment-variables
+- Vercel OIDC with Google Cloud: https://vercel.com/docs/oidc/gcp
+- Google Workload Identity Federation: https://cloud.google.com/iam/docs/workload-identity-federation
 
 ## 1. Firebase web app variables
 
@@ -26,27 +28,31 @@ FIREBASE_MEASUREMENT_ID=G-6Q0QNW5P10
 
 Keep the Vercel values above explicit so the production deployment is easy to audit. If Firebase Console shows a different storage bucket, use the exact bucket shown there.
 
-## 2. Firebase admin credentials
+## 2. Keyless Firebase Admin access
 
-Use one of these two options.
-
-Recommended Vercel option:
+Create a Google Workload Identity pool and provider that trust the Vercel team issuer and production project subject. Leave the provider's optional **Allowed audiences** list empty so Google requires its canonical provider URL. Brothers OS requests that exact URL as the Vercel token audience. Grant the production subject `roles/iam.workloadIdentityUser` on the Firebase Admin service account. Then set:
 
 ```text
-FIREBASE_SERVICE_ACCOUNT_JSON=
+GCP_PROJECT_ID=brothers-restoration-website
+GCP_PROJECT_NUMBER=80592032671
+GCP_SERVICE_ACCOUNT_EMAIL=firebase-adminsdk-fbsvc@brothers-restoration-website.iam.gserviceaccount.com
+GCP_WORKLOAD_IDENTITY_POOL_ID=vercel
+GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID=vercel
 ```
 
-Paste the raw service-account JSON from Firebase Console. Keep it private. Do not commit it to GitHub.
-
-Alternate option:
+Expected provider and token audience:
 
 ```text
-FIREBASE_PROJECT_ID=brothers-restoration-website
-FIREBASE_CLIENT_EMAIL=
-FIREBASE_PRIVATE_KEY=
+https://iam.googleapis.com/projects/80592032671/locations/global/workloadIdentityPools/vercel/providers/vercel
 ```
 
-If you use `FIREBASE_PRIVATE_KEY`, keep the newline markers as `\n` when entering the value in Vercel.
+Expected production Vercel OIDC subject:
+
+```text
+owner:brothers-restoration-services:project:brothers-ad:environment:production
+```
+
+Do not create a service-account key for production. The OS still supports service-account JSON and Application Default Credentials for controlled local development, but Vercel should use short-lived OIDC credentials.
 
 ## 3. Google-only login and 48-hour sessions
 

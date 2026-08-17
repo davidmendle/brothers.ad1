@@ -59,8 +59,11 @@ Do not commit Firebase config values to GitHub. Add them in Vercel Project Setti
 - `OPENAI_IMAGE_MODEL` (defaults to `gpt-image-2`)
 - `LEAD_NOTIFICATION_FROM` (example: `Brothers.ad <leads@brothers.ad>`)
 - `LEAD_NOTIFICATION_TO` (example: `david@brothersrestoration.org`)
-- `FIREBASE_CLIENT_EMAIL`
-- `FIREBASE_PRIVATE_KEY`
+- `GCP_PROJECT_ID` (`brothers-restoration-website`)
+- `GCP_PROJECT_NUMBER` (`80592032671`)
+- `GCP_SERVICE_ACCOUNT_EMAIL`
+- `GCP_WORKLOAD_IDENTITY_POOL_ID` (`vercel`)
+- `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID` (`vercel`)
 - `CRON_SECRET`
 - `BLOG_CRON_SECRET`
 
@@ -68,6 +71,8 @@ Lead notifications from the AI audit form are sent only to `david@brothersrestor
 Use `RESEND_API_KEY` for server-side email delivery. `LEAD_NOTIFICATION_FROM` should be a verified sender in Resend, for example `Brothers.ad <leads@brothers.ad>`.
 
 Set `ADMIN_EMAILS=david@brothersrestoration.org` for the server-side blog/admin allowlist. Keep `BLOCKED_ADMIN_EMAILS=chaim@brothersrestoration.org,reznikchaim@gmail.com` so revoked accounts stay denied even if an old Firebase user or stale dashboard config exists.
+
+Production Firebase Admin access uses Vercel OIDC and Google Workload Identity Federation. Configure the Google provider before adding the five `GCP_*` variables. Do not create or store a service-account private key for the Vercel deployment.
 
 ## Blog media, AI drafts, and scheduled publishing
 

@@ -43,21 +43,19 @@ Set or confirm these production variables:
 
 ```text
 OS_BASE_URL=https://brothers.ad
-FIREBASE_SERVICE_ACCOUNT_JSON=
 FIREBASE_ALLOWED_SIGN_IN_PROVIDERS=google.com
 FIREBASE_SESSION_TTL_MS=172800000
 SUPER_ADMIN_EMAILS=david@brothersrestoration.org
 BLOCKED_ADMIN_EMAILS=chaim@brothersrestoration.org,reznikchaim@gmail.com
-```
-
-If you do not use `FIREBASE_SERVICE_ACCOUNT_JSON`, set these instead:
-
-```text
-FIREBASE_CLIENT_EMAIL=
-FIREBASE_PRIVATE_KEY=
+GCP_PROJECT_ID=brothers-restoration-website
+GCP_PROJECT_NUMBER=80592032671
+GCP_SERVICE_ACCOUNT_EMAIL=firebase-adminsdk-fbsvc@brothers-restoration-website.iam.gserviceaccount.com
+GCP_WORKLOAD_IDENTITY_POOL_ID=vercel
+GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID=vercel
 ```
 
 The Firebase web config for `brothers-restoration-website` is already wired into the app defaults.
+The five `GCP_*` values require a Google Workload Identity provider that trusts the Vercel project OIDC subject. This keyless path replaces `FIREBASE_PRIVATE_KEY` in production.
 
 Keep `ENABLE_LEGACY_PROXY`, `ENABLE_LEGACY_ADMIN_PROXY`, `ALLOW_LEGACY_ADMIN_BRIDGE`, and `ALLOW_DERIVED_ADMIN_FALLBACK` unset in production unless you are intentionally testing a temporary migration bridge.
 

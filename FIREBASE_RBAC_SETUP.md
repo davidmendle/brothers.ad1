@@ -4,14 +4,20 @@ This OS keeps the existing frontend and Express backend, then layers Firebase Au
 
 ## Required environment variables
 
-Backend Firebase Admin:
+Recommended production Firebase Admin authentication:
 
-- `FIREBASE_PROJECT_ID`
-- `FIREBASE_CLIENT_EMAIL`
-- `FIREBASE_PRIVATE_KEY`
+- `FIREBASE_PROJECT_ID=brothers-restoration-website`
+- `GCP_PROJECT_ID=brothers-restoration-website`
+- `GCP_PROJECT_NUMBER=80592032671`
+- `GCP_SERVICE_ACCOUNT_EMAIL=firebase-adminsdk-fbsvc@brothers-restoration-website.iam.gserviceaccount.com`
+- `GCP_WORKLOAD_IDENTITY_POOL_ID=vercel`
+- `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID=vercel`
 
-Alternative backend credential sources:
+The production deployment requests a Vercel OIDC token for the canonical Google provider URL, exchanges it through Google Workload Identity Federation, and impersonates the Firebase Admin service account. Keep the provider's custom allowed-audience list empty and restrict its subject condition and IAM binding to the production `brothers-ad` deployment. This flow does not require a stored private key.
 
+Local-only alternative credential sources:
+
+- `FIREBASE_CLIENT_EMAIL` plus `FIREBASE_PRIVATE_KEY`
 - `FIREBASE_SERVICE_ACCOUNT_JSON` as a file path or raw JSON string
 - `GOOGLE_APPLICATION_CREDENTIALS` when the environment already has Google ADC configured
 
@@ -69,7 +75,7 @@ Live Firebase console findings from June 18, 2026:
 - Google sign-in provider is enabled
 - Existing Auth users should be reviewed in Firebase Authentication, and any revoked users should be disabled there.
 - Firestore already contains legacy `admins`, `pages`, `settings`, and related collections, so the OS layer should preserve compatibility rather than treat Firestore as empty
-- Firebase Admin SDK credentials are still required in Vercel before the hosted OS can verify Google ID tokens and unlock protected data
+- Keyless Firebase Admin authorization through Vercel OIDC and Google Workload Identity Federation is required before the hosted OS can verify Google ID tokens and unlock protected data
 
 ## Collections
 

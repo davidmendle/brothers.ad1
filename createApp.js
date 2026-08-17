@@ -1746,6 +1746,7 @@ function createApp() {
     });
   });
 
+  app.use(express.static(path.join(rootDir, "public")));
   app.use(express.static(rootDir, { extensions: ["html"] }));
   app.use("/uploads", express.static(uploadsRoot));
 

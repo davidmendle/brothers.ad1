@@ -3542,11 +3542,17 @@ dd {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.team-layout,
-.sketch-layout {
+.team-layout {
   display: grid;
   grid-template-columns: minmax(420px, 1fr) minmax(360px, 0.85fr);
   gap: 16px;
+}
+
+.sketch-layout {
+  display: grid;
+  grid-template-columns: minmax(560px, 1.35fr) minmax(340px, 0.65fr);
+  gap: 16px;
+  align-items: start;
 }
 
 .team-card {
@@ -3579,35 +3585,322 @@ dd {
 
 .floor-plan {
   position: relative;
+  width: 100%;
   min-height: 520px;
+  aspect-ratio: 16 / 10;
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
-  background:
-    linear-gradient(90deg, rgba(104, 115, 131, 0.14) 1px, transparent 1px),
-    linear-gradient(rgba(104, 115, 131, 0.14) 1px, transparent 1px),
-    #f8fbfd;
-  background-size: 28px 28px;
+  background: #f8fafc;
 }
 
-.floor-room {
-  position: absolute;
+.sketch-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 520px;
+  touch-action: manipulation;
+}
+
+.sketch-grid {
+  fill: #f8fafc;
+}
+
+#sketch-grid-small path {
+  stroke: #dbe4eb;
+  stroke-width: 0.035;
+}
+
+#sketch-grid-large > path {
+  stroke: #aab9c6;
+  stroke-width: 0.07;
+}
+
+.sketch-room-shape {
+  cursor: pointer;
+  outline: none;
+}
+
+.sketch-room-shape polygon {
+  fill: rgba(255, 255, 255, 0.9);
+  stroke: transparent;
+  transition: fill 150ms ease, stroke 150ms ease;
+}
+
+.sketch-room-shape:hover polygon,
+.sketch-room-shape:focus polygon {
+  fill: rgba(218, 237, 246, 0.84);
+  stroke: #3583a6;
+  stroke-width: 0.12;
+}
+
+.sketch-room-shape.selected polygon {
+  fill: rgba(213, 238, 226, 0.88);
+  stroke: #0c7a5e;
+  stroke-width: 0.15;
+}
+
+.sketch-room-name,
+.sketch-room-area,
+.sketch-wall-length {
+  text-anchor: middle;
+  pointer-events: none;
+  paint-order: stroke;
+  stroke: #fff;
+  stroke-width: 0.18;
+  stroke-linejoin: round;
+  letter-spacing: 0;
+}
+
+.sketch-room-name {
+  fill: #152d3f;
+  font-size: 0.82px;
+  font-weight: 900;
+}
+
+.sketch-room-area {
+  fill: #566b79;
+  font-size: 0.62px;
+  font-weight: 800;
+}
+
+.sketch-wall-shape {
+  cursor: pointer;
+  outline: none;
+}
+
+.sketch-wall-hit {
+  stroke: transparent;
+  stroke-width: 1.4;
+}
+
+.sketch-wall-line {
+  stroke: #18394f;
+  stroke-linecap: square;
+  transition: stroke 150ms ease, filter 150ms ease;
+}
+
+.sketch-wall-shape.shared .sketch-wall-line {
+  stroke: #0c7a5e;
+}
+
+.sketch-wall-shape.load-bearing .sketch-wall-line {
+  stroke: #b42318;
+}
+
+.sketch-wall-shape.wall-demolition .sketch-wall-line {
+  stroke: #9b5c00;
+  stroke-dasharray: 0.55 0.35;
+}
+
+.sketch-wall-shape:hover .sketch-wall-line,
+.sketch-wall-shape:focus .sketch-wall-line,
+.sketch-wall-shape.selected .sketch-wall-line {
+  stroke: #d97706;
+  filter: drop-shadow(0 0 0.16px rgba(217, 119, 6, 0.48));
+}
+
+.sketch-junction {
+  fill: #fff;
+  stroke: #18394f;
+  stroke-width: 0.08;
+  pointer-events: none;
+}
+
+.sketch-wall-shape.selected .sketch-junction {
+  fill: #f59e0b;
+  stroke: #92400e;
+}
+
+.sketch-wall-length {
+  fill: #263f50;
+  font-size: 0.56px;
+  font-weight: 900;
+}
+
+.sketch-tools {
   display: grid;
-  align-content: center;
-  justify-items: center;
-  min-height: 48px;
-  padding: 8px;
-  white-space: normal;
-  text-align: center;
-  background: rgba(255, 255, 255, 0.94);
-  border: 2px solid var(--blue);
-  color: var(--ink);
-  box-shadow: 0 10px 28px rgba(16, 34, 52, 0.12);
+  gap: 12px;
 }
 
-.floor-room span {
+.sketch-tool-panel {
+  padding: 14px;
+}
+
+.inline-notice {
+  display: grid;
+  gap: 3px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid #d89b33;
+  border-radius: 6px;
+  background: #fff7e6;
+  color: #5c3a06;
+  font-size: 12px;
+}
+
+.inline-notice strong {
+  color: #342105;
+  font-size: 13px;
+}
+
+details.sketch-tool-panel > summary {
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 900;
+}
+
+details.sketch-tool-panel[open] > summary {
+  margin-bottom: 14px;
+}
+
+.selection-heading,
+.form-actions,
+.checkbox-line,
+.sketch-legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.selection-heading,
+.form-actions {
+  justify-content: space-between;
+}
+
+.selection-heading > div {
+  display: grid;
+  gap: 2px;
+}
+
+.selection-heading span,
+.sketch-wall-editor small {
   color: var(--muted);
   font-size: 12px;
+}
+
+.selection-heading h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.selection-heading > strong {
+  color: #0c7a5e;
+  font-size: 18px;
+}
+
+.checkbox-line {
+  justify-content: flex-start;
+  min-height: 36px;
+}
+
+.checkbox-line input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+}
+
+.checkbox-line span {
+  color: var(--ink);
+  font-weight: 800;
+}
+
+.form-actions {
+  flex-wrap: wrap;
+}
+
+.form-actions button {
+  flex: 1 1 130px;
+}
+
+.danger-button {
+  background: #fff;
+  border-color: #d92d20;
+  color: #b42318;
+}
+
+.sketch-legend {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.sketch-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.sketch-legend i {
+  width: 18px;
+  height: 4px;
+  border-radius: 2px;
+  background: #18394f;
+}
+
+.sketch-legend .legend-shared {
+  background: #0c7a5e;
+}
+
+.sketch-legend .legend-bearing {
+  background: #b42318;
+}
+
+.sketch-room-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.sketch-room-chip {
+  display: grid;
+  justify-items: start;
+  min-height: 54px;
+  padding: 8px 10px;
+  background: #fff;
+  border-color: var(--line);
+  color: var(--ink);
+  text-align: left;
+  white-space: normal;
+}
+
+.sketch-room-chip.selected {
+  background: #e8f6ef;
+  border-color: #0c7a5e;
+}
+
+.sketch-room-chip span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+@media (max-width: 1180px) {
+  .sketch-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sketch-tools {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .floor-plan,
+  .sketch-svg {
+    min-height: 380px;
+  }
+
+  .sketch-tools {
+    grid-template-columns: 1fr;
+  }
+
+  .sketch-legend {
+    justify-content: flex-start;
+  }
 }
 
 .ai-copilot {

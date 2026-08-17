@@ -458,8 +458,11 @@ describe("insurance intake logic", () => {
         webConfigured: true,
         projectId: "brothers-restoration-website",
         missingAdminEnv: [
-          "FIREBASE_CLIENT_EMAIL",
-          "FIREBASE_PRIVATE_KEY"
+          "GCP_PROJECT_ID",
+          "GCP_PROJECT_NUMBER",
+          "GCP_SERVICE_ACCOUNT_EMAIL",
+          "GCP_WORKLOAD_IDENTITY_POOL_ID",
+          "GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID"
         ],
         missingWebEnv: []
       },
@@ -488,7 +491,7 @@ describe("insurance intake logic", () => {
         warnings: [
           "ALLOWED_WEBSITE_ORIGIN is still using the placeholder domain.",
           "Insurance submissions are using sqlite-file storage. Configure Firebase Admin credentials or BLOB_READ_WRITE_TOKEN for durable production storage on Vercel.",
-          "Firebase auth/RBAC is not fully configured. Missing admin env: FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY. Missing web env: none."
+          "Firebase auth/RBAC is not fully configured. Missing admin env: GCP_PROJECT_ID, GCP_PROJECT_NUMBER, GCP_SERVICE_ACCOUNT_EMAIL, GCP_WORKLOAD_IDENTITY_POOL_ID, GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID. Missing web env: none."
         ]
       }
     });
@@ -1309,6 +1312,167 @@ describe("insurance intake logic", () => {
     expect(workerResponse.body.workspaceState.photoRecords.map((photo) => photo.id)).toEqual(["photo-assigned"]);
     expect(workerResponse.body.workspaceState.contractorBills).toBeUndefined();
     expect(workerResponse.body.workspaceState.estimateDraft).toBeUndefined();
+  });
+
+  it("persists measured walls and fails closed across franchise workspace scopes", async () => {
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "owner-uid": {
+          email: "david@brothersrestoration.org",
+          displayName: "David",
+          roleId: "super_admin",
+          companyId: "default-company",
+          franchiseIds: ["franchise-a", "franchise-b"],
+          status: "active",
+          disabled: false
+        },
+        "franchise-a-uid": {
+          email: "owner-a@example.com",
+          displayName: "Franchise A",
+          roleId: "franchise_owner",
+          companyId: "default-company",
+          franchiseIds: ["franchise-a"],
+          status: "active",
+          disabled: false
+        },
+        "franchise-b-uid": {
+          email: "owner-b@example.com",
+          displayName: "Franchise B",
+          roleId: "franchise_owner",
+          companyId: "default-company",
+          franchiseIds: ["franchise-b"],
+          status: "active",
+          disabled: false
+        },
+        "multi-franchise-uid": {
+          email: "multi@example.com",
+          displayName: "Multi Franchise",
+          roleId: "franchise_owner",
+          companyId: "default-company",
+          franchiseIds: ["franchise-a", "franchise-b"],
+          status: "active",
+          disabled: false
+        }
+      }
+    });
+    const users = {
+      "owner-uid": { uid: "owner-uid", email: "david@brothersrestoration.org", displayName: "David", disabled: false },
+      "franchise-a-uid": { uid: "franchise-a-uid", email: "owner-a@example.com", displayName: "Franchise A", disabled: false },
+      "franchise-b-uid": { uid: "franchise-b-uid", email: "owner-b@example.com", displayName: "Franchise B", disabled: false },
+      "multi-franchise-uid": { uid: "multi-franchise-uid", email: "multi@example.com", displayName: "Multi Franchise", disabled: false }
+    };
+    const identities = {
+      "owner-cookie": freshGoogleIdentity(),
+      "franchise-a-cookie": freshGoogleIdentity({ uid: "franchise-a-uid", email: "owner-a@example.com", name: "Franchise A" }),
+      "franchise-b-cookie": freshGoogleIdentity({ uid: "franchise-b-uid", email: "owner-b@example.com", name: "Franchise B" }),
+      "multi-franchise-cookie": freshGoogleIdentity({ uid: "multi-franchise-uid", email: "multi@example.com", name: "Multi Franchise" })
+    };
+    const app = express();
+    app.use(express.json({ limit: "5mb" }));
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async (cookie) => identities[cookie],
+          getUser: async (uid) => users[uid],
+          setCustomUserClaims: async () => undefined
+        };
+      },
+      getFirebasePublicConfig: () => ({ enabled: true, adminConfigured: true, webConfigured: true }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const seedResponse = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=owner-cookie"])
+      .send({
+        workspaceState: {
+          sketchRooms: [
+            { id: "legacy-unscoped-room", name: "Legacy Room" },
+            { id: "room-a", name: "Room A", franchiseId: "franchise-a" },
+            { id: "room-b", name: "Room B", franchiseId: "franchise-b" }
+          ],
+          sketchWalls: [
+            { id: "predictable-wall-id", franchiseId: "franchise-a", start: { x: 0, y: 0 }, end: { x: 8, y: 0 }, notes: "Franchise A original" },
+            { id: "predictable-wall-id", franchiseId: "franchise-b", start: { x: 0, y: 0 }, end: { x: 10, y: 0 }, notes: "Franchise B original" }
+          ]
+        }
+      });
+
+    expect(seedResponse.status).toBe(200);
+    expect(seedResponse.body.savedRecords).toBe(5);
+
+    const franchiseAResponse = await request(app)
+      .get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=franchise-a-cookie"]);
+    expect(franchiseAResponse.status).toBe(200);
+    expect(franchiseAResponse.body.workspaceState.sketchRooms.map((room) => room.id)).toEqual(["room-a"]);
+    expect(franchiseAResponse.body.workspaceState.sketchWalls.map((wall) => wall.id)).toEqual(["predictable-wall-id"]);
+
+    const franchiseBResponse = await request(app)
+      .get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=franchise-b-cookie"]);
+    expect(franchiseBResponse.status).toBe(200);
+    expect(franchiseBResponse.body.workspaceState.sketchRooms.map((room) => room.id)).toEqual(["room-b"]);
+    expect(franchiseBResponse.body.workspaceState.sketchWalls.map((wall) => wall.id)).toEqual(["predictable-wall-id"]);
+
+    const collisionAttemptResponse = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=franchise-a-cookie"])
+      .send({
+        workspaceState: {
+          sketchWalls: [{
+            id: "predictable-wall-id",
+            franchiseId: "franchise-a",
+            start: { x: 0, y: 0 },
+            end: { x: 12, y: 0 },
+            notes: "Franchise A updated"
+          }]
+        }
+      });
+    expect(collisionAttemptResponse.status).toBe(200);
+    expect(collisionAttemptResponse.body).toMatchObject({ savedRecords: 1, ignoredRecords: 0 });
+    const franchiseBAfterCollision = await request(app)
+      .get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=franchise-b-cookie"]);
+    expect(franchiseBAfterCollision.body.workspaceState.sketchWalls).toEqual([
+      expect.objectContaining({ id: "predictable-wall-id", notes: "Franchise B original", end: { x: 10, y: 0 } })
+    ]);
+
+    const autoScopeResponse = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=franchise-a-cookie"])
+      .send({
+        workspaceState: {
+          sketchWalls: [{ id: "wall-a-new", start: { x: 8, y: 0 }, end: { x: 8, y: 6 } }]
+        }
+      });
+    expect(autoScopeResponse.status).toBe(200);
+    expect(autoScopeResponse.body).toMatchObject({ savedRecords: 1, ignoredRecords: 0 });
+    const storedAutoScopedWall = Object.values(fakeDb.dump("osWorkspaceRecords"))
+      .find((record) => record.field === "sketchWalls" && record.data?.id === "wall-a-new");
+    expect(storedAutoScopedWall.data.franchiseId).toBe("franchise-a");
+
+    const ambiguousScopeResponse = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=multi-franchise-cookie"])
+      .send({ workspaceState: { sketchWalls: [{ id: "wall-ambiguous" }] } });
+    expect(ambiguousScopeResponse.status).toBe(200);
+    expect(ambiguousScopeResponse.body).toMatchObject({ savedRecords: 0, ignoredRecords: 1 });
+    const franchiseBAfterRejectedWrite = await request(app)
+      .get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=franchise-b-cookie"]);
+    expect(franchiseBAfterRejectedWrite.body.workspaceState.sketchWalls).toEqual([
+      expect.objectContaining({ id: "predictable-wall-id", notes: "Franchise B original" })
+    ]);
   });
 
   it("blocks franchise owners from escalating managed users into higher roles", async () => {

@@ -14,7 +14,7 @@ const remoteWorkspaceFields = [
   "files", "queue", "activity", "standardsOutputs", "learnedJargon",
   "equipmentDeployments", "dryLogs", "jobBoards", "contacts", "branches",
   "priceItems", "xactimateImports", "estimateDraft", "quickBooksConnection",
-  "accountProfile", "teamMembers", "tasks", "photoRecords", "contractorBills", "sketchRooms",
+  "accountProfile", "teamMembers", "tasks", "photoRecords", "contractorBills", "sketchRooms", "sketchWalls",
   "performanceMetrics", "actionDashboard", "skillPacks", "dataVaults",
   "institutionalReview", "serviceSettings", "serviceRequests",
   "calloutSchedule", "industryProfile", "aiCopilotProfile", "aiCopilotMemory",
@@ -819,12 +819,15 @@ const defaultSketchRooms = [
     id: "ROOM-1001",
     name: "Living room",
     assignedJob: "J-2039",
+    branchId: "BR-1001",
     width: 22,
     height: 16,
     x: 8,
     y: 12,
     w: 34,
     h: 28,
+    points: [{ x: 4, y: 4 }, { x: 26, y: 4 }, { x: 26, y: 20 }, { x: 4, y: 20 }],
+    wallIds: ["WALL-1001", "WALL-1002", "WALL-1003", "WALL-1004", "WALL-1005", "WALL-1006"],
     notes: "Affected flooring, two air movers, one LGR dehumidifier.",
     scribble: "living rm 22x16 affected floor equip near window"
   },
@@ -832,15 +835,30 @@ const defaultSketchRooms = [
     id: "ROOM-1002",
     name: "Hall",
     assignedJob: "J-2039",
+    branchId: "BR-1001",
     width: 12,
     height: 5,
     x: 44,
     y: 24,
     w: 18,
     h: 12,
+    points: [{ x: 26, y: 9.5 }, { x: 38, y: 9.5 }, { x: 38, y: 14.5 }, { x: 26, y: 14.5 }],
+    wallIds: ["WALL-1003", "WALL-1007", "WALL-1008", "WALL-1009"],
     notes: "Moisture point at transition.",
     scribble: "hall 12x5 moisture transition"
   }
+];
+
+const defaultSketchWalls = [
+  { id: "WALL-1001", branchId: "BR-1001", start: { x: 4, y: 4 }, end: { x: 26, y: 4 }, roomIds: ["ROOM-1001"], type: "exterior", thickness: 6, height: 8, loadBearing: false, notes: "" },
+  { id: "WALL-1002", branchId: "BR-1001", start: { x: 26, y: 4 }, end: { x: 26, y: 9.5 }, roomIds: ["ROOM-1001"], type: "exterior", thickness: 6, height: 8, loadBearing: false, notes: "" },
+  { id: "WALL-1003", branchId: "BR-1001", start: { x: 26, y: 9.5 }, end: { x: 26, y: 14.5 }, roomIds: ["ROOM-1001", "ROOM-1002"], type: "interior", thickness: 4, height: 8, loadBearing: false, notes: "Shared living room and hall wall." },
+  { id: "WALL-1004", branchId: "BR-1001", start: { x: 26, y: 14.5 }, end: { x: 26, y: 20 }, roomIds: ["ROOM-1001"], type: "exterior", thickness: 6, height: 8, loadBearing: false, notes: "" },
+  { id: "WALL-1005", branchId: "BR-1001", start: { x: 26, y: 20 }, end: { x: 4, y: 20 }, roomIds: ["ROOM-1001"], type: "exterior", thickness: 6, height: 8, loadBearing: false, notes: "" },
+  { id: "WALL-1006", branchId: "BR-1001", start: { x: 4, y: 20 }, end: { x: 4, y: 4 }, roomIds: ["ROOM-1001"], type: "exterior", thickness: 6, height: 8, loadBearing: false, notes: "" },
+  { id: "WALL-1007", branchId: "BR-1001", start: { x: 26, y: 9.5 }, end: { x: 38, y: 9.5 }, roomIds: ["ROOM-1002"], type: "exterior", thickness: 6, height: 8, loadBearing: false, notes: "" },
+  { id: "WALL-1008", branchId: "BR-1001", start: { x: 38, y: 9.5 }, end: { x: 38, y: 14.5 }, roomIds: ["ROOM-1002"], type: "exterior", thickness: 6, height: 8, loadBearing: false, notes: "" },
+  { id: "WALL-1009", branchId: "BR-1001", start: { x: 38, y: 14.5 }, end: { x: 26, y: 14.5 }, roomIds: ["ROOM-1002"], type: "exterior", thickness: 6, height: 8, loadBearing: false, notes: "" }
 ];
 
 const defaultPerformanceMetrics = {
@@ -1008,6 +1026,9 @@ const defaultState = {
   photoRecords: defaultPhotoRecords,
   contractorBills: [],
   sketchRooms: defaultSketchRooms,
+  sketchWalls: defaultSketchWalls,
+  selectedSketchRoomId: "ROOM-1001",
+  selectedSketchWallId: "WALL-1001",
   performanceMetrics: defaultPerformanceMetrics,
   actionDashboard: defaultActionDashboard,
   skillPacks: defaultSkillPacks,
@@ -1073,6 +1094,7 @@ const defaultState = {
 };
 
 let state = loadState();
+let sketchUndoStack = [];
 state.activeKey = getRouteKey() || state.activeKey || "daily";
 applyHighestPricingPolicy();
 
@@ -1231,21 +1253,28 @@ function loadState() {
   }
 }
 
-function normalizeState(next) {
-  next.files = Array.isArray(next.files) ? mergeDefaultsById(next.files, defaultFiles) : clone(defaultFiles);
+function normalizeState(next, { includeDefaults = true } = {}) {
+  const mergedArray = (value, defaults) => Array.isArray(value)
+    ? (includeDefaults ? mergeDefaultsById(value, defaults) : value)
+    : (includeDefaults ? clone(defaults) : []);
+  const plainArray = (value, defaults) => Array.isArray(value)
+    ? value
+    : (includeDefaults ? clone(defaults) : []);
+
+  next.files = mergedArray(next.files, defaultFiles);
   next.files = next.files.map(normalizeFileRecord);
-  next.queue = Array.isArray(next.queue) ? next.queue : clone(defaultQueue);
-  next.activity = Array.isArray(next.activity) ? next.activity : clone(defaultActivity);
-  next.standardsOutputs = Array.isArray(next.standardsOutputs) ? next.standardsOutputs : clone(defaultStandardsOutputs);
-  next.learnedJargon = Array.isArray(next.learnedJargon) ? mergeDefaultsById(next.learnedJargon, defaultJargonTerms) : clone(defaultJargonTerms);
-  next.equipmentDeployments = Array.isArray(next.equipmentDeployments) ? mergeDefaultsById(next.equipmentDeployments, defaultEquipmentDeployments) : clone(defaultEquipmentDeployments);
-  next.dryLogs = Array.isArray(next.dryLogs) ? mergeDefaultsById(next.dryLogs, defaultDryLogs) : clone(defaultDryLogs);
-  next.jobBoards = Array.isArray(next.jobBoards) ? mergeDefaultsById(next.jobBoards, defaultJobBoards) : clone(defaultJobBoards);
+  next.queue = plainArray(next.queue, defaultQueue);
+  next.activity = plainArray(next.activity, defaultActivity);
+  next.standardsOutputs = plainArray(next.standardsOutputs, defaultStandardsOutputs);
+  next.learnedJargon = mergedArray(next.learnedJargon, defaultJargonTerms);
+  next.equipmentDeployments = mergedArray(next.equipmentDeployments, defaultEquipmentDeployments);
+  next.dryLogs = mergedArray(next.dryLogs, defaultDryLogs);
+  next.jobBoards = mergedArray(next.jobBoards, defaultJobBoards);
   next.jobBoards = next.jobBoards.map(normalizeJobRecord);
-  next.contacts = Array.isArray(next.contacts) ? mergeDefaultsById(next.contacts, defaultContacts) : clone(defaultContacts);
-  next.branches = Array.isArray(next.branches) ? mergeDefaultsById(next.branches, defaultBranches) : clone(defaultBranches);
-  next.priceItems = Array.isArray(next.priceItems) ? mergeDefaultsById(next.priceItems, defaultPriceItems) : clone(defaultPriceItems);
-  next.xactimateImports = Array.isArray(next.xactimateImports) ? mergeDefaultsById(next.xactimateImports, defaultXactimateImports) : clone(defaultXactimateImports);
+  next.contacts = mergedArray(next.contacts, defaultContacts);
+  next.branches = mergedArray(next.branches, defaultBranches);
+  next.priceItems = mergedArray(next.priceItems, defaultPriceItems);
+  next.xactimateImports = mergedArray(next.xactimateImports, defaultXactimateImports);
   next.estimateDraft =
     next.estimateDraft && typeof next.estimateDraft === "object"
       ? { ...clone(defaultEstimateDraft), ...next.estimateDraft, lines: Array.isArray(next.estimateDraft.lines) ? next.estimateDraft.lines : clone(defaultEstimateDraft.lines) }
@@ -1256,13 +1285,21 @@ function normalizeState(next) {
     next.accountProfile && typeof next.accountProfile === "object" ? { ...clone(defaultAccountProfile), ...next.accountProfile } : clone(defaultAccountProfile);
   next.accountProfile.adminAccount = { ...clone(defaultAccountProfile.adminAccount), ...(next.accountProfile.adminAccount || {}) };
   next.accountProfile.employeePortal = { ...clone(defaultAccountProfile.employeePortal), ...(next.accountProfile.employeePortal || {}) };
-  next.teamMembers = Array.isArray(next.teamMembers) ? mergeDefaultsById(next.teamMembers, defaultTeamMembers) : clone(defaultTeamMembers);
+  next.teamMembers = mergedArray(next.teamMembers, defaultTeamMembers);
   next.teamMembers = next.teamMembers.map(normalizeTeamMember);
-  next.tasks = Array.isArray(next.tasks) ? mergeDefaultsById(next.tasks, defaultTasks) : clone(defaultTasks);
+  next.tasks = mergedArray(next.tasks, defaultTasks);
   next.tasks = next.tasks.map((task) => normalizeTaskRecord(task, next.teamMembers));
-  next.photoRecords = Array.isArray(next.photoRecords) ? mergeDefaultsById(next.photoRecords, defaultPhotoRecords) : clone(defaultPhotoRecords);
+  next.photoRecords = mergedArray(next.photoRecords, defaultPhotoRecords);
   next.contractorBills = Array.isArray(next.contractorBills) ? next.contractorBills : [];
-  next.sketchRooms = Array.isArray(next.sketchRooms) ? mergeDefaultsById(next.sketchRooms, defaultSketchRooms) : clone(defaultSketchRooms);
+  const sketchWorkspace = normalizeSketchWorkspace(next.sketchRooms, next.sketchWalls, { includeDefaults });
+  next.sketchRooms = sketchWorkspace.rooms;
+  next.sketchWalls = sketchWorkspace.walls;
+  next.selectedSketchRoomId = next.sketchRooms.some((room) => room.id === next.selectedSketchRoomId)
+    ? next.selectedSketchRoomId
+    : next.sketchRooms[0]?.id || "";
+  next.selectedSketchWallId = next.sketchWalls.some((wall) => wall.id === next.selectedSketchWallId)
+    ? next.selectedSketchWallId
+    : next.sketchWalls[0]?.id || "";
   next.performanceMetrics =
     next.performanceMetrics && typeof next.performanceMetrics === "object" ? { ...clone(defaultPerformanceMetrics), ...next.performanceMetrics } : clone(defaultPerformanceMetrics);
   next.actionDashboard =
@@ -1271,14 +1308,14 @@ function normalizeState(next) {
     ? next.actionDashboard.selectedKeys.filter((key) => moduleByKey(key))
     : clone(defaultActionDashboard.selectedKeys);
   if (!next.actionDashboard.selectedKeys.length) next.actionDashboard.selectedKeys = clone(defaultActionDashboard.selectedKeys);
-  next.skillPacks = Array.isArray(next.skillPacks) ? mergeDefaultsById(next.skillPacks, defaultSkillPacks) : clone(defaultSkillPacks);
-  next.dataVaults = Array.isArray(next.dataVaults) ? mergeDefaultsById(next.dataVaults, defaultDataVaults) : clone(defaultDataVaults);
+  next.skillPacks = mergedArray(next.skillPacks, defaultSkillPacks);
+  next.dataVaults = mergedArray(next.dataVaults, defaultDataVaults);
   next.institutionalReview =
     next.institutionalReview && typeof next.institutionalReview === "object" ? { ...clone(defaultInstitutionalReview), ...next.institutionalReview } : clone(defaultInstitutionalReview);
   next.serviceSettings =
     next.serviceSettings && typeof next.serviceSettings === "object" ? { ...clone(defaultServiceSettings), ...next.serviceSettings } : clone(defaultServiceSettings);
-  next.serviceRequests = Array.isArray(next.serviceRequests) ? next.serviceRequests : clone(defaultServiceRequests);
-  next.calloutSchedule = Array.isArray(next.calloutSchedule) ? next.calloutSchedule : clone(defaultCalloutSchedule);
+  next.serviceRequests = plainArray(next.serviceRequests, defaultServiceRequests);
+  next.calloutSchedule = plainArray(next.calloutSchedule, defaultCalloutSchedule);
   next.insuranceSubmissions = Array.isArray(next.insuranceSubmissions) ? next.insuranceSubmissions : [];
   next.insuranceFilters =
     next.insuranceFilters && typeof next.insuranceFilters === "object"
@@ -1300,7 +1337,7 @@ function normalizeState(next) {
   next.aiCopilotMemory = Array.isArray(next.aiCopilotMemory) ? next.aiCopilotMemory : [];
   next.aiCopilotOpen = next.aiCopilotOpen === true;
   next.aiCopilotQuery = next.aiCopilotQuery || "";
-  next.aiCopilotMessages = Array.isArray(next.aiCopilotMessages) ? mergeDefaultsById(next.aiCopilotMessages, defaultAiCopilotMessages) : clone(defaultAiCopilotMessages);
+  next.aiCopilotMessages = mergedArray(next.aiCopilotMessages, defaultAiCopilotMessages);
   next.firebase = { enabled: false, ready: false };
   next.workspacePersistence = clone(defaultState.workspacePersistence);
   next.authSession = null;
@@ -1354,6 +1391,9 @@ function buildPersistedState() {
     photoRecords: state.photoRecords,
     contractorBills: state.contractorBills,
     sketchRooms: state.sketchRooms,
+    sketchWalls: state.sketchWalls,
+    selectedSketchRoomId: state.selectedSketchRoomId,
+    selectedSketchWallId: state.selectedSketchWallId,
     performanceMetrics: state.performanceMetrics,
     actionDashboard: state.actionDashboard,
     skillPacks: state.skillPacks,
@@ -1476,12 +1516,20 @@ async function syncWorkspaceState({ force = false } = {}) {
   return workspaceSyncPromise;
 }
 
+function replaceWorkspaceStateFromServer(workspaceState = {}) {
+  const nextState = { ...state };
+  remoteWorkspaceFields.forEach((field) => {
+    delete nextState[field];
+  });
+  return normalizeState({ ...nextState, ...workspaceState }, { includeDefaults: false });
+}
+
 async function hydrateWorkspaceState({ migrateIfEmpty = true } = {}) {
   if (!state.authSession || !state.firebase?.adminConfigured) {
     state.workspacePersistence = {
       ...clone(defaultState.workspacePersistence),
       loaded: true,
-      error: state.firebase?.adminConfigured ? "" : "Firebase Admin credentials are required for durable shared records."
+      error: state.firebase?.adminConfigured ? "" : "Keyless Firebase Admin access is required for durable shared records."
     };
     return;
   }
@@ -1500,11 +1548,11 @@ async function hydrateWorkspaceState({ migrateIfEmpty = true } = {}) {
         businessData: state.businessData,
         communityPosts: state.communityPosts
       };
-      state = normalizeState({ ...state, ...result.workspaceState });
+      state = replaceWorkspaceStateFromServer(result.workspaceState);
       Object.assign(state, runtimeState);
       applyHighestPricingPolicy();
       lastWorkspacePayload = JSON.stringify(buildRemoteWorkspaceState());
-    } else if (migrateIfEmpty) {
+    } else if (migrateIfEmpty && ["super_admin", "business_owner"].includes(currentRoleId())) {
       const workspaceState = buildRemoteWorkspaceState();
       const saved = await apiRequest("/api/workspace-state", {
         method: "PUT",
@@ -1513,6 +1561,21 @@ async function hydrateWorkspaceState({ migrateIfEmpty = true } = {}) {
       lastWorkspacePayload = JSON.stringify(workspaceState);
       result.recordCount = saved.savedRecords || 0;
       result.updatedAt = saved.updatedAt || "";
+    } else {
+      const runtimeState = {
+        activeKey: state.activeKey,
+        firebase: state.firebase,
+        authSession: state.authSession,
+        accessContext: state.accessContext,
+        authLoading: state.authLoading,
+        authChecked: state.authChecked,
+        authError: state.authError,
+        businessData: state.businessData,
+        communityPosts: state.communityPosts
+      };
+      state = replaceWorkspaceStateFromServer({});
+      Object.assign(state, runtimeState);
+      lastWorkspacePayload = JSON.stringify(buildRemoteWorkspaceState());
     }
     state.workspacePersistence = {
       durable: Boolean(result.durable),
@@ -4141,6 +4204,15 @@ async function bootstrapFirebaseAuth() {
     state.authChecked = true;
     state.authError = "";
   } catch (error) {
+    state.firebase = {
+      ...state.firebase,
+      enabled: false,
+      ready: true,
+      adminConfigured: false,
+      webConfigured: false,
+      missingAdminEnv: state.firebase?.missingAdminEnv || ["GCP_WORKLOAD_IDENTITY_CONFIGURATION"],
+      missingWebEnv: state.firebase?.missingWebEnv || ["FIREBASE_WEB_CONFIGURATION"]
+    };
     state.authChecked = true;
     state.authError = error.message || "Unable to initialize Firebase authentication.";
   } finally {
@@ -4207,11 +4279,11 @@ async function signOutFirebaseAuth() {
       console.warn("Brothers OS could not finish its final workspace save before sign-out.", error);
     });
     await logoutFirebaseSession();
-    state.authSession = null;
-    state.accessContext = null;
-    state.employeeMode = false;
-    state.worker = null;
-    state.ticketSignoffs = [];
+    const firebaseState = state.firebase;
+    const activeKey = state.activeKey;
+    localStorage.removeItem(storageKey);
+    state = normalizeState({ ...clone(defaultState), activeKey });
+    state.firebase = firebaseState;
     workspaceSyncPromise = null;
     workspaceSyncQueued = false;
     lastWorkspacePayload = "";
@@ -6239,43 +6311,506 @@ function completeTask(taskId) {
   render();
 }
 
+function sketchNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function roundSketch(value, precision = 2) {
+  const factor = 10 ** precision;
+  return Math.round(sketchNumber(value) * factor) / factor;
+}
+
+function normalizeSketchPoint(point, fallback = { x: 0, y: 0 }) {
+  return {
+    x: roundSketch(Math.min(10000, Math.max(-10000, sketchNumber(point?.x, fallback.x)))),
+    y: roundSketch(Math.min(10000, Math.max(-10000, sketchNumber(point?.y, fallback.y))))
+  };
+}
+
+function sameSketchPoint(first, second, tolerance = 0.05) {
+  return Math.abs(sketchNumber(first?.x) - sketchNumber(second?.x)) <= tolerance
+    && Math.abs(sketchNumber(first?.y) - sketchNumber(second?.y)) <= tolerance;
+}
+
+function sketchWallLength(wall) {
+  return Math.hypot(
+    sketchNumber(wall?.end?.x) - sketchNumber(wall?.start?.x),
+    sketchNumber(wall?.end?.y) - sketchNumber(wall?.start?.y)
+  );
+}
+
+function sketchRoomArea(room) {
+  const points = Array.isArray(room?.points) ? room.points : [];
+  if (points.length < 3) return Math.max(0, sketchNumber(room?.width) * sketchNumber(room?.height));
+  const signedArea = points.reduce((sum, point, index) => {
+    const nextPoint = points[(index + 1) % points.length];
+    return sum + sketchNumber(point.x) * sketchNumber(nextPoint.y) - sketchNumber(nextPoint.x) * sketchNumber(point.y);
+  }, 0);
+  return Math.abs(signedArea) / 2;
+}
+
+function sketchRoomCentroid(room) {
+  const points = Array.isArray(room?.points) ? room.points : [];
+  if (!points.length) return { x: 0, y: 0 };
+  return {
+    x: points.reduce((sum, point) => sum + sketchNumber(point.x), 0) / points.length,
+    y: points.reduce((sum, point) => sum + sketchNumber(point.y), 0) / points.length
+  };
+}
+
+function updateSketchRoomDimensions(room) {
+  const points = Array.isArray(room?.points) ? room.points : [];
+  if (!points.length) return room;
+  const xValues = points.map((point) => sketchNumber(point.x));
+  const yValues = points.map((point) => sketchNumber(point.y));
+  room.width = roundSketch(Math.max(...xValues) - Math.min(...xValues));
+  room.height = roundSketch(Math.max(...yValues) - Math.min(...yValues));
+  return room;
+}
+
+function normalizeSketchWall(wall) {
+  const start = normalizeSketchPoint(wall?.start);
+  const end = normalizeSketchPoint(wall?.end, { x: start.x + 1, y: start.y });
+  return {
+    ...wall,
+    id: String(wall?.id || createId("WALL")),
+    start,
+    end,
+    roomIds: [...new Set(Array.isArray(wall?.roomIds) ? wall.roomIds.map(String).filter(Boolean) : [])],
+    type: ["exterior", "interior", "partition", "demolition"].includes(wall?.type) ? wall.type : "exterior",
+    thickness: Math.min(18, Math.max(2, sketchNumber(wall?.thickness, 4))),
+    height: Math.min(30, Math.max(4, sketchNumber(wall?.height, 8))),
+    loadBearing: wall?.loadBearing === true,
+    notes: String(wall?.notes || "")
+  };
+}
+
+function rectangleSketchPoints(room, index) {
+  const width = Math.min(1000, Math.max(4, sketchNumber(room?.width, 12)));
+  const height = Math.min(1000, Math.max(4, sketchNumber(room?.height, 10)));
+  const fallbackX = 4 + (index % 3) * 18;
+  const fallbackY = 4 + Math.floor(index / 3) * 14;
+  const x = roundSketch(room?.planX ?? (Number.isFinite(Number(room?.x)) ? Number(room.x) / 2 : fallbackX));
+  const y = roundSketch(room?.planY ?? (Number.isFinite(Number(room?.y)) ? Number(room.y) / 3 : fallbackY));
+  return [
+    { x, y },
+    { x: roundSketch(x + width), y },
+    { x: roundSketch(x + width), y: roundSketch(y + height) },
+    { x, y: roundSketch(y + height) }
+  ];
+}
+
+function normalizeSketchWorkspace(rawRooms, rawWalls, { includeDefaults = true } = {}) {
+  const incomingRooms = Array.isArray(rawRooms)
+    ? (includeDefaults ? mergeDefaultsById(rawRooms, defaultSketchRooms) : rawRooms)
+    : (includeDefaults ? clone(defaultSketchRooms) : []);
+  const incomingWalls = Array.isArray(rawWalls)
+    ? (includeDefaults ? mergeDefaultsById(rawWalls, defaultSketchWalls) : rawWalls)
+    : (includeDefaults ? clone(defaultSketchWalls) : []);
+  const walls = incomingWalls.map(normalizeSketchWall);
+  const wallById = new Map(walls.map((wall) => [wall.id, wall]));
+
+  const rooms = incomingRooms.map((incomingRoom, index) => {
+    const fallbackRoom = defaultSketchRooms.find((room) => room.id === incomingRoom.id);
+    const rawPoints = Array.isArray(incomingRoom.points) && incomingRoom.points.length >= 3
+      ? incomingRoom.points
+      : fallbackRoom?.points || rectangleSketchPoints(incomingRoom, index);
+    const points = rawPoints.map((point) => normalizeSketchPoint(point));
+    let wallIds = Array.isArray(incomingRoom.wallIds)
+      ? incomingRoom.wallIds.map(String).filter((id) => wallById.has(id))
+      : [];
+    if (!wallIds.length && fallbackRoom?.wallIds) {
+      wallIds = fallbackRoom.wallIds.filter((id) => wallById.has(id));
+    }
+
+    const room = updateSketchRoomDimensions({
+      ...incomingRoom,
+      id: String(incomingRoom.id || createId("ROOM")),
+      name: String(incomingRoom.name || `Room ${index + 1}`),
+      assignedJob: String(incomingRoom.assignedJob || ""),
+      points,
+      wallIds: [...new Set(wallIds)],
+      notes: String(incomingRoom.notes || ""),
+      scribble: String(incomingRoom.scribble || "")
+    });
+
+    if (!room.wallIds.length) {
+      room.wallIds = points.map((point, pointIndex) => {
+        const nextPoint = points[(pointIndex + 1) % points.length];
+        const wallId = `${room.id}-W${pointIndex + 1}`;
+        if (!wallById.has(wallId)) {
+          const wall = normalizeSketchWall({
+            id: wallId,
+            start: point,
+            end: nextPoint,
+            roomIds: [room.id],
+            type: "exterior",
+            thickness: 6,
+            height: 8
+          });
+          walls.push(wall);
+          wallById.set(wallId, wall);
+        }
+        return wallId;
+      });
+    }
+    return room;
+  });
+
+  const roomIds = new Set(rooms.map((room) => room.id));
+  walls.forEach((wall) => {
+    wall.roomIds = wall.roomIds.filter((roomId) => roomIds.has(roomId));
+  });
+  rooms.forEach((room) => {
+    room.wallIds = room.wallIds.filter((wallId) => wallById.has(wallId));
+    room.wallIds.forEach((wallId) => {
+      const wall = wallById.get(wallId);
+      if (wall && !wall.roomIds.includes(room.id)) wall.roomIds.push(room.id);
+    });
+  });
+  walls.forEach((wall) => {
+    if (wall.roomIds.length > 1) wall.type = "interior";
+  });
+  return { rooms, walls };
+}
+
+function recordSketchUndo(label) {
+  sketchUndoStack = [
+    ...sketchUndoStack.slice(-24),
+    {
+      label,
+      rooms: clone(state.sketchRooms),
+      walls: clone(state.sketchWalls),
+      selectedRoomId: state.selectedSketchRoomId,
+      selectedWallId: state.selectedSketchWallId
+    }
+  ];
+}
+
+function undoSketchChange() {
+  const snapshot = sketchUndoStack.pop();
+  if (!snapshot) {
+    setToast("No sketch change to undo");
+    return render();
+  }
+  state.sketchRooms = snapshot.rooms;
+  state.sketchWalls = snapshot.walls;
+  state.selectedSketchRoomId = snapshot.selectedRoomId;
+  state.selectedSketchWallId = snapshot.selectedWallId;
+  addActivity(`Undid sketch change: ${snapshot.label}.`);
+  persist();
+  setToast("Sketch change undone");
+  render();
+}
+
+function snapSketchPoint(point, tolerance = 0.35) {
+  const normalized = normalizeSketchPoint(point);
+  const endpoints = state.sketchWalls.flatMap((wall) => [wall.start, wall.end]);
+  const match = endpoints.find((endpoint) => sameSketchPoint(endpoint, normalized, tolerance));
+  return match ? clone(match) : normalized;
+}
+
+function replaceSketchJunction(oldPoint, newPoint) {
+  state.sketchWalls.forEach((wall) => {
+    if (sameSketchPoint(wall.start, oldPoint)) wall.start = clone(newPoint);
+    if (sameSketchPoint(wall.end, oldPoint)) wall.end = clone(newPoint);
+  });
+  state.sketchRooms.forEach((room) => {
+    room.points = room.points.map((point) => sameSketchPoint(point, oldPoint) ? clone(newPoint) : point);
+    updateSketchRoomDimensions(room);
+  });
+}
+
+function sketchScopeForJob(jobReference, fallback = {}) {
+  const job = jobByJobId(jobReference);
+  const franchiseId = String(job?.franchiseId || fallback.franchiseId || "").trim();
+  const branchId = String(job?.branchId || fallback.branchId || "").trim();
+  if (franchiseId) return { franchiseId, ...(branchId ? { branchId } : {}) };
+  if (branchId) return { branchId };
+  const assignedFranchises = currentUserFranchiseIds();
+  return assignedFranchises.length === 1 ? { franchiseId: assignedFranchises[0] } : {};
+}
+
+function sketchFilePayload(room) {
+  const roomWalls = room.wallIds.map((wallId) => state.sketchWalls.find((wall) => wall.id === wallId)).filter(Boolean);
+  return {
+    ...sketchScopeForJob(room.assignedJob, room),
+    moduleKey: "sketch",
+    linkedModuleKeys: ["jobs", "pricing", "photos", "defensibility", "evidencechain", "payments"],
+    sourceType: "sketchRoom",
+    sourceId: room.id,
+    title: `${room.name} measured room`,
+    type: "Measured floor plan",
+    owner: "Estimator",
+    status: roomWalls.length >= 3 ? "Active" : "Needs review",
+    priority: "Medium",
+    relatedJob: room.assignedJob,
+    notes: [
+      `Room ID: ${room.id}`,
+      `Area: ${roundSketch(sketchRoomArea(room), 1)} sq ft`,
+      `Bounds: ${roundSketch(room.width, 1)} ft x ${roundSketch(room.height, 1)} ft`,
+      `Walls: ${roomWalls.map((wall) => `${wall.id} ${roundSketch(sketchWallLength(wall), 2)} ft ${wall.type}`).join("; ") || "No walls"}`,
+      `Notes: ${room.notes || "None"}`,
+      `Field notes: ${room.scribble || "None"}`
+    ].join("\n")
+  };
+}
+
+function upsertSketchFile(fileData, toastText = "Sketch file saved") {
+  const existing = state.files.find((file) => file.sourceType === fileData.sourceType && file.sourceId === fileData.sourceId);
+  if (!existing) {
+    const file = createFile(fileData);
+    setToast(toastText);
+    render();
+    return file;
+  }
+  Object.assign(existing, fileData, {
+    linkedModuleKeys: normalizeModuleKeyList(fileData.linkedModuleKeys, fileData.moduleKey),
+    updatedAt: new Date().toISOString(),
+    history: [`Measurements updated ${formatTime(new Date().toISOString())}`, ...(existing.history || [])].slice(0, 12)
+  });
+  state.selectedFileId = existing.id;
+  addActivity(`Updated ${existing.title} across linked modules.`);
+  persist();
+  setToast(toastText);
+  render();
+  return existing;
+}
+
 function addSketchRoom(formData) {
-  const width = Math.max(4, parseAmount(formData.get("width")) || 12);
-  const height = Math.max(4, parseAmount(formData.get("height")) || 10);
+  const width = Math.min(1000, Math.max(4, parseAmount(formData.get("width")) || 12));
+  const height = Math.min(1000, Math.max(4, parseAmount(formData.get("height")) || 10));
   const index = state.sketchRooms.length;
+  const allPoints = state.sketchRooms.flatMap((room) => room.points || []);
+  const planX = allPoints.length ? Math.max(...allPoints.map((point) => sketchNumber(point.x))) + 3 : 4;
+  const planY = allPoints.length ? Math.min(...allPoints.map((point) => sketchNumber(point.y))) : 4;
+  const id = createId("ROOM");
+  const assignedJob = String(formData.get("assignedJob") || "").trim();
+  const scope = sketchScopeForJob(assignedJob);
+  const points = rectangleSketchPoints({ width, height, planX, planY }, index);
+  const wallIds = points.map(() => createId("WALL"));
   const room = {
-    id: createId("ROOM"),
+    id,
+    ...scope,
     name: String(formData.get("name") || `Room ${index + 1}`).trim(),
-    assignedJob: String(formData.get("assignedJob") || "").trim(),
+    assignedJob,
     width,
     height,
-    x: 6 + (index * 13) % 70,
-    y: 10 + (index * 11) % 55,
-    w: Math.min(36, Math.max(12, width * 1.4)),
-    h: Math.min(34, Math.max(10, height * 1.4)),
+    points,
+    wallIds,
     notes: String(formData.get("notes") || "").trim(),
     scribble: String(formData.get("scribble") || "").trim()
   };
-  state.sketchRooms = [room, ...state.sketchRooms];
-  addActivity(`Added sketch room ${room.name}.`);
+  const walls = points.map((point, pointIndex) => normalizeSketchWall({
+    id: wallIds[pointIndex],
+    ...scope,
+    start: point,
+    end: points[(pointIndex + 1) % points.length],
+    roomIds: [id],
+    type: "exterior",
+    thickness: 6,
+    height: 8
+  }));
+  recordSketchUndo(`add ${room.name}`);
+  state.sketchRooms = [...state.sketchRooms, room];
+  state.sketchWalls = [...state.sketchWalls, ...walls];
+  state.selectedSketchRoomId = room.id;
+  state.selectedSketchWallId = walls[0].id;
+  addActivity(`Added measured sketch room ${room.name}.`);
+  upsertSketchFile(sketchFilePayload(room), "Room added and linked");
+}
+
+function addConnectedSketchRoom(formData) {
+  const sharedWall = state.sketchWalls.find((wall) => wall.id === String(formData.get("wallId") || state.selectedSketchWallId));
+  if (!sharedWall || sketchWallLength(sharedWall) < 0.5) {
+    setToast("Select a measured wall before adding a connected room");
+    return render();
+  }
+  if (sharedWall.roomIds.length >= 2) {
+    setToast("That wall already joins two rooms. Select an open boundary wall.");
+    return render();
+  }
+  const depth = Math.min(1000, Math.max(3, parseAmount(formData.get("depth")) || 10));
+  const dx = sharedWall.end.x - sharedWall.start.x;
+  const dy = sharedWall.end.y - sharedWall.start.y;
+  const length = sketchWallLength(sharedWall);
+  const parentRoom = state.sketchRooms.find((room) => sharedWall.roomIds.includes(room.id));
+  let side = String(formData.get("side") || "auto");
+  if (side === "auto" && parentRoom) {
+    const center = sketchRoomCentroid(parentRoom);
+    const cross = dx * (center.y - sharedWall.start.y) - dy * (center.x - sharedWall.start.x);
+    side = cross >= 0 ? "right" : "left";
+  }
+  if (side === "auto") side = "left";
+  const direction = side === "right" ? -1 : 1;
+  const normal = { x: (-dy / length) * depth * direction, y: (dx / length) * depth * direction };
+  const first = clone(sharedWall.start);
+  const second = clone(sharedWall.end);
+  const third = normalizeSketchPoint({ x: second.x + normal.x, y: second.y + normal.y });
+  const fourth = normalizeSketchPoint({ x: first.x + normal.x, y: first.y + normal.y });
+  const roomId = createId("ROOM");
+  const assignedJob = String(formData.get("assignedJob") || parentRoom?.assignedJob || "").trim();
+  const scope = sketchScopeForJob(assignedJob, parentRoom);
+  const newWallIds = [createId("WALL"), createId("WALL"), createId("WALL")];
+  const room = {
+    id: roomId,
+    ...scope,
+    name: String(formData.get("name") || `Connected room ${state.sketchRooms.length + 1}`).trim(),
+    assignedJob,
+    width: roundSketch(length),
+    height: roundSketch(depth),
+    points: [first, second, third, fourth],
+    wallIds: [sharedWall.id, ...newWallIds],
+    notes: String(formData.get("notes") || "").trim(),
+    scribble: `Built from shared wall ${sharedWall.id}.`
+  };
+  const walls = [
+    normalizeSketchWall({ id: newWallIds[0], ...scope, start: second, end: third, roomIds: [roomId], type: "exterior", thickness: 6, height: sharedWall.height }),
+    normalizeSketchWall({ id: newWallIds[1], ...scope, start: third, end: fourth, roomIds: [roomId], type: "exterior", thickness: 6, height: sharedWall.height }),
+    normalizeSketchWall({ id: newWallIds[2], ...scope, start: fourth, end: first, roomIds: [roomId], type: "exterior", thickness: 6, height: sharedWall.height })
+  ];
+  recordSketchUndo(`connect ${room.name}`);
+  if (!String(sharedWall.franchiseId || sharedWall.branchId || "").trim()) Object.assign(sharedWall, scope);
+  sharedWall.roomIds = [...new Set([...sharedWall.roomIds, roomId])];
+  sharedWall.type = "interior";
+  state.sketchRooms = [...state.sketchRooms, room];
+  state.sketchWalls = [...state.sketchWalls, ...walls];
+  state.selectedSketchRoomId = room.id;
+  state.selectedSketchWallId = sharedWall.id;
+  addActivity(`Built ${room.name} from shared wall ${sharedWall.id}.`);
+  upsertSketchFile(sketchFilePayload(room), "Connected room added and linked");
+}
+
+function addSketchWall(formData) {
+  const start = snapSketchPoint({ x: formData.get("x1"), y: formData.get("y1") });
+  const end = snapSketchPoint({ x: formData.get("x2"), y: formData.get("y2") });
+  if (sameSketchPoint(start, end, 0.1)) {
+    setToast("A wall must be at least 0.1 ft long");
+    return render();
+  }
+  const duplicate = state.sketchWalls.find((wall) =>
+    (sameSketchPoint(wall.start, start) && sameSketchPoint(wall.end, end))
+    || (sameSketchPoint(wall.start, end) && sameSketchPoint(wall.end, start))
+  );
+  if (duplicate) {
+    state.selectedSketchWallId = duplicate.id;
+    setToast("That wall already exists and is now selected");
+    return render();
+  }
+  const roomId = String(formData.get("roomId") || "");
+  const room = state.sketchRooms.find((item) => item.id === roomId);
+  const scope = sketchScopeForJob(room?.assignedJob, room);
+  const wall = normalizeSketchWall({
+    id: createId("WALL"),
+    ...scope,
+    start,
+    end,
+    roomIds: roomId ? [roomId] : [],
+    type: formData.get("type") || "partition",
+    thickness: formData.get("thickness") || 4,
+    height: formData.get("height") || 8,
+    loadBearing: formData.get("loadBearing") === "on",
+    notes: formData.get("notes")
+  });
+  recordSketchUndo(`add wall ${wall.id}`);
+  state.sketchWalls = [...state.sketchWalls, wall];
+  if (room) {
+    room.wallIds = [...new Set([...room.wallIds, wall.id])];
+  }
+  state.selectedSketchWallId = wall.id;
+  state.selectedSketchRoomId = roomId || state.selectedSketchRoomId;
+  addActivity(`Added individual wall ${wall.id} at ${roundSketch(sketchWallLength(wall), 2)} ft.`);
   persist();
-  setToast("Room added to sketch");
+  setToast("Wall added with endpoint snapping");
+  render();
+}
+
+function editSketchWall(formData) {
+  const wall = state.sketchWalls.find((item) => item.id === String(formData.get("wallId") || state.selectedSketchWallId));
+  if (!wall) return;
+  const targetLength = Math.min(1000, Math.max(0.1, parseAmount(formData.get("length")) || sketchWallLength(wall)));
+  const currentLength = sketchWallLength(wall);
+  recordSketchUndo(`edit wall ${wall.id}`);
+  if (Math.abs(targetLength - currentLength) > 0.01 && currentLength > 0) {
+    const oldEnd = clone(wall.end);
+    const newEnd = normalizeSketchPoint({
+      x: wall.start.x + ((wall.end.x - wall.start.x) / currentLength) * targetLength,
+      y: wall.start.y + ((wall.end.y - wall.start.y) / currentLength) * targetLength
+    });
+    replaceSketchJunction(oldEnd, newEnd);
+  }
+  wall.thickness = Math.min(18, Math.max(2, parseAmount(formData.get("thickness")) || wall.thickness));
+  wall.height = Math.min(30, Math.max(4, parseAmount(formData.get("height")) || wall.height));
+  const requestedType = String(formData.get("type") || wall.type);
+  wall.type = ["exterior", "interior", "partition", "demolition"].includes(requestedType) ? requestedType : wall.type;
+  wall.loadBearing = formData.get("loadBearing") === "on";
+  wall.notes = String(formData.get("notes") || "").trim();
+  addActivity(`Updated wall ${wall.id} to ${roundSketch(sketchWallLength(wall), 2)} ft.`);
+  persist();
+  setToast("Wall dimensions updated");
+  render();
+}
+
+function deleteSketchWall(wallId) {
+  const wall = state.sketchWalls.find((item) => item.id === wallId);
+  if (!wall) return;
+  recordSketchUndo(`delete wall ${wall.id}`);
+  state.sketchWalls = state.sketchWalls.filter((item) => item.id !== wall.id);
+  state.sketchRooms.forEach((room) => {
+    room.wallIds = room.wallIds.filter((id) => id !== wall.id);
+  });
+  state.selectedSketchWallId = state.sketchWalls[0]?.id || "";
+  addActivity(`Removed wall ${wall.id}; connected rooms are flagged for boundary review.`);
+  persist();
+  setToast("Wall removed; review open room boundaries");
   render();
 }
 
 function professionalizeSketch() {
-  state.sketchRooms = state.sketchRooms.map((room, index) => ({
-    ...room,
-    x: 6 + (index % 3) * 29,
-    y: 10 + Math.floor(index / 3) * 24,
-    w: Math.min(27, Math.max(14, Number(room.width || 10) * 1.1)),
-    h: Math.min(22, Math.max(10, Number(room.height || 8) * 1.1)),
-    notes: room.notes || `Professionalized from scribble: ${room.scribble || "room outline"}`
-  }));
-  addActivity("Professionalized sketch rooms into floor plan blocks.");
+  recordSketchUndo("clean and snap plan");
+  state.sketchWalls.forEach((wall) => {
+    wall.start = normalizeSketchPoint({ x: Math.round(wall.start.x * 4) / 4, y: Math.round(wall.start.y * 4) / 4 });
+    wall.end = normalizeSketchPoint({ x: Math.round(wall.end.x * 4) / 4, y: Math.round(wall.end.y * 4) / 4 });
+    wall.type = wall.roomIds.length > 1 ? "interior" : wall.type === "interior" ? "exterior" : wall.type;
+  });
+  state.sketchRooms.forEach((room) => {
+    room.points = room.points.map((point) => normalizeSketchPoint({ x: Math.round(point.x * 4) / 4, y: Math.round(point.y * 4) / 4 }));
+    updateSketchRoomDimensions(room);
+    if (!room.notes && room.scribble) room.notes = `Field notes converted to measured plan: ${room.scribble}`;
+  });
+  addActivity("Snapped the measured plan to quarter-foot endpoints and classified shared walls.");
   persist();
-  setToast("Sketch professionalized");
+  setToast("Plan cleaned and endpoints snapped");
   render();
+}
+
+function saveSketchWorkspaceFile() {
+  const selectedRoom = state.sketchRooms.find((room) => room.id === state.selectedSketchRoomId);
+  const relatedJob = selectedRoom?.assignedJob || state.sketchRooms.find((room) => room.assignedJob)?.assignedJob || "";
+  const sourceId = `floor-plan-${relatedJob || "workspace"}`;
+  const notes = [
+    `Measured floor plan: ${state.sketchRooms.length} rooms, ${state.sketchWalls.length} walls`,
+    `Total area: ${roundSketch(state.sketchRooms.reduce((sum, room) => sum + sketchRoomArea(room), 0), 1)} sq ft`,
+    "",
+    ...state.sketchRooms.map((room) => `${room.name}: ${roundSketch(sketchRoomArea(room), 1)} sq ft, ${room.wallIds.length} walls, job ${room.assignedJob || "unassigned"}`),
+    "",
+    ...state.sketchWalls.map((wall) => `${wall.id}: ${roundSketch(sketchWallLength(wall), 2)} ft, ${wall.type}, ${wall.thickness} in, ${wall.height} ft high${wall.loadBearing ? ", load bearing" : ""}`)
+  ].join("\n");
+  upsertSketchFile({
+    ...sketchScopeForJob(relatedJob, selectedRoom),
+    moduleKey: "sketch",
+    linkedModuleKeys: ["jobs", "pricing", "photos", "defensibility", "evidencechain", "payments", "closeout"],
+    sourceType: "floorPlan",
+    sourceId,
+    title: `${relatedJob || "Workspace"} measured floor plan`,
+    type: "Connected wall plan",
+    owner: "Estimator",
+    status: state.sketchRooms.every((room) => room.wallIds.length >= 3) ? "Active" : "Needs review",
+    priority: "High",
+    relatedJob,
+    notes
+  }, "Floor plan saved across linked modules");
 }
 
 function generateDefensibilityReview(formData) {
@@ -6896,7 +7431,7 @@ function renderAuthGate() {
               <div><dt>Connected Firebase project</dt><dd>${escapeHtml(projectId)}</dd></div>
               <div><dt>Server credentials</dt><dd>${escapeHtml(missingAdmin)}</dd></div>
               <div><dt>Web app config</dt><dd>${escapeHtml(missingWeb)}</dd></div>
-              <div><dt>Next action</dt><dd>Add Firebase Admin credentials in Vercel, authorize brothers.ad in Firebase Authentication, then redeploy production.</dd></div>
+              <div><dt>Next action</dt><dd>Complete Google workload identity federation, authorize brothers.ad in Firebase Authentication, then redeploy production.</dd></div>
             </dl>
           </div>
         </div>
@@ -6912,12 +7447,12 @@ function renderAuthGate() {
   const ownerLabel = ownerEmails.length ? ownerEmails.join(", ") : "the Super Admin email";
   const adminCredentialWarning = state.firebase.restAuthFallback
     ? {
-        title: "Firebase Admin credentials still needed for contractor codes",
-        body: "Owner Google login can use secure Firebase REST token verification. Add FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY in Vercel to activate contractor code validation, invite management, Firestore-backed portals, and full admin datastore features."
+        title: "Keyless Firebase Admin access still needed for contractor codes",
+        body: "Owner Google login can use secure Firebase REST token verification. Complete the Vercel OIDC workload identity connection to activate contractor code validation, invite management, Firestore-backed portals, and full admin datastore features."
       }
     : {
-        title: "Contractor code validation needs Firebase Admin credentials",
-        body: "Owner login and contractor code validation become live after FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY are added in Vercel."
+        title: "Contractor code validation needs keyless Firebase Admin access",
+        body: "Owner login and contractor code validation become fully durable after Vercel OIDC is authorized to impersonate the Firebase Admin service account."
       };
   return `
     <section class="auth-gate">
@@ -9602,7 +10137,7 @@ function getLaunchCenterItems() {
     },
     {
       label: "Firebase Admin",
-      status: state.firebase.adminConfigured ? "Ready" : "Needs private credential",
+      status: state.firebase.adminConfigured ? "Ready" : "Needs cloud identity",
       tone: state.firebase.adminConfigured ? "ready" : "blocked",
       detail: missingAdmin.length ? `Missing: ${missingAdmin.join(", ")}` : `Credential source: ${state.firebase.adminCredentialSource || "configured"}`
     },
@@ -9614,7 +10149,7 @@ function getLaunchCenterItems() {
         ? "Google sign-in, secure 48-hour sessions, revocation, invitation links, and individual codes are active."
         : state.firebase.enabled
           ? "Google can verify the owner, but invited-user sessions remain locked until Firebase Admin is configured."
-        : "Add Firebase Admin credentials in Vercel before customer data, invoices, and global indexes can unlock."
+        : "Complete the Vercel-to-Google workload identity before customer data, invoices, and global indexes can unlock."
     },
     {
       label: "Shared workspace data",
@@ -9708,7 +10243,7 @@ function renderLaunchCenterModule(module) {
       <ol>
         <li><strong>Deploy latest code.</strong><span>Push or upload this build to the Vercel project that owns the current OS deployment.</span></li>
         <li><strong>Attach domains.</strong><span>Add brothers.ad and www.brothers.ad under Vercel Project Settings, then set brothers.ad as production.</span></li>
-        <li><strong>Add private Firebase Admin credentials.</strong><span>Use FIREBASE_SERVICE_ACCOUNT_JSON, or FIREBASE_CLIENT_EMAIL plus FIREBASE_PRIVATE_KEY.</span></li>
+        <li><strong>Authorize keyless Firebase Admin access.</strong><span>Use the production-only Vercel OIDC identity and Google Workload Identity Federation; no downloadable private key is required.</span></li>
         <li><strong>Authorize Google login.</strong><span>Add brothers.ad and www.brothers.ad in Firebase Authentication authorized domains.</span></li>
         <li><strong>Redeploy and smoke test.</strong><span>Open /api/auth/config, sign in with a Super Admin Google account, and confirm contractors cannot see global indexes.</span></li>
       </ol>
@@ -9840,7 +10375,7 @@ function renderGlobalBusinessIndexPanel() {
         <div><strong>${escapeHtml(formatMoney(openBalance))}</strong><span>Open balance</span></div>
         <div><strong>${escapeHtml(formatMoney(contractorTotal))}</strong><span>Contractor invoices</span></div>
       </div>
-      ${!state.firebase.adminConfigured ? `<div class="empty-state warning-state"><strong>Persistent Admin storage still needs Firebase service-account credentials</strong><span>Browser-only changes are not shared. Server-side workspace records, invite validation, user management, and board posts require FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY in Vercel.</span></div>` : ""}
+      ${!state.firebase.adminConfigured ? `<div class="empty-state warning-state"><strong>Persistent Admin storage still needs Google workload identity</strong><span>Browser-only changes are not shared. Authorize the production Brothers OS Vercel identity to use the Firebase Admin service account, then set the five GCP workload identity variables in Vercel.</span></div>` : ""}
       <div class="empty-state compact-empty"><strong>Data source</strong><span>${escapeHtml(sourceLabel)}</span></div>
       ${allRecords.length ? `
         <div class="business-record-grid">
@@ -10207,7 +10742,7 @@ function accessListValue(config, key) {
 
 function renderRolePermissionForms(editableRoles, permissionDocs) {
   if (!editableRoles.length) {
-    return `<div class="empty-state"><strong>No editable roles loaded</strong><span>Run RBAC bootstrap after Firebase Admin credentials are configured.</span></div>`;
+    return `<div class="empty-state"><strong>No editable roles loaded</strong><span>Run RBAC bootstrap after keyless Firebase Admin access is configured.</span></div>`;
   }
   return `
     <div class="inline-section">
@@ -10499,44 +11034,193 @@ function renderTaskItem(task) {
   `;
 }
 
+function sketchPlanBounds() {
+  const points = [
+    ...state.sketchWalls.flatMap((wall) => [wall.start, wall.end]),
+    ...state.sketchRooms.flatMap((room) => room.points || [])
+  ];
+  if (!points.length) return { x: 0, y: 0, width: 40, height: 26 };
+  const xValues = points.map((point) => sketchNumber(point.x));
+  const yValues = points.map((point) => sketchNumber(point.y));
+  const minX = Math.min(...xValues) - 3;
+  const minY = Math.min(...yValues) - 3;
+  const maxX = Math.max(...xValues) + 3;
+  const maxY = Math.max(...yValues) + 3;
+  return {
+    x: roundSketch(minX),
+    y: roundSketch(minY),
+    width: Math.max(24, roundSketch(maxX - minX)),
+    height: Math.max(18, roundSketch(maxY - minY))
+  };
+}
+
+function renderSketchRoomShape(room) {
+  const selected = room.id === state.selectedSketchRoomId;
+  const center = sketchRoomCentroid(room);
+  const points = room.points.map((point) => `${roundSketch(point.x)},${roundSketch(point.y)}`).join(" ");
+  return `
+    <g class="sketch-room-shape${selected ? " selected" : ""}" data-action="select-sketch-room" data-id="${escapeHtml(room.id)}" role="button" tabindex="0" aria-label="Select ${escapeHtml(room.name)}">
+      <polygon points="${points}"></polygon>
+      <text class="sketch-room-name" x="${roundSketch(center.x)}" y="${roundSketch(center.y - 0.35)}">${escapeHtml(room.name)}</text>
+      <text class="sketch-room-area" x="${roundSketch(center.x)}" y="${roundSketch(center.y + 0.8)}">${roundSketch(sketchRoomArea(room), 1)} sq ft</text>
+    </g>
+  `;
+}
+
+function renderSketchWallShape(wall) {
+  const selected = wall.id === state.selectedSketchWallId;
+  const midpoint = {
+    x: (wall.start.x + wall.end.x) / 2,
+    y: (wall.start.y + wall.end.y) / 2
+  };
+  const classes = [
+    "sketch-wall-shape",
+    selected ? "selected" : "",
+    wall.roomIds.length > 1 ? "shared" : "",
+    wall.loadBearing ? "load-bearing" : "",
+    `wall-${wall.type}`
+  ].filter(Boolean).join(" ");
+  const strokeWidth = Math.max(0.16, sketchNumber(wall.thickness, 4) / 18);
+  return `
+    <g class="${classes}" data-action="select-sketch-wall" data-id="${escapeHtml(wall.id)}" role="button" tabindex="0" aria-label="Select ${escapeHtml(wall.id)}, ${roundSketch(sketchWallLength(wall), 2)} feet">
+      <line class="sketch-wall-hit" x1="${wall.start.x}" y1="${wall.start.y}" x2="${wall.end.x}" y2="${wall.end.y}"></line>
+      <line class="sketch-wall-line" x1="${wall.start.x}" y1="${wall.start.y}" x2="${wall.end.x}" y2="${wall.end.y}" style="stroke-width:${strokeWidth}"></line>
+      <circle class="sketch-junction" cx="${wall.start.x}" cy="${wall.start.y}" r="0.18"></circle>
+      <circle class="sketch-junction" cx="${wall.end.x}" cy="${wall.end.y}" r="0.18"></circle>
+      <text class="sketch-wall-length" x="${roundSketch(midpoint.x)}" y="${roundSketch(midpoint.y - 0.38)}">${roundSketch(sketchWallLength(wall), 2)} ft</text>
+    </g>
+  `;
+}
+
+function renderSelectedSketchWall(wall) {
+  if (!wall) {
+    return `<div class="empty-state"><strong>Select a wall</strong><span>Choose any wall on the plan to edit its exact length, construction, or connected room.</span></div>`;
+  }
+  const connectedRooms = wall.roomIds.map((roomId) => state.sketchRooms.find((room) => room.id === roomId)?.name).filter(Boolean);
+  return `
+    <form class="stack-form sketch-wall-editor" data-form="sketch-wall-edit">
+      <input type="hidden" name="wallId" value="${escapeHtml(wall.id)}" />
+      <div class="selection-heading">
+        <div><span>Selected wall</span><h3>${escapeHtml(wall.id)}</h3></div>
+        <strong>${roundSketch(sketchWallLength(wall), 2)} ft</strong>
+      </div>
+      <div class="form-grid compact-grid">
+        <label><span>Exact length (ft)</span><input name="length" type="number" min="0.1" max="1000" step="0.01" value="${roundSketch(sketchWallLength(wall), 2)}" required /></label>
+        <label><span>Height (ft)</span><input name="height" type="number" min="4" max="30" step="0.1" value="${escapeHtml(wall.height)}" /></label>
+        <label><span>Thickness (in)</span><input name="thickness" type="number" min="2" max="18" step="0.5" value="${escapeHtml(wall.thickness)}" /></label>
+        <label><span>Construction</span><select name="type">${["exterior", "interior", "partition", "demolition"].map((type) => `<option value="${type}" ${wall.type === type ? "selected" : ""}>${type[0].toUpperCase() + type.slice(1)}</option>`).join("")}</select></label>
+      </div>
+      <label class="checkbox-line"><input name="loadBearing" type="checkbox" ${wall.loadBearing ? "checked" : ""} /><span>Load-bearing wall</span></label>
+      <label><span>Wall notes</span><textarea name="notes" rows="2" placeholder="Material, damage, openings, demolition notes">${escapeHtml(wall.notes)}</textarea></label>
+      <small>Connected rooms: ${escapeHtml(connectedRooms.join(", ") || "Unassigned wall")}</small>
+      <div class="form-actions">
+        <button type="submit">Update wall</button>
+        <button type="button" class="danger-button" data-action="delete-sketch-wall" data-id="${escapeHtml(wall.id)}">Remove wall</button>
+      </div>
+    </form>
+  `;
+}
+
 function renderSketchModule(module) {
+  const bounds = sketchPlanBounds();
+  const selectedWall = state.sketchWalls.find((wall) => wall.id === state.selectedSketchWallId);
+  const selectedRoom = state.sketchRooms.find((room) => room.id === state.selectedSketchRoomId);
+  const selectedWallHasOpenSide = Boolean(selectedWall && selectedWall.roomIds.length < 2);
+  const totalArea = state.sketchRooms.reduce((sum, room) => sum + sketchRoomArea(room), 0);
+  const sharedWalls = state.sketchWalls.filter((wall) => wall.roomIds.length > 1).length;
+  const jobOptions = [...new Set(state.jobBoards.map((job) => job.jobId || job.id).filter(Boolean))];
   return `
     <section class="hero-band sketch-hero">
       <div>
         <p>${escapeHtml(module.purpose)}</p>
         <div class="hero-actions">
-          <button type="button" data-action="professionalize-sketch">Professionalize sketch</button>
-          <button type="button" data-action="open-create-file" data-key="sketch">Sketch file</button>
+          <button type="button" data-action="save-sketch-file">Save connected plan</button>
+          <button type="button" data-action="professionalize-sketch">Snap and clean</button>
+          <button type="button" data-action="undo-sketch" ${sketchUndoStack.length ? "" : "disabled"}>Undo</button>
         </div>
       </div>
       <div class="metric-strip">
         <div><strong>${state.sketchRooms.length}</strong><span>Rooms</span></div>
-        <div><strong>${state.sketchRooms.reduce((sum, room) => sum + Number(room.width || 0) * Number(room.height || 0), 0)}</strong><span>Sq ft</span></div>
-        <div><strong>${state.sketchRooms.filter((room) => room.notes.toLowerCase().includes("moisture")).length}</strong><span>Moisture zones</span></div>
+        <div><strong>${roundSketch(totalArea, 1)}</strong><span>Sq ft</span></div>
+        <div><strong>${sharedWalls}</strong><span>Shared walls</span></div>
       </div>
     </section>
     <section class="sketch-layout">
-      <div class="panel">
-        <div class="panel-head"><div><h2>Floor plan builder</h2><p>Rooms from scribbles become professional plan blocks.</p></div><button type="button" data-action="professionalize-sketch">Clean layout</button></div>
-        <div class="floor-plan">
-          ${state.sketchRooms.map((room) => `<button type="button" class="floor-room" style="left:${room.x}%;top:${room.y}%;width:${room.w}%;height:${room.h}%;" data-action="select-sketch-room" data-id="${room.id}"><strong>${escapeHtml(room.name)}</strong><span>${escapeHtml(room.width)} x ${escapeHtml(room.height)}</span></button>`).join("")}
+      <div class="panel sketch-canvas-panel">
+        <div class="panel-head">
+          <div><h2>Connected wall plan</h2><p>Select a room or wall. Exact edits move joined endpoints and preserve shared boundaries.</p></div>
+          <div class="sketch-legend"><span><i class="legend-exterior"></i>Exterior</span><span><i class="legend-shared"></i>Shared</span><span><i class="legend-bearing"></i>Load bearing</span></div>
+        </div>
+        <div class="floor-plan" aria-label="Measured floor plan editor">
+          <svg class="sketch-svg" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" role="img" aria-label="Connected room and wall plan">
+            <defs>
+              <pattern id="sketch-grid-small" width="1" height="1" patternUnits="userSpaceOnUse"><path d="M 1 0 L 0 0 0 1" fill="none"></path></pattern>
+              <pattern id="sketch-grid-large" width="5" height="5" patternUnits="userSpaceOnUse"><rect width="5" height="5" fill="url(#sketch-grid-small)"></rect><path d="M 5 0 L 0 0 0 5" fill="none"></path></pattern>
+            </defs>
+            <rect class="sketch-grid" x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" fill="url(#sketch-grid-large)"></rect>
+            ${state.sketchRooms.map(renderSketchRoomShape).join("")}
+            ${state.sketchWalls.map(renderSketchWallShape).join("")}
+          </svg>
+        </div>
+        <div class="sketch-room-strip">
+          ${state.sketchRooms.map((room) => `<button type="button" class="sketch-room-chip ${room.id === state.selectedSketchRoomId ? "selected" : ""}" data-action="select-sketch-room" data-id="${escapeHtml(room.id)}"><strong>${escapeHtml(room.name)}</strong><span>${roundSketch(sketchRoomArea(room), 1)} sq ft | ${room.wallIds.length} walls</span></button>`).join("")}
         </div>
       </div>
-      <div class="panel">
-        <div class="panel-head"><div><h2>Room scribble intake</h2><p>Enter rough dimensions, notes, and room assignment.</p></div></div>
-        <form class="stack-form" data-form="sketch-room">
-          <div class="form-grid">
-            <label><span>Room</span><input name="name" required placeholder="Kitchen, hall, bedroom" /></label>
-            <label><span>Job</span><input name="assignedJob" placeholder="J-2039" /></label>
-            <label><span>Width</span><input name="width" type="number" step="0.1" value="12" /></label>
-            <label><span>Height</span><input name="height" type="number" step="0.1" value="10" /></label>
-          </div>
-          <label><span>Scribble notes</span><textarea name="scribble" rows="3" placeholder="rough sketch notes, moisture points, equipment placement"></textarea></label>
-          <label><span>Professional notes</span><textarea name="notes" rows="3" placeholder="Affected materials, room assignment, line item support"></textarea></label>
-          <button type="submit">Add room to plan</button>
-        </form>
+      <div class="sketch-tools">
+        <section class="panel sketch-tool-panel">
+          <div class="panel-head"><div><h2>Wall properties</h2><p>Measurements use feet; thickness uses inches.</p></div></div>
+          ${renderSelectedSketchWall(selectedWall)}
+        </section>
+        <section class="panel sketch-tool-panel">
+          <div class="panel-head"><div><h2>Build from selected wall</h2><p>Create an adjoining room that reuses the selected boundary.</p></div></div>
+          ${selectedWall && !selectedWallHasOpenSide ? `<div class="inline-notice" role="status"><strong>Boundary occupied</strong><span>This wall already joins ${selectedWall.roomIds.length} rooms. Select an exterior wall to continue.</span></div>` : ""}
+          <form class="stack-form" data-form="sketch-connected-room">
+            <input type="hidden" name="wallId" value="${escapeHtml(selectedWall?.id || "")}" />
+            <div class="form-grid compact-grid">
+              <label><span>Room</span><input name="name" required placeholder="Bedroom, closet, hall" /></label>
+              <label><span>Depth (ft)</span><input name="depth" type="number" min="3" max="1000" step="0.1" value="10" required /></label>
+              <label><span>Job</span><input name="assignedJob" list="sketch-job-options" value="${escapeHtml(selectedRoom?.assignedJob || "")}" placeholder="J-2039" /></label>
+              <label><span>Build side</span><select name="side"><option value="auto">Outside selected room</option><option value="left">Left of wall</option><option value="right">Right of wall</option></select></label>
+            </div>
+            <label><span>Room notes</span><textarea name="notes" rows="2" placeholder="Affected materials, moisture, equipment"></textarea></label>
+            <button type="submit" ${selectedWallHasOpenSide ? "" : "disabled"}>Add connected room</button>
+          </form>
+        </section>
+        <details class="panel sketch-tool-panel">
+          <summary>Add an individual wall</summary>
+          <form class="stack-form" data-form="sketch-wall">
+            <div class="form-grid compact-grid">
+               <label><span>Start X</span><input name="x1" type="number" min="-10000" max="10000" step="0.1" value="${roundSketch(selectedWall?.end?.x ?? 4)}" required /></label>
+               <label><span>Start Y</span><input name="y1" type="number" min="-10000" max="10000" step="0.1" value="${roundSketch(selectedWall?.end?.y ?? 4)}" required /></label>
+               <label><span>End X</span><input name="x2" type="number" min="-10000" max="10000" step="0.1" value="${roundSketch((selectedWall?.end?.x ?? 4) + 8)}" required /></label>
+               <label><span>End Y</span><input name="y2" type="number" min="-10000" max="10000" step="0.1" value="${roundSketch(selectedWall?.end?.y ?? 4)}" required /></label>
+              <label><span>Assign to room</span><select name="roomId"><option value="">Standalone wall</option>${state.sketchRooms.map((room) => `<option value="${escapeHtml(room.id)}" ${room.id === state.selectedSketchRoomId ? "selected" : ""}>${escapeHtml(room.name)}</option>`).join("")}</select></label>
+              <label><span>Construction</span><select name="type"><option value="partition">Partition</option><option value="interior">Interior</option><option value="exterior">Exterior</option><option value="demolition">Demolition</option></select></label>
+              <label><span>Thickness (in)</span><input name="thickness" type="number" min="2" max="18" step="0.5" value="4" /></label>
+              <label><span>Height (ft)</span><input name="height" type="number" min="4" max="30" step="0.1" value="8" /></label>
+            </div>
+            <label class="checkbox-line"><input name="loadBearing" type="checkbox" /><span>Load-bearing wall</span></label>
+            <label><span>Wall notes</span><textarea name="notes" rows="2"></textarea></label>
+            <button type="submit">Add wall and snap endpoints</button>
+          </form>
+        </details>
+        <details class="panel sketch-tool-panel">
+          <summary>Add a separate room</summary>
+          <form class="stack-form" data-form="sketch-room">
+            <div class="form-grid compact-grid">
+              <label><span>Room</span><input name="name" required placeholder="Kitchen, hall, bedroom" /></label>
+              <label><span>Job</span><input name="assignedJob" list="sketch-job-options" placeholder="J-2039" /></label>
+              <label><span>Width (ft)</span><input name="width" type="number" min="4" max="1000" step="0.1" value="12" /></label>
+              <label><span>Depth (ft)</span><input name="height" type="number" min="4" max="1000" step="0.1" value="10" /></label>
+            </div>
+            <label><span>Field notes</span><textarea name="scribble" rows="2" placeholder="Rough notes, moisture points, equipment placement"></textarea></label>
+            <label><span>Professional notes</span><textarea name="notes" rows="2" placeholder="Affected materials and scope support"></textarea></label>
+            <button type="submit">Add measured room</button>
+          </form>
+        </details>
       </div>
     </section>
+    <datalist id="sketch-job-options">${jobOptions.map((jobId) => `<option value="${escapeHtml(jobId)}"></option>`).join("")}</datalist>
     ${renderModuleFiles(module)}
     ${renderFileDetail(module)}
   `;
@@ -11353,6 +12037,7 @@ function downloadExport() {
     teamMembers: state.teamMembers,
     tasks: state.tasks,
     sketchRooms: state.sketchRooms,
+    sketchWalls: state.sketchWalls,
     performanceMetrics: state.performanceMetrics,
     actionDashboard: state.actionDashboard,
     skillPacks: state.skillPacks,
@@ -11390,7 +12075,11 @@ async function copyLaunchEnv() {
     "FIREBASE_ALLOWED_LOGIN_EMAILS=david@brothersrestoration.org",
     "FIREBASE_SESSION_TTL_MS=172800000",
     "SUPER_ADMIN_EMAILS=david@brothersrestoration.org",
-    "FIREBASE_SERVICE_ACCOUNT_JSON=<paste Firebase service-account JSON in Vercel>",
+    "GCP_PROJECT_ID=brothers-restoration-website",
+    "GCP_PROJECT_NUMBER=80592032671",
+    "GCP_SERVICE_ACCOUNT_EMAIL=firebase-adminsdk-fbsvc@brothers-restoration-website.iam.gserviceaccount.com",
+    "GCP_WORKLOAD_IDENTITY_POOL_ID=vercel",
+    "GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID=vercel",
     "RESEND_API_KEY=<optional invite email provider key>",
     "INVITE_FROM_EMAIL=Brothers OS <access@brothers.ad>"
   ].join("\n");
@@ -11562,19 +12251,26 @@ document.addEventListener("click", (event) => {
   if (action === "create-payment-rail") return createPaymentRailSetup(actionElement.dataset.method || "Payment", actionElement.dataset.route || "gateway-ready", actionElement.dataset.detail || "Payment rail setup");
   if (action === "complete-task") return completeTask(id);
   if (action === "professionalize-sketch") return professionalizeSketch();
+  if (action === "save-sketch-file") return saveSketchWorkspaceFile();
+  if (action === "undo-sketch") return undoSketchChange();
+  if (action === "delete-sketch-wall") return deleteSketchWall(id);
+  if (action === "select-sketch-wall") {
+    const wall = state.sketchWalls.find((item) => item.id === id);
+    if (wall) {
+      state.selectedSketchWallId = wall.id;
+      state.selectedSketchRoomId = wall.roomIds[0] || state.selectedSketchRoomId;
+      persist();
+      render();
+    }
+    return;
+  }
   if (action === "select-sketch-room") {
     const room = state.sketchRooms.find((item) => item.id === id);
     if (room) {
-      createFile({
-        moduleKey: "sketch",
-        title: `${room.name} sketch room`,
-        type: "Sketch room",
-        owner: "Estimator",
-        status: "Active",
-        priority: "Medium",
-        relatedJob: room.assignedJob,
-        notes: `${room.width} x ${room.height}\n${room.notes}\nScribble: ${room.scribble}`
-      });
+      state.selectedSketchRoomId = room.id;
+      state.selectedSketchWallId = room.wallIds.find((wallId) => state.sketchWalls.some((wall) => wall.id === wallId)) || state.selectedSketchWallId;
+      persist();
+      render();
     }
     return;
   }
@@ -11713,6 +12409,15 @@ document.addEventListener("submit", (event) => {
   if (type === "sketch-room") {
     addSketchRoom(formData);
   }
+  if (type === "sketch-connected-room") {
+    addConnectedSketchRoom(formData);
+  }
+  if (type === "sketch-wall") {
+    addSketchWall(formData);
+  }
+  if (type === "sketch-wall-edit") {
+    editSketchWall(formData);
+  }
   if (type === "defensibility-review") {
     generateDefensibilityReview(formData);
   }
@@ -11842,6 +12547,12 @@ document.addEventListener("submit", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  const actionElement = event.target.closest?.('[role="button"][data-action]');
+  if (actionElement && (event.key === "Enter" || event.key === " ")) {
+    event.preventDefault();
+    actionElement.click();
+    return;
+  }
   if (!state.modal) return;
   const dialog = app.querySelector('.modal-backdrop [role="dialog"]');
   if (!dialog) return;
