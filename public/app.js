@@ -11,18 +11,36 @@ import { normalizeSectionButtonUrl } from "./ui-security.js";
 const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES : [];
 const storageKey = "brothers-os-workspace-v2";
 const remoteWorkspaceFields = [
-  "files", "queue", "activity", "standardsOutputs", "learnedJargon",
+  "files", "moduleRecords", "queue", "activity", "standardsOutputs", "learnedJargon",
   "equipmentDeployments", "dryLogs", "jobBoards", "contacts", "branches",
   "priceItems", "xactimateImports", "estimateDraft", "quickBooksConnection",
   "accountProfile", "teamMembers", "tasks", "photoRecords", "contractorBills", "sketchRooms", "sketchWalls",
   "performanceMetrics", "actionDashboard", "skillPacks", "dataVaults",
   "institutionalReview", "serviceSettings", "serviceRequests",
   "calloutSchedule", "industryProfile", "aiCopilotProfile", "aiCopilotMemory",
-  "aiCopilotMessages", "timeEntries"
+  "aiCopilotMessages", "timeEntries", "activeClockSessions"
 ];
+const fieldUserEditableWorkspaceFields = new Set([
+  "files", "equipmentDeployments", "dryLogs", "jobBoards", "tasks",
+  "photoRecords", "contractorBills", "serviceRequests", "timeEntries", "activeClockSessions"
+]);
+const ownerManagedJobGateIds = new Set(["authorization", "deposit", "invoice"]);
 const adminAccessCode = "Issued by Super Admin";
 const employeeAllowedModuleKeys = ["jobs", "drylogs", "time", "equipment", "photos", "forms", "communications"];
 const defaultContractorModuleKeys = ["contractorportal", "daily", "jobs", "time", "equipment", "photos", "payments", "communications", "settings"];
+const durableMutationActions = new Set([
+  "clear-activity", "reset-action-dashboard", "run-institutional-review", "create-investor-report",
+  "toggle-skill-pack", "toggle-data-vault", "mark-callout-scheduled", "complete-service-request",
+  "complete-file", "status-review", "status-active", "duplicate-file", "delete-file",
+  "create-equipment-invoice", "generate-rebuttal", "run-live-source-check", "toggle-job-gate",
+  "create-job-packet", "create-drylog-packet", "log-contact-touch", "create-contact-file",
+  "toggle-branch-module", "create-branch-file", "create-estimate-invoice", "remove-estimate-line",
+  "import-sample-pricing", "connect-quickbooks", "create-payment-rail", "complete-task",
+  "professionalize-sketch", "save-sketch-file", "undo-sketch", "delete-sketch-wall",
+  "ai-copilot-ask", "ai-copilot-prompt", "save-standards-output", "complete-queue", "seed-queue",
+  "clock-out", "reset-user-permissions", "toggle-user-disabled", "delete-user",
+  "revoke-employee-invitation", "complete-module-record"
+]);
 const brandLogoPath = brothersLogoDataUrl;
 const insuranceStatuses = ["all", "new", "reviewed", "in-progress", "completed", "rejected"];
 const rbacActionKeys = [
@@ -650,7 +668,7 @@ const defaultBranches = [
     status: "Limited access",
     linkedBranchIds: ["BR-1001"],
     modules: ["universalintake", "dispatch", "time", "fieldmobile"],
-    notes: "Employee-only access code can be shared for time and dispatch without opening owner screens."
+    notes: "Employee access is limited to Google-verified field accounts for time and dispatch without opening owner screens."
   }
 ];
 
@@ -748,7 +766,7 @@ const defaultTeamMembers = [
     accountType: "Employee",
     access: "Jobs, dry logs, time, photos, equipment, communication board",
     permissions: ["jobs", "drylogs", "time", "photos", "equipment", "communications"],
-    accessCode: "FIELD-2039",
+    accessCode: "",
     assignedJobIds: ["J-2039"],
     assignedTaskIds: ["TASK-1001"],
     status: "Invited",
@@ -1007,6 +1025,7 @@ const defaultState = {
   category: "all",
   search: "",
   files: defaultFiles,
+  moduleRecords: [],
   queue: defaultQueue,
   activity: defaultActivity,
   standardsOutputs: defaultStandardsOutputs,
@@ -1065,8 +1084,10 @@ const defaultState = {
     status: "browser-cache",
     recordCount: 0,
     lastSavedAt: "",
+    revision: "",
     error: ""
   },
+  workspaceIdentity: null,
   authSession: null,
   accessContext: null,
   authLoading: false,
@@ -1084,6 +1105,7 @@ const defaultState = {
   adminEditMode: false,
   adminEditAssetUrl: "",
   timeEntries: [],
+  activeClockSessions: [],
   clockSession: null,
   employeeMode: false,
   worker: null,
@@ -1179,12 +1201,13 @@ function moduleVisibilityPayload(formData) {
   };
 }
 
-function renderModuleAccessPicker({ selectedKeys = [], legend = "Allowed modules" } = {}) {
+function renderModuleAccessPicker({ selectedKeys = [], allowedKeys = null, legend = "Allowed modules" } = {}) {
   const selected = new Set(moduleKeysFromList(selectedKeys));
+  const allowed = Array.isArray(allowedKeys) ? new Set(moduleKeysFromList(allowedKeys)) : null;
   const groupedKeys = taskTypeGroups
     .map((group) => ({
       ...group,
-      moduleKeys: group.keys.filter((key) => moduleByKey(key))
+      moduleKeys: group.keys.filter((key) => moduleByKey(key) && (!allowed || allowed.has(key)))
     }))
     .filter((group) => group.moduleKeys.length);
   return `
@@ -1228,7 +1251,12 @@ function normalizeTeamMember(member) {
     assignedJobIds: normalizeListValue(member.assignedJobIds || member.assignedJobs || ""),
     assignedTaskIds: normalizeListValue(member.assignedTaskIds || member.tasks || ""),
     status: member.status || "Invited",
-    lastLogin: member.lastLogin || ""
+    lastLogin: member.lastLogin || "",
+    phone: String(member.phone || "").trim(),
+    jobTitle: String(member.jobTitle || "").trim(),
+    employmentType: String(member.employmentType || "").trim(),
+    startDate: String(member.startDate || "").trim(),
+    pendingGrantId: String(member.pendingGrantId || "").trim()
   };
 }
 
@@ -1263,6 +1291,7 @@ function normalizeState(next, { includeDefaults = true } = {}) {
 
   next.files = mergedArray(next.files, defaultFiles);
   next.files = next.files.map(normalizeFileRecord);
+  next.moduleRecords = Array.isArray(next.moduleRecords) ? next.moduleRecords : [];
   next.queue = plainArray(next.queue, defaultQueue);
   next.activity = plainArray(next.activity, defaultActivity);
   next.standardsOutputs = plainArray(next.standardsOutputs, defaultStandardsOutputs);
@@ -1355,6 +1384,9 @@ function normalizeState(next, { includeDefaults = true } = {}) {
   next.adminEditMode = false;
   next.adminEditAssetUrl = "";
   next.timeEntries = Array.isArray(next.timeEntries) ? next.timeEntries : [];
+  next.activeClockSessions = Array.isArray(next.activeClockSessions)
+    ? next.activeClockSessions
+    : (next.clockSession ? [next.clockSession] : []);
   next.clockSession = next.clockSession || null;
   next.employeeMode = Boolean(next.employeeMode);
   next.worker = next.worker || null;
@@ -1372,6 +1404,7 @@ function buildPersistedState() {
     category: state.category,
     search: state.search,
     files: state.files,
+    moduleRecords: state.moduleRecords,
     queue: state.queue,
     activity: state.activity,
     standardsOutputs: state.standardsOutputs,
@@ -1411,10 +1444,12 @@ function buildPersistedState() {
     aiCopilotQuery: state.aiCopilotQuery,
     aiCopilotMessages: state.aiCopilotMessages,
     timeEntries: state.timeEntries,
+    activeClockSessions: state.activeClockSessions,
     clockSession: state.clockSession,
     employeeMode: state.employeeMode,
     worker: state.worker,
-    selectedFileId: state.selectedFileId
+    selectedFileId: state.selectedFileId,
+    workspaceIdentity: state.workspaceIdentity
   };
 }
 
@@ -1444,27 +1479,31 @@ function sanitizeRemoteWorkspaceValue(value, key = "", depth = 0) {
 
 function buildRemoteWorkspaceState() {
   const persisted = buildPersistedState();
+  const fields = ["worker", "contractor"].includes(currentRoleId())
+    ? remoteWorkspaceFields.filter((field) => fieldUserEditableWorkspaceFields.has(field))
+    : remoteWorkspaceFields;
   return Object.fromEntries(
-    remoteWorkspaceFields
+    fields
       .filter((field) => Object.prototype.hasOwnProperty.call(persisted, field))
       .map((field) => [field, sanitizeRemoteWorkspaceValue(persisted[field], field)])
   );
 }
 
 function scheduleWorkspaceSync() {
-  if (workspaceHydrating || !state.authSession || !state.firebase?.adminConfigured) return;
+  if (workspaceHydrating || !workspaceWritesReady()) return;
   workspaceSyncQueued = true;
   window.clearTimeout(workspaceSyncTimer);
   workspaceSyncTimer = window.setTimeout(() => {
     workspaceSyncTimer = null;
-    syncWorkspaceState().catch((error) => {
+    syncWorkspaceState().catch(async (error) => {
       console.warn("Brothers OS workspace sync failed.", error);
+      await recoverRejectedWorkspaceState(error);
     });
   }, 300);
 }
 
 async function syncWorkspaceState({ force = false } = {}) {
-  if (!state.authSession || !state.firebase?.adminConfigured) return null;
+  if (!workspaceWritesReady()) return null;
   if (workspaceSyncPromise) {
     workspaceSyncQueued = true;
     return workspaceSyncPromise;
@@ -1487,7 +1526,11 @@ async function syncWorkspaceState({ force = false } = {}) {
       };
       const result = await apiRequest("/api/workspace-state", {
         method: "PUT",
-        body: JSON.stringify({ workspaceState })
+        body: JSON.stringify({
+          workspaceState,
+          baseRevision: state.workspacePersistence.revision || "",
+          baseUpdatedAt: state.workspacePersistence.lastSavedAt || ""
+        })
       });
       lastWorkspacePayload = serialized;
       state.workspacePersistence = {
@@ -1496,6 +1539,7 @@ async function syncWorkspaceState({ force = false } = {}) {
         status: result.durable ? "saved" : "browser-cache",
         recordCount: Number(result.savedRecords || state.workspacePersistence.recordCount || 0),
         lastSavedAt: result.updatedAt || new Date().toISOString(),
+        revision: result.revision || state.workspacePersistence.revision || "",
         error: ""
       };
       lastResult = result;
@@ -1524,78 +1568,127 @@ function replaceWorkspaceStateFromServer(workspaceState = {}) {
   return normalizeState({ ...nextState, ...workspaceState }, { includeDefaults: false });
 }
 
-async function hydrateWorkspaceState({ migrateIfEmpty = true } = {}) {
+function currentWorkspaceIdentity() {
+  if (!state.authSession) return null;
+  return {
+    uid: String(state.authSession.uid || "").trim(),
+    companyId: String(state.authSession.companyId || currentSessionUser()?.companyId || "default-company").trim() || "default-company"
+  };
+}
+
+function workspaceIdentityMatchesCurrent(identity = state.workspaceIdentity) {
+  const current = currentWorkspaceIdentity();
+  return Boolean(current
+    && identity
+    && String(identity.uid || "").trim() === current.uid
+    && String(identity.companyId || "").trim() === current.companyId);
+}
+
+function workspaceRuntimeState() {
+  return {
+    activeKey: state.activeKey,
+    firebase: state.firebase,
+    authSession: state.authSession,
+    accessContext: state.accessContext,
+    authLoading: state.authLoading,
+    authChecked: state.authChecked,
+    authError: state.authError,
+    businessData: state.businessData,
+    communityPosts: state.communityPosts
+  };
+}
+
+function resetWorkspaceForCurrentSession(runtimeState = workspaceRuntimeState()) {
+  state = replaceWorkspaceStateFromServer({});
+  Object.assign(state, runtimeState);
+  state.workspaceIdentity = null;
+}
+
+async function hydrateWorkspaceState({ migrateIfEmpty = true, preserveLocalOnError = false } = {}) {
+  const runtimeState = workspaceRuntimeState();
   if (!state.authSession || !state.firebase?.adminConfigured) {
+    resetWorkspaceForCurrentSession(runtimeState);
+    lastWorkspacePayload = "";
     state.workspacePersistence = {
       ...clone(defaultState.workspacePersistence),
       loaded: true,
       error: state.firebase?.adminConfigured ? "" : "Keyless Firebase Admin access is required for durable shared records."
     };
-    return;
+    persist();
+    return false;
   }
+  const stateBeforeHydration = state;
+  const migrationState = workspaceIdentityMatchesCurrent() ? buildRemoteWorkspaceState() : null;
   workspaceHydrating = true;
+  resetWorkspaceForCurrentSession(runtimeState);
+  state.workspacePersistence = {
+    ...clone(defaultState.workspacePersistence),
+    status: "loading"
+  };
   try {
     const result = await apiRequest("/api/workspace-state");
     if (result.exists && result.workspaceState && typeof result.workspaceState === "object") {
-      const runtimeState = {
-        activeKey: state.activeKey,
-        firebase: state.firebase,
-        authSession: state.authSession,
-        accessContext: state.accessContext,
-        authLoading: state.authLoading,
-        authChecked: state.authChecked,
-        authError: state.authError,
-        businessData: state.businessData,
-        communityPosts: state.communityPosts
-      };
       state = replaceWorkspaceStateFromServer(result.workspaceState);
       Object.assign(state, runtimeState);
       applyHighestPricingPolicy();
       lastWorkspacePayload = JSON.stringify(buildRemoteWorkspaceState());
-    } else if (migrateIfEmpty && ["super_admin", "business_owner"].includes(currentRoleId())) {
-      const workspaceState = buildRemoteWorkspaceState();
+    } else if (migrateIfEmpty && migrationState && ["super_admin", "business_owner"].includes(currentRoleId())) {
       const saved = await apiRequest("/api/workspace-state", {
         method: "PUT",
-        body: JSON.stringify({ workspaceState })
+        body: JSON.stringify({
+          workspaceState: migrationState,
+          baseRevision: result.revision || "",
+          baseUpdatedAt: result.updatedAt || ""
+        })
       });
-      lastWorkspacePayload = JSON.stringify(workspaceState);
+      state = replaceWorkspaceStateFromServer(migrationState);
+      Object.assign(state, runtimeState);
+      lastWorkspacePayload = JSON.stringify(migrationState);
       result.recordCount = saved.savedRecords || 0;
       result.updatedAt = saved.updatedAt || "";
+      result.revision = saved.revision || "";
     } else {
-      const runtimeState = {
-        activeKey: state.activeKey,
-        firebase: state.firebase,
-        authSession: state.authSession,
-        accessContext: state.accessContext,
-        authLoading: state.authLoading,
-        authChecked: state.authChecked,
-        authError: state.authError,
-        businessData: state.businessData,
-        communityPosts: state.communityPosts
-      };
-      state = replaceWorkspaceStateFromServer({});
-      Object.assign(state, runtimeState);
       lastWorkspacePayload = JSON.stringify(buildRemoteWorkspaceState());
     }
+    state.workspaceIdentity = currentWorkspaceIdentity();
     state.workspacePersistence = {
       durable: Boolean(result.durable),
       loaded: true,
       status: result.durable ? "saved" : "browser-cache",
       recordCount: Number(result.recordCount || 0),
       lastSavedAt: result.updatedAt || "",
+      revision: result.revision || "",
       error: ""
     };
+    reconcileActiveClockSession();
     persist();
+    return true;
   } catch (error) {
+    if (preserveLocalOnError) {
+      state = stateBeforeHydration;
+    } else {
+      resetWorkspaceForCurrentSession(runtimeState);
+    }
     state.workspacePersistence = {
-      ...state.workspacePersistence,
+      ...(preserveLocalOnError ? state.workspacePersistence : clone(defaultState.workspacePersistence)),
       loaded: true,
       status: "error",
       error: error.message || "Workspace records could not be loaded."
     };
+    persist();
+    return false;
   } finally {
     workspaceHydrating = false;
   }
+}
+
+async function recoverRejectedWorkspaceState(error) {
+  const message = error?.message || "Workspace could not be saved. Reload the latest records and try again.";
+  const restored = await hydrateWorkspaceState({ migrateIfEmpty: false, preserveLocalOnError: true });
+  setToast(restored
+    ? `${message} Latest shared records restored.`
+    : `${message} The server could not reload, so your unsaved local changes remain in this browser.`);
+  render();
 }
 
 function persist() {
@@ -1652,6 +1745,33 @@ function isLocalSmokePreview() {
 function isOfflineSmokePreview() {
   return isLocalSmokePreview()
     && new URLSearchParams(window.location.search).get("smoke") === "offline";
+}
+
+function workspaceWritesReady() {
+  if (isOfflineSmokePreview()) return true;
+  const persistence = state.workspacePersistence || {};
+  return Boolean(state.authSession
+    && state.firebase?.adminConfigured
+    && persistence.loaded
+    && persistence.durable
+    && ["saved", "saving"].includes(persistence.status)
+    && workspaceIdentityMatchesCurrent());
+}
+
+function blockUnavailableWorkspaceWrite() {
+  setToast("Secure shared storage is unavailable; no changes were made");
+  render();
+}
+
+function renderWorkspaceDurabilityNotice() {
+  if (!state.authSession || workspaceWritesReady()) return "";
+  const persistenceMessage = String(state.workspacePersistence?.error || "").trim();
+  return `
+    <div class="inline-notice critical-notice workspace-write-lock" role="status">
+      <strong>Shared record editing is locked</strong>
+      <span>${escapeHtml(persistenceMessage || "Firebase Admin must be active before jobs, tasks, invoices, files, employee profiles, or module records can be changed. This prevents browser-only data from appearing saved.")}</span>
+    </div>
+  `;
 }
 
 function getLoginAccessOptions() {
@@ -2728,10 +2848,23 @@ function closeModal() {
   if (returnFocus) queueMicrotask(() => restoreModalTrigger(returnFocus));
 }
 
+function canEditFileRecord(file) {
+  return !(currentRoleId() === "worker"
+    && String(file?.sourceType || "").trim().toLowerCase() === "taskassignment");
+}
+
+function canDeleteWorkspaceRecords() {
+  return ["super_admin", "business_owner", "franchise_owner"].includes(currentRoleId());
+}
+
 function updateFileStatus(fileId, status) {
   const file = state.files.find((item) => item.id === fileId);
   if (!file) {
     setToast("That file is no longer available.");
+    return render();
+  }
+  if (!canEditFileRecord(file)) {
+    setToast("Complete the assigned ticket with GPS instead");
     return render();
   }
   file.status = status;
@@ -2747,6 +2880,10 @@ function duplicateFile(fileId) {
   const file = state.files.find((item) => item.id === fileId);
   if (!file) {
     setToast("That file is no longer available.");
+    return render();
+  }
+  if (!canEditFileRecord(file)) {
+    setToast("Assignment files are managed through the ticket workflow");
     return render();
   }
   const now = new Date().toISOString();
@@ -2771,6 +2908,10 @@ function deleteFile(fileId) {
   const file = state.files.find((item) => item.id === fileId);
   if (!file) {
     setToast("That file is no longer available.");
+    return render();
+  }
+  if (!canDeleteWorkspaceRecords()) {
+    setToast("Only an authorized workspace owner can delete shared files");
     return render();
   }
   state.files = state.files.filter((item) => item.id !== fileId);
@@ -3506,6 +3647,10 @@ function jobTimelinePosition(job, bounds) {
 }
 
 function toggleJobGate(jobId, gateId) {
+  if (currentRoleId() === "worker" && ownerManagedJobGateIds.has(String(gateId || ""))) {
+    setToast("This gate is managed by the employer");
+    return render();
+  }
   const job = state.jobBoards.find((item) => item.id === jobId);
   const gate = job?.gates?.find((item) => item.id === gateId);
   if (!gate) return;
@@ -3756,17 +3901,95 @@ function currentContractorId() {
   return state.authSession?.contractorId || currentSessionUser()?.contractorId || "";
 }
 
-function normalizeLocalAccessCode(value) {
-  return String(value || "").trim().toUpperCase().replace(/[\s-]+/g, "");
+function employeeEmployerOptions() {
+  const employers = new Map();
+  const addEmployer = (record = {}) => {
+    const roleId = String(record.roleId || record.role || record.accountType || "").toLowerCase();
+    const contractorId = String(record.contractorId || record.employerContractorId || "").trim();
+    if (!contractorId || !roleId.includes("contractor") || employers.has(contractorId)) return;
+    employers.set(contractorId, {
+      contractorId,
+      label: String(record.displayName || record.name || record.email || contractorId).trim()
+    });
+  };
+  (state.accessContext?.users || []).forEach(addEmployer);
+  (state.teamMembers || []).forEach(addEmployer);
+  return Array.from(employers.values()).sort((left, right) => left.label.localeCompare(right.label));
 }
 
-function employeeAccessCodeFor(member) {
+function displayablePortalAccessCodeFor(member) {
+  if (/worker|employee/i.test(`${member?.roleId || ""} ${member?.accountType || ""} ${member?.role || ""}`)) return "";
   return String(member?.accessCode || "").trim().toUpperCase();
 }
 
+function mapEmployeeGrantToTeamMember(grant = {}) {
+  const grantId = String(grant.id || grant.grantId || "").trim();
+  const grantStatus = String(grant.status || "issued").trim().toLowerCase();
+  const status = grantStatus === "issued"
+    ? "Invitation pending"
+    : grantStatus === "active"
+      ? "Active"
+      : grantStatus === "superseded"
+        ? "Invite superseded"
+        : grantStatus === "expired"
+          ? "Invite expired"
+          : grant.status || "Invitation pending";
+  return normalizeTeamMember({
+    id: grant.firebaseUid || `invite-${grantId || normalizePriceToken(grant.email || grant.displayName || "employee")}`,
+    pendingGrantId: grantStatus === "issued" ? grantId : "",
+    name: grant.displayName || grant.email || "Invited employee",
+    email: grant.email || "",
+    role: "worker",
+    roleId: "worker",
+    accountType: "worker",
+    access: "employee portal",
+    permissions: grant.visiblePageIds || grant.visibleTabIds || employeeAllowedModuleKeys,
+    visibleTabIds: grant.visibleTabIds || [],
+    visiblePageIds: grant.visiblePageIds || [],
+    assignedJobIds: grant.assignedJobIds || [],
+    assignedTaskIds: grant.assignedTaskIds || [],
+    status,
+    companyId: grant.companyId || "",
+    franchiseIds: grant.franchiseIds || [],
+    contractorId: grant.contractorId || "",
+    employerUid: grant.employerUid || "",
+    employerEmail: grant.employerEmail || "",
+    employerContractorId: grant.employerContractorId || grant.contractorId || "",
+    employmentStatus: grant.employmentStatus || "invited",
+    onboardingMode: "employee_link",
+    phone: grant.phone || "",
+    jobTitle: grant.jobTitle || "Field employee",
+    employmentType: grant.employmentType || "Employee",
+    startDate: grant.startDate || "",
+    accessExpiresAt: grant.expiresAt || "",
+    accessScope: grant.accessScope || "employee_portal"
+  });
+}
+
+function employeeDirectoryMembers() {
+  const members = new Map();
+  const identityKey = (member = {}) => String(member.email || member.id || "").trim().toLowerCase();
+  const put = (member) => {
+    const normalized = normalizeTeamMember(member);
+    const key = identityKey(normalized);
+    if (key) members.set(key, normalized);
+  };
+  (state.accessContext?.accessGrants || [])
+    .filter((grant) => grant.onboardingMode === "employee_link" && !["superseded", "revoked"].includes(String(grant.status || "").toLowerCase()))
+    .slice()
+    .reverse()
+    .forEach((grant) => put(mapEmployeeGrantToTeamMember(grant)));
+  (state.teamMembers || []).forEach(put);
+  (state.accessContext?.users || []).map(mapUserToTeamMember).forEach(put);
+  return Array.from(members.values()).sort((left, right) => {
+    const leftPending = left.pendingGrantId ? 0 : 1;
+    const rightPending = right.pendingGrantId ? 0 : 1;
+    return leftPending - rightPending || String(left.name || left.email).localeCompare(String(right.name || right.email));
+  });
+}
+
 function assignableTeamMembers() {
-  const secureUsers = (state.accessContext?.users || []).map(mapUserToTeamMember);
-  return mergeById(state.teamMembers || [], secureUsers).map(normalizeTeamMember);
+  return employeeDirectoryMembers();
 }
 
 function mergeSessionTeamMembers(users = []) {
@@ -3791,7 +4014,7 @@ function applyAuthenticatedPortalMode(sessionPayload) {
     visiblePageIds: session.visiblePageIds || []
   };
   const member = normalizeTeamMember(mapUserToTeamMember(secureUser));
-  state.worker = fieldSessionForMember(member, "");
+  state.worker = fieldSessionForMember(member);
   state.employeeMode = true;
   const allowedKeys = employeeModuleKeys();
   state.activeKey = allowedKeys.includes(state.activeKey) ? state.activeKey : (allowedKeys.includes("time") ? "time" : allowedKeys[0] || "time");
@@ -3823,6 +4046,25 @@ function currentWorkerProfile() {
     assignedJobIds: state.worker?.assignedJobIds?.length ? state.worker.assignedJobIds : (member?.assignedJobIds || []),
     assignedTaskIds: state.worker?.assignedTaskIds?.length ? state.worker.assignedTaskIds : (member?.assignedTaskIds || [])
   };
+}
+
+function clockSessionMatchesCurrentWorker(session) {
+  const profile = currentWorkerProfile();
+  const workerId = String(profile.id || state.authSession?.uid || "").trim();
+  const workerEmail = String(profile.email || state.authSession?.email || "").trim().toLowerCase();
+  return Boolean((workerId && String(session?.workerId || "").trim() === workerId)
+    || (workerEmail && String(session?.workerEmail || "").trim().toLowerCase() === workerEmail));
+}
+
+function reconcileActiveClockSession() {
+  state.activeClockSessions = Array.isArray(state.activeClockSessions) ? state.activeClockSessions : [];
+  state.clockSession = state.activeClockSessions.find(clockSessionMatchesCurrentWorker) || null;
+  return state.clockSession;
+}
+
+function visibleActiveClockSessions() {
+  const sessions = Array.isArray(state.activeClockSessions) ? state.activeClockSessions : [];
+  return state.employeeMode ? sessions.filter(clockSessionMatchesCurrentWorker) : sessions;
 }
 
 function employeeModuleKeys() {
@@ -4116,7 +4358,7 @@ function isAdminCredentialGap(error) {
 function upsertAccessGrant(grant) {
   if (!grant) return;
   state.accessContext = state.accessContext || {};
-  state.accessContext.accessGrants = mergeById([grant], state.accessContext.accessGrants || []);
+  state.accessContext.accessGrants = mergeById(state.accessContext.accessGrants || [], [grant]);
 }
 
 function upsertManagedUser(user) {
@@ -4375,7 +4617,10 @@ async function createEmployeeInvitation(formData) {
   const payload = {
     displayName: String(formData.get("displayName") || "").trim(),
     email: String(formData.get("email") || "").trim(),
+    phone: String(formData.get("phone") || "").trim(),
     jobTitle: String(formData.get("jobTitle") || "Field employee").trim(),
+    employmentType: String(formData.get("employmentType") || "Employee").trim(),
+    startDate: String(formData.get("startDate") || "").trim(),
     companyId: String(formData.get("companyId") || state.authSession?.companyId || "default-company").trim(),
     franchiseIds: csvValues(formData.get("franchiseIds")),
     contractorId: String(formData.get("contractorId") || currentContractorId()).trim(),
@@ -4410,6 +4655,45 @@ async function updateEmployeeAssignments(uid, assignedJobIds, assignedTaskIds) {
   });
   if (result.user) upsertManagedUser(result.user);
   return result.user || null;
+}
+
+async function updatePendingEmployeeInvitation(grantId, updates = {}) {
+  if (!state.firebase.enabled || !state.authSession || !canDo("inviteWorkers") || !grantId) return null;
+  const result = await apiRequest(`/api/employee-invitations/${encodeURIComponent(grantId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(updates)
+  });
+  if (result.grant) upsertAccessGrant(result.grant);
+  return result.grant || null;
+}
+
+async function savePendingEmployeeInvitation(formData) {
+  const grantId = String(formData.get("grantId") || "").trim();
+  await updatePendingEmployeeInvitation(grantId, {
+    displayName: String(formData.get("displayName") || "").trim(),
+    phone: String(formData.get("phone") || "").trim(),
+    jobTitle: String(formData.get("jobTitle") || "").trim(),
+    employmentType: String(formData.get("employmentType") || "Employee").trim(),
+    startDate: String(formData.get("startDate") || "").trim(),
+    assignedJobIds: csvValues(formData.get("assignedJobIds")),
+    assignedTaskIds: csvValues(formData.get("assignedTaskIds")),
+    visibleModuleKeys: formData.getAll("visibleModuleKeys").map(String)
+  });
+  state.modal = null;
+  setToast("Pending employee profile updated");
+  await refreshAccessContext();
+  render();
+}
+
+async function revokePendingEmployeeInvitation(grantId) {
+  if (!state.firebase.enabled || !state.authSession || !canDo("inviteWorkers") || !grantId) return null;
+  const result = await apiRequest(`/api/employee-invitations/${encodeURIComponent(grantId)}`, { method: "DELETE" });
+  if (result.grant) upsertAccessGrant(result.grant);
+  state.modal = null;
+  setToast("Employee invitation revoked");
+  await refreshAccessContext();
+  render();
+  return result.grant || null;
 }
 
 async function createCommunityPost(formData) {
@@ -4631,6 +4915,8 @@ function mapUserToTeamMember(member) {
     onboardingMode: member.onboardingMode || "",
     phone: member.phone || "",
     jobTitle: member.jobTitle || "",
+    employmentType: member.employmentType || "",
+    startDate: member.startDate || "",
     accessExpiresAt: member.accessExpiresAt || "",
     accessScope: member.accessScope || ""
   };
@@ -4818,7 +5104,7 @@ function selectedBrowserFile(formData, name) {
 function readImageDataUrl(file) {
   if (!file || typeof FileReader === "undefined") return Promise.resolve("");
   if (Number(file.size || 0) > 1800000) {
-    throw new Error("Photo is too large for local field storage. Use a compressed image or paste an evidence link.");
+    throw new Error("Photo is too large for local field storage. Choose a compressed image.");
   }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -4911,13 +5197,16 @@ async function addPhotoEvidence(formData) {
     setToast("Select a job before saving photo evidence");
     return render();
   }
+  if (!file) {
+    throw new Error("Choose a photo file before saving evidence.");
+  }
   const uploadedAsset = file ? await uploadWorkspacePhoto(file, { jobId, taskId }) : null;
   const record = {
     id: createId("PHOTO"),
     jobId,
     room: String(formData.get("room") || "Field area").trim(),
     category: String(formData.get("category") || "Progress").trim(),
-    photoRef: String(formData.get("photoRef") || file?.name || "").trim(),
+    photoRef: String(file.name || "job-photo").trim(),
     photoDataUrl: uploadedAsset?.localDataUrl || "",
     photoUrl: uploadedAsset?.assetUrl || "",
     assetId: uploadedAsset?.id || "",
@@ -4930,11 +5219,12 @@ async function addPhotoEvidence(formData) {
     workerEmail: worker.email || "",
     createdAt: new Date().toISOString()
   };
-  state.photoRecords = [record, ...(state.photoRecords || [])];
   const job = markJobGateDone(record.jobId, "photos");
   if (task && task.moduleKey === "photos") {
-    task.status = "Complete";
+    task.photoEvidenceIds = Array.from(new Set([...(task.photoEvidenceIds || []), record.id]));
+    task.photoEvidenceAt = record.createdAt;
   }
+  state.photoRecords = [record, ...(state.photoRecords || [])];
   createFile({
     moduleKey: "photos",
     linkedModuleKeys: ["jobs", "drylogs", "time", "equipment", "payments", "defensibility", "closeout"],
@@ -4959,7 +5249,8 @@ async function addPhotoEvidence(formData) {
   });
   addActivity(`${record.workerName} saved photo evidence for ${record.jobId}.`);
   persist();
-  setToast("Photo evidence saved");
+  await syncWorkspaceState({ force: true });
+  setToast(task ? "Photo evidence saved; sign the ticket with GPS to complete it" : "Photo evidence saved");
   render();
 }
 
@@ -5143,7 +5434,7 @@ function createBranchFile(branchId) {
   if (!branch) return;
   createFile({
     moduleKey: "branches",
-    linkedModuleKeys: ["branchbench", "moduletoggles", "licensing", "globalindexes"],
+    linkedModuleKeys: ["team", "moduletoggles", "licensing", "globalindexes"],
     sourceType: "branch",
     sourceId: branch.id,
     title: `${branch.name} access profile`,
@@ -6101,14 +6392,14 @@ async function connectQuickBooks() {
 }
 
 async function addTeamMember(formData) {
-  const accountType = String(formData.get("accountType") || "Employee");
+  const accountType = String(formData.get("accountType") || "Contractor portal");
   const permissions = formData.getAll("permissions").map(String);
   const assignedJobIds = csvValues(formData.get("assignedJobIds"));
-  const roleId = accountType === "Contractor portal"
-    ? "contractor"
-    : accountType === "Administrator"
-      ? "business_owner"
-      : "worker";
+  const roleId = {
+    "Contractor portal": "contractor",
+    "Franchise owner": "franchise_owner",
+    "Business owner": "business_owner"
+  }[accountType] || "contractor";
   const payload = {
     displayName: String(formData.get("name") || "Team member").trim(),
     email: String(formData.get("email") || "").trim(),
@@ -6194,14 +6485,22 @@ async function addTask(formData) {
   const assigneeId = String(formData.get("assigneeId") || assignableTeamMembers()[0]?.id || "");
   const assignee = assignableTeamMembers().find((member) => member.id === assigneeId);
   const relatedJob = String(formData.get("relatedJob") || "").trim();
+  const relatedJobRecord = jobByJobId(relatedJob);
+  const moduleKey = String(formData.get("moduleKey") || "jobs");
+  if (assignee && !visibleModuleKeysForMember(assignee).includes(moduleKey)) {
+    throw new Error(`Enable ${moduleByKey(moduleKey)?.label || moduleKey} in this employee's profile before assigning the ticket.`);
+  }
   const task = {
     id: createId("TASK"),
     title: String(formData.get("title") || "Task").trim(),
     assigneeId,
     assigneeName: assignee?.name || "",
     assigneeEmail: assignee?.email || "",
-    moduleKey: String(formData.get("moduleKey") || "jobs"),
+    moduleKey,
     relatedJob,
+    franchiseId: String(relatedJobRecord?.franchiseId || "").trim(),
+    branchId: String(relatedJobRecord?.branchId || "").trim(),
+    contractorId: String(assignee?.employerContractorId || assignee?.contractorId || relatedJobRecord?.contractorId || "").trim(),
     due: String(formData.get("due") || ""),
     status: "Open",
     priority: String(formData.get("priority") || "Medium")
@@ -6209,19 +6508,13 @@ async function addTask(formData) {
   const nextAssignedTaskIds = [...new Set([task.id, ...normalizeListValue(assignee?.assignedTaskIds)])];
   const nextAssignedJobIds = [...new Set([...(relatedJob ? [relatedJob] : []), ...normalizeListValue(assignee?.assignedJobIds)])];
   const secureEmployee = (state.accessContext?.users || []).some((user) => (user.uid || user.id) === assigneeId && user.roleId === "worker");
-  if (secureEmployee) {
-    await updateEmployeeAssignments(assigneeId, nextAssignedJobIds, nextAssignedTaskIds);
-  }
   state.tasks = [task, ...state.tasks];
-  state.teamMembers = (state.teamMembers || []).map((member) => {
-    if (member.id !== assigneeId) return member;
-    return normalizeTeamMember({ ...member, assignedTaskIds: nextAssignedTaskIds, assignedJobIds: nextAssignedJobIds });
-  });
   createFile({
     moduleKey: "team",
     linkedModuleKeys: ["jobs", task.moduleKey, "time", "photos"],
     sourceType: "taskAssignment",
     sourceId: task.id,
+    taskModuleKey: task.moduleKey,
     title: `${assignee?.name || "Unassigned"} task - ${task.title}`,
     type: "Task assignment",
     owner: assignee?.name || "Dispatcher",
@@ -6229,6 +6522,12 @@ async function addTask(formData) {
     priority: task.priority,
     due: task.due,
     relatedJob: task.relatedJob,
+    taskId: task.id,
+    workerId: assignee?.id || "",
+    workerEmail: assignee?.email || "",
+    franchiseId: task.franchiseId,
+    branchId: task.branchId,
+    contractorId: task.contractorId,
     notes: [
       `Task: ${task.title}`,
       `Assignee: ${assignee?.name || "Unassigned"} ${assignee?.email || ""}`.trim(),
@@ -6238,11 +6537,30 @@ async function addTask(formData) {
   });
   addActivity(`Assigned task: ${task.title}.`);
   persist();
+  try {
+    await syncWorkspaceState({ force: true });
+  } catch (error) {
+    await recoverRejectedWorkspaceState(error);
+    throw error;
+  }
+  if (assignee?.pendingGrantId) {
+    await updatePendingEmployeeInvitation(assignee.pendingGrantId, {
+      assignedJobIds: nextAssignedJobIds,
+      assignedTaskIds: nextAssignedTaskIds
+    });
+  } else if (secureEmployee) {
+    await updateEmployeeAssignments(assigneeId, nextAssignedJobIds, nextAssignedTaskIds);
+  }
+  state.teamMembers = (state.teamMembers || []).map((member) => {
+    if (member.id !== assigneeId) return member;
+    return normalizeTeamMember({ ...member, assignedTaskIds: nextAssignedTaskIds, assignedJobIds: nextAssignedJobIds });
+  });
+  persist();
   setToast("Task assigned");
   render();
 }
 
-function fieldSessionForMember(member, accessCode) {
+function fieldSessionForMember(member) {
   const visibleKeys = visibleModuleKeysForMember(member).filter((key) => employeeAllowedModuleKeys.includes(key));
   return {
     id: member.id,
@@ -6259,53 +6577,72 @@ function fieldSessionForMember(member, accessCode) {
     employerUid: member.employerUid || "",
     employerEmail: member.employerEmail || "",
     employerContractorId: member.employerContractorId || member.contractorId || "",
-    jobTitle: member.jobTitle || ""
+    phone: member.phone || "",
+    jobTitle: member.jobTitle || "",
+    employmentType: member.employmentType || "",
+    startDate: member.startDate || ""
   };
 }
 
-function findEmployeeForPortalLogin(identifier, accessCode) {
-  const normalizedCode = normalizeLocalAccessCode(accessCode);
-  const normalizedIdentifier = String(identifier || "").trim().toLowerCase();
-  return assignableTeamMembers().find((member) => {
-    const oneTimeInviteCode = String(state.lastAccessGrant?.email || "").trim().toLowerCase() === String(member.email || "").trim().toLowerCase()
-      ? state.lastAccessGrant?.accessCode
-      : "";
-    const acceptedCodes = [employeeAccessCodeFor(member), oneTimeInviteCode]
-      .map(normalizeLocalAccessCode)
-      .filter(Boolean);
-    const codeMatches = Boolean(normalizedCode && acceptedCodes.includes(normalizedCode));
-    if (!codeMatches) return false;
-    if (!normalizedIdentifier) return true;
-    return [member.id, member.email, member.name]
-      .map((value) => String(value || "").trim().toLowerCase())
-      .some((value) => value === normalizedIdentifier);
-  }) || null;
-}
-
-function loginEmployeePortal(formData) {
-  const identifier = String(formData.get("identifier") || formData.get("email") || formData.get("name") || "").trim();
-  const code = String(formData.get("code") || "").trim();
-  const member = findEmployeeForPortalLogin(identifier, code);
-  if (!member) {
-    setToast("Employee profile or access code was not accepted");
-    return render();
-  }
-  state.teamMembers = (state.teamMembers || []).map((item) =>
-    item.id === member.id ? normalizeTeamMember({ ...item, status: "Active", lastLogin: new Date().toISOString() }) : item
-  );
-  state.worker = fieldSessionForMember(member, code);
-  state.employeeMode = true;
-  state.modal = null;
-  addActivity(`${member.name} entered employee field access.`);
-  persist();
-  routeToModule(employeeModuleKeys()[0] || "time");
-}
-
-function completeTask(taskId) {
+async function completeTask(taskId) {
   const task = state.tasks.find((item) => item.id === taskId);
   if (!task) return;
+  if (currentRoleId() === "worker") {
+    state.activeKey = "time";
+    persist();
+    setToast("Sign the assigned ticket with GPS to complete it");
+    return render();
+  }
+  if (task.status === "Complete") {
+    setToast("Task is already complete");
+    return render();
+  }
+  const assignee = assignableTeamMembers().find((member) => member.id === task.assigneeId
+    || (task.assigneeEmail && String(member.email || "").toLowerCase() === String(task.assigneeEmail).toLowerCase()));
+  const remainingAssignedTaskIds = normalizeListValue(assignee?.assignedTaskIds).filter((id) => id !== taskId);
+  const assignedJobIds = normalizeListValue(assignee?.assignedJobIds);
+  const secureEmployee = (state.accessContext?.users || []).some((user) => {
+    return (user.uid || user.id) === assignee?.id && user.roleId === "worker";
+  });
+  const now = new Date().toISOString();
   task.status = "Complete";
+  task.completedAt = now;
+  task.completedByEmail = state.authSession?.email || state.worker?.email || "";
+  const assignmentFile = state.files.find((file) => file.sourceType === "taskAssignment" && file.sourceId === taskId);
+  if (assignmentFile) {
+    assignmentFile.status = "Complete";
+    assignmentFile.updatedAt = now;
+    assignmentFile.history = [`Task completed ${formatTime(now)}`, ...(assignmentFile.history || [])];
+    assignmentFile.notes = `${assignmentFile.notes || ""}\nCompleted: ${formatTime(now)}`.trim();
+  }
   addActivity(`Completed task: ${task.title}.`);
+  persist();
+  try {
+    await syncWorkspaceState({ force: true });
+  } catch (error) {
+    await recoverRejectedWorkspaceState(error);
+    throw error;
+  }
+  try {
+    if (assignee?.pendingGrantId && canDo("inviteWorkers")) {
+      await updatePendingEmployeeInvitation(assignee.pendingGrantId, {
+        assignedJobIds,
+        assignedTaskIds: remainingAssignedTaskIds
+      });
+    } else if (secureEmployee && canDo("inviteWorkers")) {
+      await updateEmployeeAssignments(assignee.id, assignedJobIds, remainingAssignedTaskIds);
+    }
+  } catch (error) {
+    setToast("Task completed, but the employee assignment profile still needs to be refreshed");
+    return render();
+  }
+  state.teamMembers = (state.teamMembers || []).map((member) => {
+    if (member.id !== task.assigneeId && String(member.email || "").toLowerCase() !== String(task.assigneeEmail || "").toLowerCase()) return member;
+    return normalizeTeamMember({ ...member, assignedTaskIds: normalizeListValue(member.assignedTaskIds).filter((id) => id !== taskId) });
+  });
+  if (state.worker && (state.worker.id === task.assigneeId || String(state.worker.email || "").toLowerCase() === String(task.assigneeEmail || "").toLowerCase())) {
+    state.worker.assignedTaskIds = normalizeListValue(state.worker.assignedTaskIds).filter((id) => id !== taskId);
+  }
   persist();
   setToast("Task complete");
   render();
@@ -7046,7 +7383,53 @@ function resetActionDashboard() {
   render();
 }
 
+function moduleRecordsFor(moduleKey) {
+  const records = (state.moduleRecords || []).filter((record) => {
+    return record.moduleKey === moduleKey || normalizeModuleKeyList(record.linkedModuleKeys || []).includes(moduleKey);
+  });
+  if (!state.employeeMode) return records;
+  const assignedJobs = new Set(normalizeListValue(state.worker?.assignedJobIds));
+  const workerEmail = String(state.worker?.email || state.authSession?.email || "").trim().toLowerCase();
+  return records.filter((record) => {
+    return (record.relatedJob && assignedJobs.has(record.relatedJob))
+      || (workerEmail && String(record.createdByEmail || "").trim().toLowerCase() === workerEmail);
+  });
+}
+
+function canEditModuleWorkflowRecords() {
+  return ["super_admin", "business_owner", "franchise_owner"].includes(currentRoleId());
+}
+
+function updateModuleRecordStatus(recordId, status) {
+  if (!canEditModuleWorkflowRecords()) {
+    setToast("Workflow records are managed by the office");
+    return render();
+  }
+  const record = (state.moduleRecords || []).find((item) => item.id === recordId);
+  if (!record) {
+    setToast("That workflow record is no longer available");
+    return render();
+  }
+  const now = new Date().toISOString();
+  record.status = status;
+  record.updatedAt = now;
+  const linkedFile = state.files.find((file) => file.sourceType === "moduleRecord" && file.sourceId === record.id);
+  if (linkedFile) {
+    linkedFile.status = status;
+    linkedFile.updatedAt = now;
+    linkedFile.history = [`Workflow record changed to ${status}`, ...(linkedFile.history || [])];
+  }
+  addActivity(`${record.subject} moved to ${status}.`);
+  persist();
+  setToast(`Workflow record ${status.toLowerCase()}`);
+  render();
+}
+
 function createWorkbenchRecord(formData) {
+  if (!canEditModuleWorkflowRecords()) {
+    setToast("Workflow records are managed by the office");
+    return render();
+  }
   const module = moduleByKey(String(formData.get("moduleKey") || state.activeKey)) || activeModule();
   const config = moduleWorkbenchConfig(module);
   const values = config.fields.map((field) => ({
@@ -7054,6 +7437,25 @@ function createWorkbenchRecord(formData) {
     value: String(formData.get(field.name) || "").trim()
   }));
   const subject = values.find((item) => item.label === config.subjectLabel)?.value || String(formData.get("subject") || "").trim();
+  const recordId = createId("REC");
+  const now = new Date().toISOString();
+  const record = {
+    id: recordId,
+    moduleKey: module.key,
+    linkedModuleKeys: config.links,
+    recordType: config.fileType,
+    subject: subject || `${module.label} record`,
+    fields: Object.fromEntries(values.filter((item) => item.value).map((item) => [item.label, item.value])),
+    owner: String(formData.get("owner") || "Office").trim() || "Office",
+    status: "Open",
+    priority: String(formData.get("priority") || "Medium"),
+    due: String(formData.get("due") || ""),
+    relatedJob: String(formData.get("relatedJob") || "").trim(),
+    createdByUid: state.authSession?.uid || state.worker?.id || "",
+    createdByEmail: state.authSession?.email || state.worker?.email || "",
+    createdAt: now,
+    updatedAt: now
+  };
   const notes = [
     `${config.title}`,
     module.purpose,
@@ -7066,12 +7468,13 @@ function createWorkbenchRecord(formData) {
     "Workflow checks:",
     ...config.tasks.map((task) => `- ${task}`)
   ].join("\n");
-  createFile({
+  state.moduleRecords = [record, ...(state.moduleRecords || [])];
+  const file = createFile({
     moduleKey: module.key,
     linkedModuleKeys: config.links,
-    sourceType: "moduleWorkbench",
-    sourceId: `${module.key}-${Date.now()}`,
-    title: subject || `${module.label} record`,
+    sourceType: "moduleRecord",
+    sourceId: recordId,
+    title: record.subject,
     type: config.fileType,
     owner: String(formData.get("owner") || "Office"),
     status: "Open",
@@ -7080,6 +7483,8 @@ function createWorkbenchRecord(formData) {
     relatedJob: String(formData.get("relatedJob") || ""),
     notes
   });
+  record.fileId = file.id;
+  persist();
 }
 
 function pinPosition(deployment, bounds) {
@@ -7238,15 +7643,23 @@ function createEquipmentInvoice(deploymentId) {
 }
 
 async function clockIn(formData) {
+  if (reconcileActiveClockSession()) {
+    setToast("This account already has an active shift. Clock out before starting another.");
+    return render();
+  }
   const gps = await requestGps();
+  if (!Number.isFinite(gps?.latitude) || !Number.isFinite(gps?.longitude)) {
+    setToast("GPS permission and a valid position are required to clock in");
+    return render();
+  }
   const selectedTaskValue = String(formData.get("task") || "").trim();
   const selectedTask = state.tasks.find((task) => task.id === selectedTaskValue) || state.tasks.find((task) => task.title === selectedTaskValue);
   const worker = currentWorkerProfile();
-  const job = String(formData.get("job") || selectedTask?.relatedJob || "Unassigned").trim();
+  const job = String(selectedTask?.relatedJob || formData.get("job") || "Unassigned").trim();
   state.clockSession = {
     id: createId("T"),
-    workerId: worker.id || "",
-    workerEmail: worker.email || "",
+    workerId: worker.id || state.authSession?.uid || "",
+    workerEmail: worker.email || state.authSession?.email || "",
     worker: worker.name || formData.get("worker") || "Employee",
     job,
     taskId: selectedTask?.id || "",
@@ -7255,15 +7668,24 @@ async function clockIn(formData) {
     start: new Date().toISOString(),
     startGps: gps
   };
+  state.activeClockSessions = [
+    state.clockSession,
+    ...(state.activeClockSessions || []).filter((session) => !clockSessionMatchesCurrentWorker(session))
+  ];
   addActivity(`${state.clockSession.worker} clocked in with GPS.`);
   persist();
+  await syncWorkspaceState({ force: true });
   setToast("Clocked in");
   render();
 }
 
 async function clockOut() {
-  if (!state.clockSession) return;
+  if (!reconcileActiveClockSession()) return;
   const gps = await requestGps();
+  if (!Number.isFinite(gps?.latitude) || !Number.isFinite(gps?.longitude)) {
+    setToast("GPS permission and a valid position are required to clock out");
+    return render();
+  }
   const entry = {
     ...state.clockSession,
     end: new Date().toISOString(),
@@ -7271,6 +7693,7 @@ async function clockOut() {
     hours: durationLabel(state.clockSession.start, new Date().toISOString())
   };
   state.timeEntries = [entry, ...state.timeEntries];
+  state.activeClockSessions = (state.activeClockSessions || []).filter((session) => session.id !== entry.id);
   state.clockSession = null;
   createFile({
     moduleKey: "time",
@@ -7299,6 +7722,7 @@ async function clockOut() {
   });
   addActivity(`${entry.worker} clocked out with GPS.`);
   persist();
+  await syncWorkspaceState({ force: true });
   setToast("Clocked out");
   render();
 }
@@ -7307,13 +7731,14 @@ async function saveEmployeeProfile(formData) {
   const result = await apiRequest("/api/employee/profile", {
     method: "PATCH",
     body: JSON.stringify({
+      displayName: String(formData.get("displayName") || "").trim(),
       phone: String(formData.get("phone") || "").trim(),
       jobTitle: String(formData.get("jobTitle") || "").trim()
     })
   });
   if (result.user) {
     const member = normalizeTeamMember(mapUserToTeamMember(result.user));
-    state.worker = fieldSessionForMember(member, "");
+    state.worker = fieldSessionForMember(member);
     upsertManagedUser(result.user);
   }
   setToast("Employee profile saved");
@@ -7342,6 +7767,8 @@ async function submitTicketSignoff(formData) {
   });
   if (result.signoff) {
     state.ticketSignoffs = mergeById([result.signoff], state.ticketSignoffs || []);
+    state.workspacePersistence.lastSavedAt = result.signoff.signedAt || state.workspacePersistence.lastSavedAt;
+    state.workspacePersistence.revision = result.workspaceRevision || state.workspacePersistence.revision;
   }
   state.tasks = state.tasks.map((item) => item.id === taskId
     ? { ...item, status: "Complete", ticketSignoffId: result.signoff?.id || "", signedOffAt: result.signoff?.signedAt || new Date().toISOString() }
@@ -7398,6 +7825,7 @@ function render() {
       <main class="workspace" id="workspace-main" tabindex="-1">
         ${renderTrialBanner()}
         ${renderTopbar(module)}
+        ${renderWorkspaceDurabilityNotice()}
         ${renderScreen(module)}
       </main>
     </div>
@@ -7462,16 +7890,16 @@ function renderAuthGate() {
         <h1>Sign in to Brothers OS</h1>
         <p>${employeeInvite
           ? "This one-time employee link creates a restricted account under the inviting contractor after Google verifies the exact invited email."
-          : `Owner access is restricted to ${escapeHtml(ownerLabel)}. Every other Google account needs an active 48-hour invitation and its individual code.`}</p>
+          : `Owner access is restricted to ${escapeHtml(ownerLabel)}. Contractors and trial users need an active 48-hour invitation plus their individual code. Employees use the link issued by their employer.`}</p>
         ${accessTokenPresent ? `<div class="empty-state compact-empty"><strong>${employeeInvite ? "Employee invitation detected" : "Access link detected"}</strong><span>${employeeInvite ? "Continue with the exact Google email that received this link. No separate portal code is required." : "Use the invited Google email and its code."}</span></div>` : ""}
-        ${employeeInvite ? "" : `<label><span>Contractor / trial access code</span><input data-field="login-access-code" name="accessCode" autocomplete="one-time-code" placeholder="CON-123ABC" /></label>`}
+        ${employeeInvite ? "" : `<label><span>Contractor / trial access code (owner leaves blank)</span><input data-field="login-access-code" name="accessCode" autocomplete="one-time-code" placeholder="CON-123ABC" /></label>`}
         <button class="google-login-button" type="button" data-action="firebase-google-login">${state.authLoading ? "Connecting to Google..." : "Continue with Google"}</button>
         <small class="auth-session-note">Current secure session limit: ${escapeHtml(ttlLabel)}. Invitation access expires within 48 hours.</small>
         ${state.authError ? `<div class="empty-state"><strong>Sign-in failed</strong><span>${escapeHtml(state.authError)}</span></div>` : ""}
         <details class="auth-disclosure">
           <summary>Access and security status</summary>
           <div class="auth-disclosure-body">
-            <div class="empty-state warning-state"><strong>Unapproved accounts are denied</strong><span>Google verifies identity first; the OS opens only after the server approves the owner email or the matching invite and code.</span></div>
+            <div class="empty-state warning-state"><strong>Unapproved accounts are denied</strong><span>Google verifies identity first; the OS opens only for the approved owner, an exact employee invite link, or a matching contractor or trial invitation and code.</span></div>
             ${isAdminCredentialGap() ? `<div class="empty-state warning-state"><strong>${escapeHtml(adminCredentialWarning.title)}</strong><span>${escapeHtml(adminCredentialWarning.body)}</span></div>` : ""}
           </div>
         </details>
@@ -7674,7 +8102,7 @@ function renderTopbar(module) {
         ${renderModuleTextLink("communications", "Board")}
         <button type="button" data-action="open-activity">Alerts</button>
         ${!state.authSession || canDo("viewGlobalIndexes") ? `<button type="button" data-action="open-export">Export</button>` : ""}
-        <button type="button" data-action="open-employee-login">Employee time</button>
+        <button type="button" data-action="open-employee-login">Employee sign-in</button>
       `;
   return `
     <header class="topbar">
@@ -7706,6 +8134,107 @@ function renderTopbar(module) {
   `;
 }
 
+function renderSettingsModule(module) {
+  const user = currentSessionUser() || state.authSession || {};
+  const visibleModules = modules.filter((item) => isModuleAllowedByAccess(item.key)).map((item) => item.label);
+  return `
+    <section class="hero-band">
+      <div>
+        <span class="hero-eyebrow">Account settings</span>
+        <h2>${escapeHtml(user.displayName || user.name || user.email || "Secure account")}</h2>
+        <p>Review the active Google identity, organization scope, assigned modules, and shared-storage status.</p>
+        <div class="hero-actions">
+          ${canDo("manageUsers") ? `<a href="#module/team" data-action="set-active" data-key="team">Manage people</a>` : ""}
+          ${canDo("manageAccessGrants") ? `<a href="#module/accessadmin" data-action="set-active" data-key="accessadmin">Manage access</a>` : ""}
+          <button type="button" data-action="firebase-logout">Sign out securely</button>
+        </div>
+      </div>
+      <div class="metric-strip">
+        <div><strong>${escapeHtml(currentRoleId().replace(/_/g, " "))}</strong><span>Role</span></div>
+        <div><strong>${visibleModules.length}</strong><span>Modules</span></div>
+        <div><strong>${state.workspacePersistence?.durable ? "Shared" : "Locked"}</strong><span>Storage</span></div>
+      </div>
+    </section>
+    <section class="panel account-settings-panel">
+      <div class="panel-head"><div><h2>Current account</h2><p>These values come from the server-verified session and cannot be changed from browser storage.</p></div></div>
+      <dl class="settings-definition-list">
+        <div><dt>Google email</dt><dd>${escapeHtml(user.email || state.authSession?.email || "Not available")}</dd></div>
+        <div><dt>Company</dt><dd>${escapeHtml(user.companyId || state.authSession?.companyId || "Not assigned")}</dd></div>
+        <div><dt>Contractor</dt><dd>${escapeHtml(user.contractorId || state.authSession?.contractorId || "Not assigned")}</dd></div>
+        <div><dt>Access expires</dt><dd>${escapeHtml(formatTime(user.accessExpiresAt || state.authSession?.accessExpiresAt || ""))}</dd></div>
+        <div><dt>Visible modules</dt><dd>${escapeHtml(visibleModules.join(", ") || "No modules assigned")}</dd></div>
+      </dl>
+    </section>
+    ${renderModuleFiles(module)}
+    ${renderFileDetail(module)}
+  `;
+}
+
+function renderSecurityCenterModule(module) {
+  const checks = [
+    {
+      label: "Google identity provider",
+      status: (state.firebase.allowedSignInProviders || []).includes("google.com") ? "Required" : "Not confirmed",
+      tone: (state.firebase.allowedSignInProviders || []).includes("google.com") ? "ready" : "blocked",
+      detail: "The OS accepts Firebase sessions established through Google and verifies authorization again on the server."
+    },
+    {
+      label: "Owner restriction",
+      status: state.firebase.ownerOnlyLogin ? "Enforced" : "Review required",
+      tone: state.firebase.ownerOnlyLogin ? "ready" : "blocked",
+      detail: `Owner access is limited to ${(state.firebase.allowedLoginEmails || []).join(", ") || "the configured Super Admin identity"}.`
+    },
+    {
+      label: "Server authorization",
+      status: state.firebase.adminConfigured ? "Active" : "Locked",
+      tone: state.firebase.adminConfigured ? "ready" : "blocked",
+      detail: state.firebase.adminConfigured ? "Firestore, invitations, role checks, and session enforcement are active." : "Keyless Firebase Admin access must be connected before shared records can change."
+    },
+    {
+      label: "Current session",
+      status: state.authSession ? "Verified" : "Signed out",
+      tone: state.authSession ? "ready" : "blocked",
+      detail: `${currentRoleId().replace(/_/g, " ") || "No role"} | ${state.authSession?.email || "No active email"}`
+    },
+    {
+      label: "Shared workspace",
+      status: state.workspacePersistence?.durable ? "Firestore saved" : "Writes locked",
+      tone: state.workspacePersistence?.durable ? "ready" : "blocked",
+      detail: state.workspacePersistence?.durable ? "Operational records synchronize across approved sessions." : "Browser-only operational writes are blocked to prevent false saves."
+    }
+  ];
+  return `
+    <section class="hero-band">
+      <div>
+        <span class="hero-eyebrow">Identity and access</span>
+        <h2>${escapeHtml(module.label)}</h2>
+        <p>Review the controls protecting owner, contractor, and employee access.</p>
+        <div class="hero-actions">
+          ${canDo("manageAccessGrants") ? `<a href="#module/accessadmin" data-action="set-active" data-key="accessadmin">Open access administration</a>` : ""}
+          ${canDo("viewAuditLogs") ? `<a href="#module/auditlog" data-action="set-active" data-key="auditlog">Review audit log</a>` : ""}
+          <button type="button" data-action="firebase-logout">Sign out securely</button>
+        </div>
+      </div>
+      <div class="metric-strip">
+        <div><strong>${checks.filter((item) => item.tone === "ready").length}</strong><span>Ready</span></div>
+        <div><strong>${checks.filter((item) => item.tone === "blocked").length}</strong><span>Blocked</span></div>
+        <div><strong>Google</strong><span>Identity</span></div>
+      </div>
+    </section>
+    <section class="panel launch-board">
+      <div class="panel-head"><div><h2>Security status</h2><p>Each check reflects the active production configuration or current server session.</p></div></div>
+      <div class="launch-check-grid">${checks.map((item) => `
+        <article class="launch-check-card ${escapeHtml(item.tone)}">
+          <span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.status)}</strong><p>${escapeHtml(item.detail)}</p>
+        </article>
+      `).join("")}</div>
+    </section>
+    ${renderAccessStatusPanel()}
+    ${renderModuleFiles(module)}
+    ${renderFileDetail(module)}
+  `;
+}
+
 function renderScreen(module) {
   if (module.key === "time") return renderTimeModule(module);
   if (module.key === "equipment") return renderEquipmentModule(module);
@@ -7727,6 +8256,8 @@ function renderScreen(module) {
   if (module.key === "defensibility") return renderDefensibilityModule(module);
   if (module.key === "supplement") return renderSupplementModule(module);
   if (module.key === "accounting") return renderAccountingModule(module);
+  if (module.key === "settings") return renderSettingsModule(module);
+  if (module.key === "securitycenter") return renderSecurityCenterModule(module);
   return `
     <section class="hero-band">
       <div>
@@ -8418,6 +8949,7 @@ function renderModuleFiles(module) {
 }
 
 function renderFileCard(file) {
+  const canEdit = canEditFileRecord(file);
   return `
     <article class="file-card${state.selectedFileId === file.id ? " selected" : ""}">
       <div class="file-card-head">
@@ -8435,8 +8967,8 @@ function renderFileCard(file) {
       </dl>
       <div class="card-actions">
         <button type="button" data-action="select-file" data-id="${file.id}">Open</button>
-        <button type="button" data-action="complete-file" data-id="${file.id}">Complete</button>
-        <button type="button" data-action="duplicate-file" data-id="${file.id}">Copy</button>
+        ${canEdit ? `<button type="button" data-action="complete-file" data-id="${file.id}">Complete</button>` : ""}
+        ${canEdit ? `<button type="button" data-action="duplicate-file" data-id="${file.id}">Copy</button>` : ""}
       </div>
     </article>
   `;
@@ -8445,6 +8977,7 @@ function renderFileCard(file) {
 function renderFileDetail(module) {
   const file = state.files.find((item) => item.id === state.selectedFileId && fileBelongsToModule(item, module.key));
   if (!file) return "";
+  const canEdit = canEditFileRecord(file);
   return `
     <section class="detail-panel">
       <div>
@@ -8469,12 +9002,12 @@ function renderFileDetail(module) {
         </div>
       ` : ""}
       ${file.paymentInstructions ? `<div class="payment-instructions"><strong>Verified ${escapeHtml(file.paymentMethod)} instructions</strong><span>${escapeHtml(file.paymentInstructions)}</span></div>` : ""}
-      <div class="detail-actions">
+      ${canEdit ? `<div class="detail-actions">
         <button type="button" data-action="status-review" data-id="${file.id}">Needs review</button>
         <button type="button" data-action="status-active" data-id="${file.id}">Active</button>
         <button type="button" data-action="complete-file" data-id="${file.id}">Complete</button>
-        <button type="button" data-action="delete-file" data-id="${file.id}">Delete</button>
-      </div>
+        ${canDeleteWorkspaceRecords() ? `<button type="button" data-action="delete-file" data-id="${file.id}">Delete</button>` : ""}
+      </div>` : ""}
     </section>
   `;
 }
@@ -8502,11 +9035,11 @@ function linkedModuleKeys(module) {
   const byCategory = {
     ai: ["aicopilots", "aireview", "compliance", "reports"],
     automation: ["jobs", "nextaction", "notifications", "auditlog"],
-    branch: ["branches", "branchbench", "moduletoggles", "licensing"],
+    branch: ["branches", "team", "moduletoggles", "licensing"],
     compliance: ["nationalcodes", "safetyintel", "justification", "reports"],
     core: ["universalintake", "properties", "jobs", "reports"],
     dispatch: ["dispatch", "routeplanner", "time", "equipment"],
-    documents: ["forms", "signature", "evidencechain", "closeout"],
+    documents: ["forms", "contracts", "evidencechain", "closeout"],
     field: ["fieldmobile", "photos", "time", "drylogs", "equipment"],
     finance: ["accounting", "payments", "pricing", "reports"],
     jobs: ["properties", "photos", "time", "equipment", "payments"],
@@ -8516,7 +9049,7 @@ function linkedModuleKeys(module) {
     platform: ["integrations", "datamodel", "auditlog", "securitycenter"],
     property: ["properties", "relationships", "jobs", "maintenance"],
     real_estate: ["properties", "relationships", "workorders", "payments"],
-    reports: ["dashboard", "businesshealth", "proofvalue", "accounting"],
+    reports: ["daily", "businesshealth", "proofvalue", "accounting"],
     revenue: ["pricing", "evidencechain", "justification", "payments"],
     security: ["securitycenter", "sessiondevices", "auditlog", "trustsafety"],
     strategy: ["setupwizard", "moduletoggles", "businesshealth", "reports"],
@@ -8529,7 +9062,7 @@ function linkedModuleKeys(module) {
     evidencechain: ["photos", "time", "drylogs", "equipment", "justification", "payments"],
     closeout: ["payments", "equipment", "warranty", "reviews"],
     integrations: ["payments", "maps", "email", "accounting"],
-    fieldmobile: ["time", "photos", "equipment", "safety"]
+    fieldmobile: ["time", "photos", "equipment", "safetyintel"]
   };
   return [...new Set([...(byKey[module.key] || []), ...(byCategory[module.category] || [])])].filter((key) => key !== module.key && moduleByKey(key));
 }
@@ -8778,9 +9311,33 @@ function renderWorkbenchField(field) {
   return `<label><span>${escapeHtml(field.label)}</span><input name="${escapeHtml(field.name)}" type="${escapeHtml(field.type || "text")}"${required} placeholder="${escapeHtml(field.placeholder || "")}" /></label>`;
 }
 
+function renderModuleRecordCard(record, activeModuleKey) {
+  const fieldSummary = Object.entries(record.fields || {})
+    .slice(0, 3)
+    .map(([label, value]) => `<span><strong>${escapeHtml(label)}</strong>${escapeHtml(value)}</span>`)
+    .join("");
+  const sourceModule = moduleByKey(record.moduleKey);
+  const linkedKeys = normalizeModuleKeyList([record.moduleKey, ...(record.linkedModuleKeys || [])], activeModuleKey);
+  return `
+    <article class="module-record-card">
+      <div class="file-card-head"><span>${escapeHtml(record.recordType || "Workflow record")}</span><strong>${escapeHtml(record.status || "Open")}</strong></div>
+      <h3>${escapeHtml(record.subject || "Untitled record")}</h3>
+      <p>${escapeHtml(sourceModule?.label || record.moduleKey)}${record.relatedJob ? ` | ${escapeHtml(record.relatedJob)}` : ""}</p>
+      <div class="module-record-fields">${fieldSummary || "<span>No additional fields</span>"}</div>
+      <small>${escapeHtml(record.owner || "Office")} | ${escapeHtml(record.priority || "Medium")}${record.due ? ` | Due ${escapeHtml(formatDate(record.due))}` : ""}</small>
+      <div class="workflow-links">${renderLinkedModuleChips(linkedKeys)}</div>
+      <div class="card-actions">
+        ${record.fileId ? `<button type="button" data-action="select-file" data-id="${escapeHtml(record.fileId)}">Open file</button>` : ""}
+        ${canEditModuleWorkflowRecords() ? `<button type="button" data-action="complete-module-record" data-id="${escapeHtml(record.id)}" ${record.status === "Complete" ? "disabled" : ""}>${record.status === "Complete" ? "Complete" : "Mark complete"}</button>` : ""}
+      </div>
+    </article>
+  `;
+}
+
 function renderModuleWorkbench(module) {
   const config = moduleWorkbenchConfig(module);
-  const recentFiles = filesForModule(module.key).slice(0, 3);
+  const recentRecords = moduleRecordsFor(module.key).slice(0, 6);
+  const canEditRecords = canEditModuleWorkflowRecords();
   return `
     <section class="module-workbench workbench-${escapeHtml(module.category)}">
       <div class="workbench-main">
@@ -8789,7 +9346,7 @@ function renderModuleWorkbench(module) {
             <h2>${escapeHtml(config.title)}</h2>
             <p>${escapeHtml(module.purpose)}</p>
           </div>
-          <button type="button" data-action="seed-queue" data-key="${module.key}">Add check item</button>
+          ${canEditRecords ? `<button type="button" data-action="seed-queue" data-key="${module.key}">Add check item</button>` : ""}
         </div>
         <div class="task-grid">
           ${config.tasks.map((task, index) => `<div><strong>${index + 1}</strong><span>${escapeHtml(task)}</span></div>`).join("")}
@@ -8798,15 +9355,15 @@ function renderModuleWorkbench(module) {
           <h3>Linked modules</h3>
           <div class="workflow-links">${renderLinkedModuleChips(config.links)}</div>
         </div>
-        <div class="mini-file-list">
-          ${recentFiles.length ? recentFiles.map((file) => `<button type="button" data-action="select-file" data-id="${file.id}">${escapeHtml(file.title)}<span>${escapeHtml(file.status)}</span></button>`).join("") : `<span>No ${escapeHtml(module.label)} records yet.</span>`}
+        <div class="module-record-grid">
+          ${recentRecords.length ? recentRecords.map((record) => renderModuleRecordCard(record, module.key)).join("") : `<div class="empty-state"><strong>No ${escapeHtml(module.label)} records yet</strong><span>${canEditRecords ? "Create the first structured record with the form." : "Office-managed records will appear here when assigned."}</span></div>`}
         </div>
       </div>
-      <form class="workbench-form" data-form="module-workbench">
+      ${canEditRecords ? `<form class="workbench-form" data-form="module-workbench">
         <input type="hidden" name="moduleKey" value="${module.key}" />
         ${config.fields.map(renderWorkbenchField).join("")}
         <button type="submit">Create ${escapeHtml(config.fileType)}</button>
-      </form>
+      </form>` : ""}
     </section>
   `;
 }
@@ -8981,12 +9538,13 @@ function renderJobTrackerModule(module) {
   const jobs = visibleJobBoards();
   const counts = jobGateCounts(jobs);
   const average = jobs.length ? Math.round(jobs.reduce((sum, job) => sum + jobGateCompletion(job), 0) / jobs.length) : 0;
+  const canCreateJobs = currentRoleId() !== "worker";
   return `
     <section class="hero-band job-hero">
       <div>
         <p>${escapeHtml(module.purpose)}</p>
         <div class="hero-actions">
-          <button type="button" data-action="open-create-file" data-key="jobs">Manual job file</button>
+          ${canCreateJobs ? `<button type="button" data-action="open-create-file" data-key="jobs">Manual job file</button>` : ""}
           <a href="#module/dispatch" data-action="set-active" data-key="dispatch">Open dispatch</a>
           <a href="#module/drylogs" data-action="set-active" data-key="drylogs">Dry logs</a>
           <a href="#module/payments" data-action="set-active" data-key="payments">Open billing</a>
@@ -9006,16 +9564,16 @@ function renderJobTrackerModule(module) {
         </div>
         ${renderJobTimeline()}
       </div>
-      <div class="panel">
+      ${canCreateJobs ? `<div class="panel">
         <div class="panel-head">
           <div><h2>Add job</h2><p>Create a job record with default gating.</p></div>
         </div>
         ${renderJobForm()}
-      </div>
+      </div>` : ""}
     </section>
     <section class="panel">
       <div class="panel-head">
-        <div><h2>Gate board</h2><p>Click a gate to cycle Open, Blocked, and Done.</p></div>
+        <div><h2>Gate board</h2><p>${currentRoleId() === "worker" ? "Update field gates while employer approvals remain read-only." : "Click a gate to cycle Open, Blocked, and Done."}</p></div>
         <div class="workflow-links">${renderLinkedModuleChips(["photos", "time", "drylogs", "equipment", "payments", "closeout"])}</div>
       </div>
       <div class="job-card-grid">
@@ -9079,7 +9637,9 @@ function renderJobGateCard(job) {
       <div class="gate-grid">
         ${(job.gates || [])
           .map(
-            (gate) => `<button type="button" class="gate-chip gate-${escapeHtml(gate.status.toLowerCase().replace(/\s+/g, "-"))}" data-action="toggle-job-gate" data-id="${job.id}" data-gate="${gate.id}"><span>${escapeHtml(gate.label)}</span><strong>${escapeHtml(gate.status)}</strong></button>`
+            (gate) => currentRoleId() === "worker" && ownerManagedJobGateIds.has(String(gate.id || ""))
+              ? `<div class="gate-chip gate-readonly gate-${escapeHtml(gate.status.toLowerCase().replace(/\s+/g, "-"))}" aria-disabled="true"><span>${escapeHtml(gate.label)}</span><strong>${escapeHtml(gate.status)}</strong></div>`
+              : `<button type="button" class="gate-chip gate-${escapeHtml(gate.status.toLowerCase().replace(/\s+/g, "-"))}" data-action="toggle-job-gate" data-id="${job.id}" data-gate="${gate.id}"><span>${escapeHtml(gate.label)}</span><strong>${escapeHtml(gate.status)}</strong></button>`
           )
           .join("")}
       </div>
@@ -9305,8 +9865,7 @@ function renderPhotoEvidenceForm(jobs, photoTasks) {
         <label><span>Task</span><select name="taskId"><option value="">No task selected</option>${photoTasks.map((task) => `<option value="${escapeHtml(task.id)}">${escapeHtml(task.title)}${task.relatedJob ? ` - ${escapeHtml(task.relatedJob)}` : ""}</option>`).join("")}</select></label>
         <label><span>Room / area</span><input name="room" required placeholder="Kitchen, hall, equipment room" /></label>
         <label><span>Category</span><select name="category"><option>Before</option><option>Progress</option><option>Completion</option><option>Equipment</option><option>Invoice support</option><option>Issue</option></select></label>
-        <label><span>Photo file</span><input name="photoFile" type="file" accept="image/*" /></label>
-        <label><span>Photo reference or link</span><input name="photoRef" placeholder="IMG_2042.jpg or cloud link" /></label>
+        <label><span>Photo file</span><input name="photoFile" type="file" accept="image/*" required /></label>
       </div>
       <label><span>Notes</span><textarea name="notes" rows="3" placeholder="What this photo proves, affected material, location, equipment, or invoice support"></textarea></label>
       <button type="submit">Save photo evidence</button>
@@ -9797,19 +10356,24 @@ function renderEmployeeInvitationPanel() {
   if (!state.authSession || !canDo("inviteWorkers")) return "";
   const last = state.lastEmployeeInvitation;
   const contractorLocked = currentRoleId() === "contractor";
-  const employees = (state.accessContext?.users || [])
-    .map(mapUserToTeamMember)
-    .filter((member) => member.accountType === "worker");
+  const contractorId = currentContractorId();
+  const employees = employeeDirectoryMembers()
+    .filter((member) => /worker|employee/i.test(`${member.roleId || ""} ${member.accountType || ""} ${member.role || ""}`))
+    .filter((member) => !contractorLocked || !contractorId || member.employerContractorId === contractorId || member.contractorId === contractorId);
   const employeeGrants = (state.accessContext?.accessGrants || [])
     .filter((grant) => grant.onboardingMode === "employee_link");
+  const employerOptions = employeeEmployerOptions();
+  const persistentProfilesReady = Boolean(state.firebase?.adminConfigured);
   return `
     <section class="panel employee-invite-panel">
       <div class="panel-head">
         <div>
-          <h2>Employee portal access</h2>
-          <p>Send a single-use link. The invited employee creates a restricted account with the exact Google email and is attached to the sending contractor profile.</p>
+          <h2>Add employee profile</h2>
+          <p>Create the employee record first, choose exactly what they can open, then issue a single-use Google link tied to the employer profile.</p>
         </div>
+        <div class="status-chip ${persistentProfilesReady ? "is-ready" : "is-blocked"}">${persistentProfilesReady ? "Secure storage ready" : "Secure storage needs activation"}</div>
       </div>
+      ${persistentProfilesReady ? "" : `<div class="inline-notice critical-notice"><strong>Employee creation is temporarily locked</strong><span>Firebase Admin is not active in production, so a submitted profile could not be saved. Complete the secure cloud identity setup before issuing employee links.</span></div>`}
       ${last ? `
         <div class="empty-state grant-output">
           <strong>Employee link issued for ${escapeHtml(last.email)}</strong>
@@ -9821,28 +10385,34 @@ function renderEmployeeInvitationPanel() {
         <div class="form-grid">
           <label><span>Employee name</span><input name="displayName" required placeholder="Full name" /></label>
           <label><span>Google email</span><input name="email" type="email" required placeholder="employee@company.com" /></label>
+          <label><span>Mobile phone</span><input name="phone" type="tel" autocomplete="tel" placeholder="Mobile number" /></label>
           <label><span>Job title</span><input name="jobTitle" placeholder="Technician, crew lead, estimator" /></label>
+          <label><span>Employment type</span><select name="employmentType"><option>Employee</option><option>Part-time employee</option><option>Seasonal employee</option><option>Independent contractor</option></select></label>
+          <label><span>Start date</span><input name="startDate" type="date" /></label>
           <label><span>Assigned job IDs</span><input name="assignedJobIds" list="employee-job-options" placeholder="J-2039,J-2050" /></label>
           <label><span>Assigned ticket IDs</span><input name="assignedTaskIds" placeholder="TASK-1001,TASK-1002" /></label>
           ${contractorLocked
             ? `<input type="hidden" name="contractorId" value="${escapeHtml(currentContractorId())}" />`
-            : `<label><span>Employer contractor ID</span><input name="contractorId" value="${escapeHtml(currentContractorId())}" required placeholder="contractor-company" /></label>`}
+            : `<label><span>Employer profile</span><select name="contractorId">
+                <option value="">Brothers Restoration owner account</option>
+                ${employerOptions.map((employer) => `<option value="${escapeHtml(employer.contractorId)}"${currentContractorId() === employer.contractorId ? " selected" : ""}>${escapeHtml(employer.label)} - ${escapeHtml(employer.contractorId)}</option>`).join("")}
+              </select><small>Select an existing contractor account, or keep the owner account for Brothers Restoration employees.</small></label>`}
           <input type="hidden" name="companyId" value="${escapeHtml(state.authSession.companyId || "default-company")}" />
           <input type="hidden" name="franchiseIds" value="${escapeHtml(currentUserFranchiseIds().join(","))}" />
         </div>
         <datalist id="employee-job-options">
           ${state.jobBoards.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}
         </datalist>
-        ${renderModuleAccessPicker({ selectedKeys: employeeAllowedModuleKeys, legend: "Employee modules" })}
+        ${renderModuleAccessPicker({ selectedKeys: employeeAllowedModuleKeys, allowedKeys: employeeAllowedModuleKeys, legend: "Employee modules" })}
         <label class="source-check"><input name="sendEmail" type="checkbox" checked /><span><strong>Email the one-time link</strong><small>The link expires after 48 hours and accepts only the invited verified Google email.</small></span></label>
-        <button type="submit">Send employee portal link</button>
+        <button type="submit" ${persistentProfilesReady ? "" : "disabled"}>Create profile and send portal link</button>
       </form>
       <div class="access-request-grid">
         <div>
-          <h3>Employees under this profile</h3>
+          <h3>Employee directory</h3>
           <div class="activity-list">${employees.length
-            ? employees.slice(0, 10).map((member) => `<div><strong>${escapeHtml(member.name)}</strong><span>${escapeHtml(member.email)} | ${escapeHtml(member.status)} | ${member.assignedTaskIds.length} ticket assignments</span></div>`).join("")
-            : `<div><strong>No employee accounts yet</strong><span>Accepted invitation accounts will appear here.</span></div>`}</div>
+            ? employees.slice(0, 20).map((member) => `<div><strong>${escapeHtml(member.name)}</strong><span>${escapeHtml(member.email)} | ${escapeHtml(member.jobTitle || "Employee")} | ${escapeHtml(member.status)} | ${member.assignedJobIds.length} jobs | ${member.assignedTaskIds.length} tickets</span></div>`).join("")
+            : `<div><strong>No employee profiles yet</strong><span>Create the first profile above. Pending invitations appear here immediately.</span></div>`}</div>
         </div>
         <div>
           <h3>Recent employee links</h3>
@@ -10635,7 +11205,8 @@ function renderCommunityPost(post) {
 }
 
 function renderTeamModule(module) {
-  const displayedUsers = assignableTeamMembers();
+  const displayedUsers = employeeDirectoryMembers();
+  const advancedAdminPanel = renderRbacAdminPanel();
   return `
     <section class="hero-band team-hero">
       <div>
@@ -10656,11 +11227,10 @@ function renderTeamModule(module) {
     </section>
     ${renderManagedSection("team-access-panel", renderAccountSeparationPanel())}
     ${renderEmployeeInvitationPanel()}
-    ${renderRbacAdminPanel()}
+    ${advancedAdminPanel ? `<details class="advanced-access-panel"><summary>Advanced roles, contractor access, and login administration</summary>${advancedAdminPanel}</details>` : ""}
     <section class="team-layout">
       <div class="panel">
-        <div class="panel-head"><div><h2>Owner-created logins</h2><p>Create employees, issue individual portal codes, and assign field modules.</p></div></div>
-        ${state.firebase.enabled && state.authSession ? `<div class="empty-state"><strong>Secure login manager</strong><span>Every new team member is created as a Google-bound 48-hour invitation with server-saved assignments and module access.</span></div>` : ""}
+        <div class="panel-head"><div><h2>Other platform logins</h2><p>Create restricted contractor, franchise-owner, or business-owner access. Employee profiles are created in the primary form above.</p></div></div>
         ${renderTeamForm()}
         <div class="team-grid">${displayedUsers.map(renderTeamMemberCard).join("")}</div>
       </div>
@@ -10928,13 +11498,11 @@ function renderAccountSeparationPanel() {
 function renderTeamForm() {
   return `
     <form class="stack-form inline-section" data-form="team-member">
-      <h3>Create login</h3>
+      <h3>Create non-employee login</h3>
       <div class="form-grid">
-        <label><span>Name</span><input name="name" required placeholder="Employee or contractor" /></label>
+        <label><span>Name</span><input name="name" required placeholder="Contractor or account owner" /></label>
         <label><span>Email</span><input name="email" type="email" required placeholder="email@example.com" /></label>
-        <label><span>Account type</span><select name="accountType"><option>Employee</option><option>Contractor portal</option><option>Manager</option><option>Administrator</option><option>Vendor portal</option></select></label>
-        <label><span>Role</span><input name="role" placeholder="Estimator, field tech, admin, vendor" /></label>
-        <label><span>Access summary</span><input name="access" placeholder="Jobs, dry logs, time, pricing, admin" /></label>
+        <label><span>Account type</span><select name="accountType"><option>Contractor portal</option><option>Franchise owner</option><option>Business owner</option></select></label>
         <label><span>Individual portal code</span><input name="accessCode" placeholder="Auto-generated if blank" autocomplete="one-time-code" /></label>
         <label><span>Assigned job IDs</span><input name="assignedJobIds" list="team-job-options" placeholder="J-2039,J-2050" /></label>
       </div>
@@ -10949,7 +11517,7 @@ function renderTeamForm() {
           .map((module) => `<label class="source-check"><input name="permissions" type="checkbox" value="${module.key}" ${employeeAllowedModuleKeys.includes(module.key) ? "checked" : ""} /><span><strong>${escapeHtml(module.label)}</strong><small>${escapeHtml(categoryLabels[module.category] || module.category)}</small></span></label>`)
           .join("")}
       </fieldset>
-      <button type="submit">Create login invite</button>
+      <button type="submit">Create restricted login invite</button>
     </form>
   `;
 }
@@ -10977,9 +11545,16 @@ function renderTaskForm(teamMemberOptions = null) {
 }
 
 function renderTeamMemberCard(member) {
-  const canManage = canDo("manageUsers") && member.id;
+  const managedUser = (state.accessContext?.users || []).find((user) => {
+    return (user.uid || user.id) === member.id
+      || (member.email && String(user.email || "").toLowerCase() === String(member.email).toLowerCase());
+  });
+  const managedUserId = managedUser?.uid || managedUser?.id || "";
+  const pendingGrantId = String(member.pendingGrantId || "").trim();
+  const canManage = canDo("manageUsers") && managedUserId;
   const assignedTaskIds = new Set(normalizeListValue(member.assignedTaskIds));
   const assignedTasks = state.tasks.filter((task) => {
+    if (task.status === "Complete") return false;
     return assignedTaskIds.has(task.id)
       || task.assigneeId === member.id
       || (member.email && String(task.assigneeEmail || "").toLowerCase() === String(member.email).toLowerCase())
@@ -10994,10 +11569,12 @@ function renderTeamMemberCard(member) {
     .map((key) => moduleByKey(key)?.label || key)
     .filter(Boolean);
   const cardActions = [
-    canManage ? `<button type="button" data-action="open-user-manage" data-id="${member.id}">Manage</button>` : "",
-    member.id && canDo("resetPermissions") ? `<button type="button" data-action="reset-user-permissions" data-id="${member.id}">Reset access</button>` : "",
-    member.id && canDo("disableAccounts") ? `<button type="button" data-action="toggle-user-disabled" data-id="${member.id}" data-disabled="${member.status === "Disabled" ? "true" : "false"}">${member.status === "Disabled" ? "Enable" : "Disable"}</button>` : "",
-    member.id && canDo("removeUsers") ? `<button type="button" data-action="delete-user" data-id="${member.id}">Delete</button>` : ""
+    pendingGrantId && canDo("inviteWorkers") ? `<button type="button" data-action="open-pending-employee-manage" data-id="${escapeHtml(pendingGrantId)}">Edit invitation</button>` : "",
+    pendingGrantId && canDo("inviteWorkers") ? `<button type="button" data-action="revoke-employee-invitation" data-id="${escapeHtml(pendingGrantId)}">Revoke invitation</button>` : "",
+    canManage ? `<button type="button" data-action="open-user-manage" data-id="${escapeHtml(managedUserId)}">Manage</button>` : "",
+    managedUserId && canDo("resetPermissions") ? `<button type="button" data-action="reset-user-permissions" data-id="${escapeHtml(managedUserId)}">Reset access</button>` : "",
+    managedUserId && canDo("disableAccounts") ? `<button type="button" data-action="toggle-user-disabled" data-id="${escapeHtml(managedUserId)}" data-disabled="${member.status === "Disabled" ? "true" : "false"}">${member.status === "Disabled" ? "Enable" : "Disable"}</button>` : "",
+    managedUserId && canDo("removeUsers") ? `<button type="button" data-action="delete-user" data-id="${escapeHtml(managedUserId)}">Delete</button>` : ""
   ].filter(Boolean).join("");
   return `
     <article class="team-card">
@@ -11005,9 +11582,9 @@ function renderTeamMemberCard(member) {
       <h3>${escapeHtml(member.name)}</h3>
       <p>${escapeHtml(member.email)}</p>
       <span>${escapeHtml(member.role)} - ${escapeHtml(member.access)}</span>
-      <small>${employeeAccessCodeFor(member)
-        ? `Local portal code: ${escapeHtml(employeeAccessCodeFor(member))}`
-        : "Portal access: Google invite plus individual code"}</small>
+      <small>${displayablePortalAccessCodeFor(member)
+        ? `Individual portal code: ${escapeHtml(displayablePortalAccessCodeFor(member))}`
+        : "Portal access: verified Google account"}</small>
       <small>${assignedTasks.length} assigned task${assignedTasks.length === 1 ? "" : "s"}${assignedJobs.length ? ` | Jobs: ${escapeHtml(assignedJobs.join(", "))}` : ""}</small>
       <small>${ticketSignoffs.length} GPS ticket sign-off${ticketSignoffs.length === 1 ? "" : "s"}${ticketSignoffs[0] ? ` | Last ${escapeHtml(formatTime(ticketSignoffs[0].signedAt))}` : ""}</small>
       <small>Modules: ${escapeHtml(visibleModules.join(", ") || "No modules assigned")}</small>
@@ -11027,8 +11604,10 @@ function renderTaskItem(task) {
         <span>${escapeHtml(assignee?.name || task.assigneeName || "Unassigned")} - ${escapeHtml(module?.label || task.moduleKey)} - ${escapeHtml(task.relatedJob || "No job")}</span>
       </div>
       <div class="row-actions">
-        <a href="#module/${task.moduleKey}" data-action="set-active" data-key="${task.moduleKey}">Open</a>
-        <button type="button" data-action="complete-task" data-id="${task.id}">${task.status === "Complete" ? "Done" : "Complete"}</button>
+        <a href="#module/${escapeHtml(task.moduleKey)}" data-action="set-active" data-key="${escapeHtml(task.moduleKey)}">Open</a>
+        ${currentRoleId() === "worker" && task.status !== "Complete"
+          ? `<a href="#module/time" data-action="set-active" data-key="time">Sign with GPS</a>`
+          : `<button type="button" data-action="complete-task" data-id="${escapeHtml(task.id)}" ${task.status === "Complete" ? "disabled" : ""}>${task.status === "Complete" ? "Complete" : "Mark complete"}</button>`}
       </div>
     </div>
   `;
@@ -11509,8 +12088,11 @@ function renderEmployeeTicketPanel(taskOptions = []) {
         <form class="stack-form" data-form="employee-profile">
           <label><span>Google account</span><input value="${escapeHtml(worker.email || state.authSession?.email || "")}" readonly /></label>
           <div class="form-grid">
+            <label><span>Full name</span><input name="displayName" value="${escapeHtml(worker.name || currentUserName() || "")}" autocomplete="name" required placeholder="Full name" /></label>
             <label><span>Job title</span><input name="jobTitle" value="${escapeHtml(worker.jobTitle || "")}" placeholder="Technician, crew lead, estimator" /></label>
-            <label><span>Phone</span><input name="phone" type="tel" value="${escapeHtml(currentSessionUser()?.phone || "")}" placeholder="Mobile number" /></label>
+            <label><span>Phone</span><input name="phone" type="tel" value="${escapeHtml(worker.phone || currentSessionUser()?.phone || "")}" autocomplete="tel" placeholder="Mobile number" /></label>
+            <label><span>Employment type</span><input value="${escapeHtml(worker.employmentType || currentSessionUser()?.employmentType || "Employee")}" readonly /></label>
+            <label><span>Start date</span><input type="date" value="${escapeHtml(worker.startDate || currentSessionUser()?.startDate || "")}" readonly /></label>
           </div>
           <button type="submit">Save employee profile</button>
         </form>
@@ -11533,6 +12115,7 @@ function renderEmployeeTicketPanel(taskOptions = []) {
 function renderTimeModule(module) {
   const timeEntries = visibleTimeEntries();
   const taskOptions = visibleTasks();
+  const activeSessions = visibleActiveClockSessions();
   const authenticatedWorker = currentRoleId() === "worker";
   return `
     <section class="hero-band time-hero">
@@ -11542,7 +12125,7 @@ function renderTimeModule(module) {
       </div>
       <div class="metric-strip">
         <div><strong>${timeEntries.length}</strong><span>Entries</span></div>
-        <div><strong>${state.clockSession ? "On" : "Off"}</strong><span>Clock</span></div>
+        <div><strong>${activeSessions.length}</strong><span>Active shifts</span></div>
         <div><strong>${state.ticketSignoffs.length}</strong><span>Signed tickets</span></div>
       </div>
     </section>
@@ -11553,7 +12136,7 @@ function renderTimeModule(module) {
             <h2>GPS time clock</h2>
             <p>Workers can use employee-only access for GPS time, dry logs, job reference, photos, notes, equipment, and the communication board without opening owner/admin software.</p>
           </div>
-          ${authenticatedWorker ? `<button type="button" data-action="employee-logout">Sign out</button>` : `<button type="button" data-action="open-employee-login">Worker preview</button>`}
+          ${authenticatedWorker ? `<button type="button" data-action="employee-logout">Sign out</button>` : `<button type="button" data-action="open-employee-login">Employee Google sign-in</button>`}
         </div>
         ${state.clockSession ? renderClockSession() : renderClockInForm(taskOptions)}
       </div>
@@ -11571,6 +12154,10 @@ function renderTimeModule(module) {
         ${renderTicketSignoffFeed()}
       </section>
     `}
+    <section class="panel">
+      <div class="panel-head"><div><h2>Active shifts</h2><p>Durable, account-bound clock sessions visible across authorized devices.</p></div></div>
+      ${renderActiveClockSessions(activeSessions)}
+    </section>
     ${renderQueue(module.key)}
     ${renderModuleFiles(module)}
     ${renderFileDetail(module)}
@@ -11579,6 +12166,7 @@ function renderTimeModule(module) {
 
 function renderClockInForm(taskOptions = []) {
   const visibleJobs = visibleJobBoards();
+  const defaultJob = String(taskOptions[0]?.relatedJob || visibleJobs[0]?.jobId || "").trim();
   return `
     <form class="stack-form" data-form="clock-in">
       <label>
@@ -11587,14 +12175,14 @@ function renderClockInForm(taskOptions = []) {
       </label>
       <label>
         <span>Job or property</span>
-        <input name="job" list="visible-job-options" placeholder="Job number, property, or route" value="General field work" />
+        <input name="job" data-field="clock-job" list="visible-job-options" placeholder="Job number, property, or route" value="${escapeHtml(defaultJob)}" />
         <datalist id="visible-job-options">
           ${visibleJobs.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}
         </datalist>
       </label>
       <label>
         <span>Task</span>
-        <select name="task">
+        <select name="task" data-field="clock-task">
           ${taskOptions.length
             ? taskOptions.map((task) => `<option value="${escapeHtml(task.id)}">${escapeHtml(task.title)}${task.relatedJob ? ` - ${escapeHtml(task.relatedJob)}` : ""}</option>`).join("")
             : `
@@ -11784,6 +12372,7 @@ function renderModal() {
   if (state.modal.type === "quick-note") return renderQuickNoteModal();
   if (state.modal.type === "admin-edit") return renderAdminEditOverlay();
   if (state.modal.type === "user-manage") return renderUserManageModal();
+  if (state.modal.type === "pending-employee-manage") return renderPendingEmployeeManageModal();
   return "";
 }
 
@@ -11801,6 +12390,17 @@ function modalShell(content) {
       </div>
     </div>
   `;
+}
+
+function renderActiveClockSessions(sessions = []) {
+  if (!sessions.length) return `<div class="empty-state"><strong>No active shifts</strong><span>Clocked-in employees will appear here after GPS verification.</span></div>`;
+  return `<div class="activity-list">${sessions.map((session) => `
+    <div>
+      <strong>${escapeHtml(session.worker || session.workerEmail || "Employee")}</strong>
+      <span>${escapeHtml(session.job || "Unassigned")} | ${escapeHtml(session.task || "Field work")} | started ${escapeHtml(formatTime(session.start))}</span>
+      <small>${escapeHtml(session.startGps?.label || "GPS unavailable")}</small>
+    </div>
+  `).join("")}</div>`;
 }
 
 function renderCreateFileModal() {
@@ -11894,19 +12494,17 @@ function renderExportModal() {
 
 function renderEmployeeLoginModal() {
   return modalShell(`
-    <form class="employee-login-panel" data-form="employee-login">
+    <section class="employee-login-panel">
       <div class="modal-head">
-        <div><span>Employee access</span><h2>Restricted field portal</h2></div>
+        <div><span>Employee access</span><h2>Google-secured field portal</h2></div>
         <button type="button" data-action="close-modal" aria-label="Close">Close</button>
       </div>
-      <p>Employees can clock in/out with GPS, see only assigned jobs and tasks, upload photo evidence, and add job notes through approved field modules.</p>
-      <label><span>Employee email or name</span><input name="identifier" required placeholder="worker@company.com" autocomplete="username" /></label>
-      <label><span>Individual portal code</span><input name="code" required placeholder="FIELD-2039" autocomplete="one-time-code" /></label>
+      <p>Employee access requires a server-verified Google account. New employees must open their single-use employer invitation first; returning employees can sign in with the same Google email.</p>
       <div class="modal-actions">
         <button type="button" data-action="close-modal">Cancel</button>
-        <button type="submit">Enter field portal</button>
+        <button type="button" data-action="employee-google-switch">Continue to Google sign-in</button>
       </div>
-    </form>
+    </section>
   `);
 }
 
@@ -11955,6 +12553,43 @@ function renderUserManageModal() {
       <div class="modal-actions">
         <button type="button" data-action="close-modal">Cancel</button>
         <button type="submit">Save user</button>
+      </div>
+    </form>
+  `);
+}
+
+function renderPendingEmployeeManageModal() {
+  const grant = (state.accessContext?.accessGrants || []).find((item) => (item.id || item.grantId) === state.modal.grantId);
+  if (!grant || grant.onboardingMode !== "employee_link" || String(grant.status || "").toLowerCase() !== "issued") {
+    return modalShell(`
+      <div class="modal-head">
+        <div><span>Employee invitation</span><h2>Invitation no longer available</h2></div>
+        <button type="button" data-action="close-modal" aria-label="Close">Close</button>
+      </div>
+    `);
+  }
+  return modalShell(`
+    <form class="stack-form" data-form="pending-employee-manage">
+      <div class="modal-head">
+        <div><span>Pending employee</span><h2>${escapeHtml(grant.displayName || grant.email)}</h2></div>
+        <button type="button" data-action="close-modal" aria-label="Close">Close</button>
+      </div>
+      <input type="hidden" name="grantId" value="${escapeHtml(grant.id || grant.grantId)}" />
+      <div class="form-grid">
+        <label><span>Full name</span><input name="displayName" required value="${escapeHtml(grant.displayName || "")}" /></label>
+        <label><span>Google email</span><input value="${escapeHtml(grant.email || "")}" readonly /></label>
+        <label><span>Mobile phone</span><input name="phone" type="tel" value="${escapeHtml(grant.phone || "")}" autocomplete="tel" /></label>
+        <label><span>Job title</span><input name="jobTitle" value="${escapeHtml(grant.jobTitle || "")}" /></label>
+        <label><span>Employment type</span><select name="employmentType">${["Employee", "Part-time employee", "Seasonal employee", "Independent contractor"].map((type) => `<option ${String(grant.employmentType || "Employee") === type ? "selected" : ""}>${type}</option>`).join("")}</select></label>
+        <label><span>Start date</span><input name="startDate" type="date" value="${escapeHtml(grant.startDate || "")}" /></label>
+        <label><span>Assigned job IDs</span><input name="assignedJobIds" value="${escapeHtml(normalizeListValue(grant.assignedJobIds).join(","))}" /></label>
+        <label><span>Assigned task IDs</span><input name="assignedTaskIds" value="${escapeHtml(normalizeListValue(grant.assignedTaskIds).join(","))}" /></label>
+      </div>
+      ${renderModuleAccessPicker({ selectedKeys: grant.visiblePageIds || grant.visibleTabIds, allowedKeys: employeeAllowedModuleKeys, legend: "Employee modules" })}
+      <div class="modal-actions split-actions">
+        <button type="button" data-action="revoke-employee-invitation" data-id="${escapeHtml(grant.id || grant.grantId)}">Revoke invitation</button>
+        <button type="button" data-action="close-modal">Cancel</button>
+        <button type="submit">Save pending profile</button>
       </div>
     </form>
   `);
@@ -12105,6 +12740,10 @@ document.addEventListener("click", (event) => {
     event.preventDefault();
   }
 
+  if (durableMutationActions.has(action) && !workspaceWritesReady()) {
+    return blockUnavailableWorkspaceWrite();
+  }
+
   if (action === "set-active") return routeToModule(key);
   if (action === "mobile-open") {
     state.mobileOpen = true;
@@ -12142,6 +12781,13 @@ document.addEventListener("click", (event) => {
     state.modal = { type: "employee-login" };
     return render();
   }
+  if (action === "employee-google-switch") {
+    state.modal = null;
+    return signOutFirebaseAuth().catch((error) => {
+      setToast(error.message || "Unable to open employee Google sign-in");
+      render();
+    });
+  }
   if (action === "open-admin-edit") {
     if (!canDo("manageSections")) {
       setToast("Admin edit mode is restricted.");
@@ -12156,6 +12802,18 @@ document.addEventListener("click", (event) => {
     rememberModalTrigger(actionElement);
     state.modal = { type: "user-manage", userId: id };
     return render();
+  }
+  if (action === "open-pending-employee-manage") {
+    rememberModalTrigger(actionElement);
+    state.modal = { type: "pending-employee-manage", grantId: id };
+    return render();
+  }
+  if (action === "revoke-employee-invitation") {
+    if (!window.confirm("Revoke this employee invitation? The link will stop working immediately.")) return;
+    return revokePendingEmployeeInvitation(id).catch((error) => {
+      setToast(error.message || "Unable to revoke employee invitation");
+      render();
+    });
   }
   if (action === "firebase-logout") return signOutFirebaseAuth();
   if (action === "toggle-admin-edit") {
@@ -12215,6 +12873,7 @@ document.addEventListener("click", (event) => {
     return render();
   }
   if (action === "complete-file") return updateFileStatus(id, "Complete");
+  if (action === "complete-module-record") return updateModuleRecordStatus(id, "Complete");
   if (action === "status-review") return updateFileStatus(id, "Needs review");
   if (action === "status-active") return updateFileStatus(id, "Active");
   if (action === "duplicate-file") return duplicateFile(id);
@@ -12249,7 +12908,12 @@ document.addEventListener("click", (event) => {
   }
   if (action === "prepare-payment-request") return preparePaymentRequest(actionElement.dataset.method || "Card");
   if (action === "create-payment-rail") return createPaymentRailSetup(actionElement.dataset.method || "Payment", actionElement.dataset.route || "gateway-ready", actionElement.dataset.detail || "Payment rail setup");
-  if (action === "complete-task") return completeTask(id);
+  if (action === "complete-task") {
+    return completeTask(id).catch((error) => {
+      setToast(error.message || "Unable to complete task");
+      render();
+    });
+  }
   if (action === "professionalize-sketch") return professionalizeSketch();
   if (action === "save-sketch-file") return saveSketchWorkspaceFile();
   if (action === "undo-sketch") return undoSketchChange();
@@ -12309,7 +12973,11 @@ document.addEventListener("click", (event) => {
     persist();
     return render();
   }
-  if (action === "clock-out") return clockOut();
+  if (action === "clock-out") {
+    return clockOut().catch(async (error) => {
+      await recoverRejectedWorkspaceState(error);
+    });
+  }
   if (action === "employee-logout") {
     if (state.authSession?.roleId === "worker") {
       return signOutFirebaseAuth().catch((error) => {
@@ -12332,6 +13000,9 @@ document.addEventListener("submit", (event) => {
   event.preventDefault();
   const formData = new FormData(form);
   const type = form.dataset.form;
+  if (type !== "access-request" && !workspaceWritesReady()) {
+    return blockUnavailableWorkspaceWrite();
+  }
   if (type === "create-file") {
     createFile(Object.fromEntries(formData.entries()));
   }
@@ -12359,10 +13030,7 @@ document.addEventListener("submit", (event) => {
     addDryLogRecord(formData);
   }
   if (type === "photo-evidence") {
-    return addPhotoEvidence(formData).catch((error) => {
-      setToast(error.message || "Unable to save photo evidence");
-      render();
-    });
+    return addPhotoEvidence(formData).catch((error) => recoverRejectedWorkspaceState(error));
   }
   if (type === "job-note") {
     addJobNote(formData);
@@ -12436,9 +13104,6 @@ document.addEventListener("submit", (event) => {
   if (type === "module-workbench") {
     createWorkbenchRecord(formData);
   }
-  if (type === "employee-login") {
-    loginEmployeePortal(formData);
-  }
   if (type === "access-request") {
     return requestTrialAccess(formData);
   }
@@ -12481,6 +13146,12 @@ document.addEventListener("submit", (event) => {
   if (type === "community-comment") {
     return addCommunityComment(formData).catch((error) => {
       setToast(error.message || "Unable to add comment");
+      render();
+    });
+  }
+  if (type === "pending-employee-manage") {
+    return savePendingEmployeeInvitation(formData).catch((error) => {
+      setToast(error.message || "Unable to update pending employee");
       render();
     });
   }
@@ -12536,7 +13207,9 @@ document.addEventListener("submit", (event) => {
     });
   }
   if (type === "clock-in") {
-    clockIn(formData);
+    return clockIn(formData).catch(async (error) => {
+      await recoverRejectedWorkspaceState(error);
+    });
   }
   if (type === "insurance-status") {
     updateInsuranceSubmissionStatus(String(formData.get("id") || ""), String(formData.get("status") || ""));
@@ -12599,10 +13272,19 @@ document.addEventListener("input", (event) => {
 document.addEventListener("change", (event) => {
   const field = event.target.closest("[data-field]");
   if (!field) return;
+  if (["industry-profile", "price-csv", "xactimate-import", "estimate-logo", "admin-image-file"].includes(field.dataset.field) && !workspaceWritesReady()) {
+    if (field.type === "file") field.value = "";
+    return blockUnavailableWorkspaceWrite();
+  }
   if (field.dataset.field === "category") {
     state.category = field.value;
     persist();
     render();
+  }
+  if (field.dataset.field === "clock-task") {
+    const task = state.tasks.find((item) => item.id === field.value);
+    const jobInput = field.closest('form[data-form="clock-in"]')?.querySelector('[data-field="clock-job"]');
+    if (jobInput && task?.relatedJob) jobInput.value = task.relatedJob;
   }
   if (field.dataset.field === "industry-profile") {
     state.industryProfile = field.value;
@@ -12648,8 +13330,9 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "hidden" || workspaceHydrating) return;
   window.clearTimeout(workspaceSyncTimer);
   workspaceSyncTimer = null;
-  syncWorkspaceState().catch((error) => {
+  syncWorkspaceState().catch(async (error) => {
     console.warn("Brothers OS workspace background save failed.", error);
+    await recoverRejectedWorkspaceState(error);
   });
 });
 

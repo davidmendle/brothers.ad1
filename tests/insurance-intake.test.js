@@ -106,6 +106,7 @@ function createFakeFirestore(seed = {}) {
     if (!store.has(collectionName)) store.set(collectionName, new Map());
     return store.get(collectionName);
   };
+  let transactionQueue = Promise.resolve();
   const snap = (id, data) => ({
     id,
     exists: Boolean(data),
@@ -173,6 +174,21 @@ function createFakeFirestore(seed = {}) {
           for (const operation of operations) await operation();
         }
       };
+    },
+    runTransaction(callback) {
+      const run = transactionQueue.then(async () => {
+        const operations = [];
+        const result = await callback({
+          get: async (ref) => ref.get(),
+          set(ref, data, options) {
+            operations.push(() => ref.set(data, options));
+          }
+        });
+        for (const operation of operations) await operation();
+        return result;
+      });
+      transactionQueue = run.catch(() => undefined);
+      return run;
     },
     dump(collectionName) {
       return Object.fromEntries(ensureCollection(collectionName).entries());
@@ -1213,8 +1229,16 @@ describe("insurance intake logic", () => {
           roleId: "worker",
           companyId: "default-company",
           franchiseIds: ["default-franchise"],
+          contractorId: "contractor-a",
+          employerContractorId: "contractor-a",
+          employerUid: "contractor-owner-uid",
+          onboardingMode: "employee_link",
+          accessScope: "employee_portal",
+          employmentStatus: "active",
           assignedJobIds: ["J-ASSIGNED"],
           assignedTaskIds: ["TASK-ASSIGNED"],
+          visibleTabIds: ["jobs", "photos"],
+          visiblePageIds: ["jobs", "photos"],
           status: "active",
           disabled: false
         }
@@ -1271,14 +1295,21 @@ describe("insurance intake logic", () => {
       .put("/api/workspace-state")
       .set("Cookie", ["brothers_os_session=owner-cookie"])
       .send({
+        baseRevision: "",
+        baseUpdatedAt: "",
         workspaceState: {
           files: [
-            { id: "file-assigned", moduleKey: "jobs", relatedJob: "J-ASSIGNED", title: "Assigned file", accessCode: "DO-NOT-STORE" },
-            { id: "file-other", moduleKey: "jobs", relatedJob: "J-OTHER", title: "Other file" }
+            { id: "file-assigned", moduleKey: "jobs", relatedJob: "J-ASSIGNED", contractorId: "contractor-a", title: "Assigned file", accessCode: "DO-NOT-STORE" },
+            { id: "file-other", moduleKey: "jobs", relatedJob: "J-OTHER", contractorId: "contractor-b", title: "Other file" }
+          ],
+          moduleRecords: [
+            { id: "record-assigned", moduleKey: "jobs", linkedModuleKeys: ["photos"], relatedJob: "J-ASSIGNED", contractorId: "contractor-a", subject: "Assigned job record" },
+            { id: "record-hidden", moduleKey: "dispatch", linkedModuleKeys: ["routeplanner"], relatedJob: "J-ASSIGNED", contractorId: "contractor-a", subject: "Hidden assigned dispatch" },
+            { id: "record-other", moduleKey: "dispatch", linkedModuleKeys: ["routeplanner"], relatedJob: "J-OTHER", contractorId: "contractor-b", subject: "Other dispatch" }
           ],
           photoRecords: [
-            { id: "photo-assigned", jobId: "J-ASSIGNED", taskId: "TASK-ASSIGNED", workerEmail: "worker@example.com" },
-            { id: "photo-other", jobId: "J-OTHER", workerEmail: "other@example.com" }
+            { id: "photo-assigned", jobId: "J-ASSIGNED", taskId: "TASK-ASSIGNED", contractorId: "contractor-a", workerEmail: "worker@example.com" },
+            { id: "photo-other", jobId: "J-OTHER", contractorId: "contractor-b", workerEmail: "other@example.com" }
           ],
           contractorBills: [
             { id: "bill-1", invoiceId: "CINV-1", contractorId: "contractor-a", contractorEmail: "contractor@example.com", jobId: "J-ASSIGNED", amount: 1250 }
@@ -1292,7 +1323,7 @@ describe("insurance intake logic", () => {
       });
 
     expect(saveResponse.status).toBe(200);
-    expect(saveResponse.body.savedRecords).toBe(5);
+    expect(saveResponse.body.savedRecords).toBe(8);
 
     const ownerResponse = await request(app)
       .get("/api/workspace-state")
@@ -1300,6 +1331,7 @@ describe("insurance intake logic", () => {
     expect(ownerResponse.status).toBe(200);
     expect(ownerResponse.body.durable).toBe(true);
     expect(ownerResponse.body.workspaceState.files).toHaveLength(2);
+    expect(ownerResponse.body.workspaceState.moduleRecords).toHaveLength(3);
     expect(ownerResponse.body.workspaceState.files[0].accessCode).toBeUndefined();
     expect(ownerResponse.body.workspaceState.estimateDraft.privateKey).toBeUndefined();
     expect(ownerResponse.body.workspaceState.contractorBills[0].invoiceId).toBe("CINV-1");
@@ -1309,9 +1341,32 @@ describe("insurance intake logic", () => {
       .set("Cookie", ["brothers_os_session=worker-cookie"]);
     expect(workerResponse.status).toBe(200);
     expect(workerResponse.body.workspaceState.files.map((file) => file.id)).toEqual(["file-assigned"]);
+    expect(workerResponse.body.workspaceState.moduleRecords.map((record) => record.id)).toEqual(["record-assigned"]);
     expect(workerResponse.body.workspaceState.photoRecords.map((photo) => photo.id)).toEqual(["photo-assigned"]);
     expect(workerResponse.body.workspaceState.contractorBills).toBeUndefined();
     expect(workerResponse.body.workspaceState.estimateDraft).toBeUndefined();
+
+    const workerWrite = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=worker-cookie"])
+      .send({
+        baseRevision: ownerResponse.body.revision,
+        baseUpdatedAt: ownerResponse.body.updatedAt,
+        workspaceState: {
+          moduleRecords: [{ id: "record-assigned", moduleKey: "jobs", relatedJob: "J-ASSIGNED", subject: "Worker replacement" }],
+          files: [{ id: "file-spoof", moduleKey: "jobs", relatedJob: "J-OTHER", workerEmail: "worker@example.com", title: "Spoofed file" }]
+        }
+      });
+    expect(workerWrite.status).toBe(403);
+    expect(workerWrite.body.message).toMatch(/no records were saved/i);
+
+    const ownerAfterWorkerWrite = await request(app)
+      .get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=owner-cookie"]);
+    expect(ownerAfterWorkerWrite.body.workspaceState.moduleRecords).toContainEqual(
+      expect.objectContaining({ id: "record-assigned", subject: "Assigned job record" })
+    );
+    expect(ownerAfterWorkerWrite.body.workspaceState.files.map((file) => file.id)).not.toContain("file-spoof");
   });
 
   it("persists measured walls and fails closed across franchise workspace scopes", async () => {
@@ -1394,7 +1449,13 @@ describe("insurance intake logic", () => {
       .put("/api/workspace-state")
       .set("Cookie", ["brothers_os_session=owner-cookie"])
       .send({
+        baseRevision: "",
+        baseUpdatedAt: "",
         workspaceState: {
+          branches: [
+            { id: "branch-a", name: "Branch A", franchiseId: "franchise-a" },
+            { id: "branch-b", name: "Branch B", franchiseId: "franchise-b" }
+          ],
           sketchRooms: [
             { id: "legacy-unscoped-room", name: "Legacy Room" },
             { id: "room-a", name: "Room A", franchiseId: "franchise-a" },
@@ -1408,7 +1469,7 @@ describe("insurance intake logic", () => {
       });
 
     expect(seedResponse.status).toBe(200);
-    expect(seedResponse.body.savedRecords).toBe(5);
+    expect(seedResponse.body.savedRecords).toBe(7);
 
     const franchiseAResponse = await request(app)
       .get("/api/workspace-state")
@@ -1428,6 +1489,8 @@ describe("insurance intake logic", () => {
       .put("/api/workspace-state")
       .set("Cookie", ["brothers_os_session=franchise-a-cookie"])
       .send({
+        baseRevision: seedResponse.body.revision,
+        baseUpdatedAt: seedResponse.body.updatedAt,
         workspaceState: {
           sketchWalls: [{
             id: "predictable-wall-id",
@@ -1451,6 +1514,8 @@ describe("insurance intake logic", () => {
       .put("/api/workspace-state")
       .set("Cookie", ["brothers_os_session=franchise-a-cookie"])
       .send({
+        baseRevision: collisionAttemptResponse.body.revision,
+        baseUpdatedAt: collisionAttemptResponse.body.updatedAt,
         workspaceState: {
           sketchWalls: [{ id: "wall-a-new", start: { x: 8, y: 0 }, end: { x: 8, y: 6 } }]
         }
@@ -1461,12 +1526,42 @@ describe("insurance intake logic", () => {
       .find((record) => record.field === "sketchWalls" && record.data?.id === "wall-a-new");
     expect(storedAutoScopedWall.data.franchiseId).toBe("franchise-a");
 
+    const foreignScopeResponse = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=franchise-a-cookie"])
+      .send({
+        baseRevision: autoScopeResponse.body.revision,
+        baseUpdatedAt: autoScopeResponse.body.updatedAt,
+        workspaceState: {
+          sketchWalls: [{ id: "wall-foreign", franchiseId: "franchise-b" }]
+        }
+      });
+    expect(foreignScopeResponse.status).toBe(403);
+    expect(foreignScopeResponse.body.message).toMatch(/outside the current franchise/i);
+
+    const foreignBranchResponse = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=franchise-a-cookie"])
+      .send({
+        baseRevision: autoScopeResponse.body.revision,
+        baseUpdatedAt: autoScopeResponse.body.updatedAt,
+        workspaceState: {
+          sketchWalls: [{ id: "wall-foreign-branch", franchiseId: "franchise-a", branchId: "branch-b" }]
+        }
+      });
+    expect(foreignBranchResponse.status).toBe(403);
+    expect(foreignBranchResponse.body.message).toMatch(/branch outside the current franchise/i);
+
     const ambiguousScopeResponse = await request(app)
       .put("/api/workspace-state")
       .set("Cookie", ["brothers_os_session=multi-franchise-cookie"])
-      .send({ workspaceState: { sketchWalls: [{ id: "wall-ambiguous" }] } });
-    expect(ambiguousScopeResponse.status).toBe(200);
-    expect(ambiguousScopeResponse.body).toMatchObject({ savedRecords: 0, ignoredRecords: 1 });
+      .send({
+        baseRevision: autoScopeResponse.body.revision,
+        baseUpdatedAt: autoScopeResponse.body.updatedAt,
+        workspaceState: { sketchWalls: [{ id: "wall-ambiguous" }] }
+      });
+    expect(ambiguousScopeResponse.status).toBe(403);
+    expect(ambiguousScopeResponse.body.message).toMatch(/choose one authorized franchise/i);
     const franchiseBAfterRejectedWrite = await request(app)
       .get("/api/workspace-state")
       .set("Cookie", ["brothers_os_session=franchise-b-cookie"]);

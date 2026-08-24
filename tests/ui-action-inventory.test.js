@@ -61,9 +61,10 @@ describe("UI action inventory", () => {
     expect(source).not.toContain("editableRoles[0]");
   });
 
-  it("keeps the local employee builder available when Firebase auth is active", () => {
-    expect(source).toContain("Secure login manager");
-    expect(source).toContain("state.firebase.enabled && state.authSession");
+  it("keeps the employee profile builder and non-employee access manager available", () => {
+    expect(source).toContain("Add employee profile");
+    expect(source).toContain("Secure storage needs activation");
+    expect(source).toContain("${renderEmployeeInvitationPanel()}");
     expect(source).toContain("${renderTeamForm()}");
   });
 
@@ -73,6 +74,76 @@ describe("UI action inventory", () => {
 
     expect(moduleAnchors.length).toBeGreaterThan(40);
     expect(unhandledAnchors).toEqual([]);
+  });
+
+  it("uses structured cross-module records instead of file-only workbench submissions", () => {
+    expect(source).toContain('moduleRecords: []');
+    expect(source).toContain('state.moduleRecords = [record, ...(state.moduleRecords || [])]');
+    expect(source).toContain('sourceType: "moduleRecord"');
+    expect(source).toContain("function moduleRecordsFor(moduleKey)");
+    expect(source).toContain("function updateModuleRecordStatus(recordId, status)");
+  });
+
+  it("locks operational writes when shared Firebase storage is unavailable", () => {
+    expect(source).toContain("function workspaceWritesReady()");
+    expect(source).toContain("durableMutationActions.has(action) && !workspaceWritesReady()");
+    expect(source).toContain('type !== "access-request" && !workspaceWritesReady()');
+    expect(source).toContain("This prevents browser-only data from appearing saved");
+    expect(source).toContain("persistence.loaded");
+    expect(source).toContain("persistence.durable");
+    expect(source).toContain("workspaceIdentityMatchesCurrent()");
+    expect(source).toContain("resetWorkspaceForCurrentSession(runtimeState)");
+  });
+
+  it("keeps photo evidence separate from GPS-backed ticket completion", () => {
+    const photoWorkflow = source.slice(
+      source.indexOf("async function addPhotoEvidence"),
+      source.indexOf("function addJobNote")
+    );
+    expect(photoWorkflow).not.toContain("completeTask(task.id)");
+    expect(photoWorkflow).toContain("sign the ticket with GPS to complete it");
+    expect(source).toContain('apiRequest("/api/employee/ticket-signoffs"');
+  });
+
+  it("keeps employee mutations aligned with server authorization", () => {
+    const profileSave = source.slice(
+      source.indexOf("async function saveEmployeeProfile"),
+      source.indexOf("async function submitTicketSignoff")
+    );
+    const photoWorkflow = source.slice(
+      source.indexOf("async function addPhotoEvidence"),
+      source.indexOf("function addJobNote")
+    );
+    expect(source).toContain("fieldUserEditableWorkspaceFields");
+    expect(source).toContain("baseRevision: state.workspacePersistence.revision");
+    expect(source).toContain("baseUpdatedAt: state.workspacePersistence.lastSavedAt");
+    expect(source).toContain('currentRoleId() === "worker"');
+    expect(source).toContain("Sign with GPS");
+    expect(source).toContain("ownerManagedJobGateIds");
+    expect(source).toContain("canEditModuleWorkflowRecords()");
+    expect(profileSave).not.toContain("employmentType:");
+    expect(profileSave).not.toContain("startDate:");
+    expect(photoWorkflow.indexOf("await syncWorkspaceState({ force: true })"))
+      .toBeLessThan(photoWorkflow.indexOf("Photo evidence saved"));
+  });
+
+  it("hides server-rejected employee controls and restores rejected workspace writes", () => {
+    expect(source).toContain('const canCreateJobs = currentRoleId() !== "worker";');
+    expect(source).toContain("function canEditFileRecord(file)");
+    expect(source).toContain('sourceType || "").trim().toLowerCase() === "taskassignment"');
+    expect(source).toContain("async function recoverRejectedWorkspaceState(error)");
+    expect(source).toContain("await hydrateWorkspaceState({ migrateIfEmpty: false, preserveLocalOnError: true })");
+    expect(source).toContain('input name="photoFile" type="file" accept="image/*" required');
+    expect(source).not.toContain("Photo reference or link");
+  });
+
+  it("routes every advertised relationship to a real module and renders real account pages", () => {
+    for (const removedKey of ["branchbench", "signature", "dashboard"]) {
+      expect(source).not.toContain(`\"${removedKey}\"`);
+    }
+    expect(source).toContain('fieldmobile: ["time", "photos", "equipment", "safetyintel"]');
+    expect(source).toContain('if (module.key === "settings") return renderSettingsModule(module);');
+    expect(source).toContain('if (module.key === "securitycenter") return renderSecurityCenterModule(module);');
   });
 
   it("filters admin-authored navigation and section URLs through shared guards", () => {

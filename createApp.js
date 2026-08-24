@@ -125,7 +125,7 @@ function resolveDatabasePath() {
   if (path.isAbsolute(rawPath)) return rawPath;
   return process.env.VERCEL
     ? path.join(runtimeDataRoot, rawPath)
-    : path.join(rootDir, rawPath);
+    : path.join(/* turbopackIgnore: true */ rootDir, rawPath);
 }
 
 function getDatabase() {
@@ -996,7 +996,7 @@ async function persistUploadedFilesToFirebase(submissionId, uploadedFiles) {
     const fileId = crypto.randomUUID();
     const safeName = sanitizeFileName(file.originalName || file.fileName || `attachment-${index + 1}`);
     const objectPath = `${firebaseInsuranceFilePrefix}/${submissionId}/${fileId}-${safeName}`;
-    const fileBuffer = fs.readFileSync(file.tempPath);
+    const fileBuffer = fs.readFileSync(/* turbopackIgnore: true */ file.tempPath);
     await bucket.file(objectPath).save(fileBuffer, {
       resumable: false,
       metadata: {
@@ -1030,7 +1030,7 @@ async function persistUploadedFilesToBlob(submissionId, uploadedFiles) {
     const fileId = crypto.randomUUID();
     const safeName = sanitizeFileName(file.originalName || file.fileName || `attachment-${index + 1}`);
     const blobPath = `${blobFilePrefix}/${submissionId}/${fileId}-${safeName}`;
-    const fileBuffer = fs.readFileSync(file.tempPath);
+    const fileBuffer = fs.readFileSync(/* turbopackIgnore: true */ file.tempPath);
     const uploadResult = await put(blobPath, fileBuffer, {
       access: "private",
       addRandomSuffix: false,
@@ -1430,7 +1430,7 @@ async function buildLegacyIntakeProxyBody(request) {
     });
 
     (Array.isArray(request.files) ? request.files : []).forEach((file) => {
-      const fileBuffer = fs.readFileSync(file.path);
+      const fileBuffer = fs.readFileSync(/* turbopackIgnore: true */ file.path);
       formData.append(
         "files",
         new Blob([fileBuffer], { type: file.mimetype || "application/octet-stream" }),
@@ -1747,7 +1747,6 @@ function createApp() {
   });
 
   app.use(express.static(path.join(rootDir, "public")));
-  app.use(express.static(rootDir, { extensions: ["html"] }));
   app.use("/uploads", express.static(uploadsRoot));
 
   app.get(/^(?!\/api\/).*/, (_request, response) => {

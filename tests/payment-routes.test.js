@@ -42,6 +42,16 @@ describe("payment and integration routes", () => {
     await request(app).get("/api/integrations/quickbooks/oauth/start").expect(401);
   });
 
+  it("serves the application shell without exposing repository source files", async () => {
+    const sourceProbe = await request(app).get("/createApp.js").expect(200);
+    const manifestProbe = await request(app).get("/package.json").expect(200);
+
+    expect(sourceProbe.headers["content-type"]).toMatch(/text\/html/);
+    expect(sourceProbe.text).not.toContain('const fs = require("fs")');
+    expect(manifestProbe.headers["content-type"]).toMatch(/text\/html/);
+    expect(manifestProbe.text).not.toContain('"name": "brothers-ad"');
+  });
+
   it("validates payment payloads before a provider request", () => {
     expect(normalizePaymentPayload({ amount: 0, customer: "Customer" })).toMatchObject({ ok: false, statusCode: 400 });
     expect(normalizePaymentPayload({ amount: 1250.459, customer: " North Ridge ", job: "J-1" })).toMatchObject({

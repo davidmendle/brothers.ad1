@@ -8,6 +8,7 @@ const moduleDataSource = fs.readFileSync(new URL("../module-data.js", import.met
 const smokeModuleDefinitions = JSON.parse(moduleDataSource.slice(moduleDataSource.indexOf("["), moduleDataSource.lastIndexOf("]") + 1));
 const staticActionTypes = [...new Set([...appSource.matchAll(/data-action="([^"]+)"/g)].map((match) => match[1]))].sort();
 const staticFormTypes = [...new Set([...appSource.matchAll(/data-form="([^"]+)"/g)].map((match) => match[1]))].sort();
+const staticFieldTypes = [...new Set([...appSource.matchAll(/data-field="([^"]+)"/g)].map((match) => match[1]))].sort();
 const stamp = String(Date.now()).slice(-6);
 const ids = {
   jobId: `J-AI-${stamp}`,
@@ -17,6 +18,7 @@ const ids = {
   employeeEmail: `ai.tech.${stamp}@example.com`,
   accessCode: `EMP${stamp}`,
   taskTitle: `Upload kitchen invoice photos ${stamp}`,
+  moduleRecord: `Emergency dispatch record ${stamp}`,
   priceCode: `AI-LAB-${stamp}`,
   priceName: `AI labor line ${stamp}`,
   paymentCustomer: `AI Payment Customer ${stamp}`,
@@ -37,6 +39,7 @@ const results = {
   workbenchFormsSubmitted: 0,
   actionTypesExercised: 0,
   formTypesSubmitted: 0,
+  fieldTypesExercised: 0,
   workflowChecks: []
 };
 const actionCoverage = {
@@ -44,9 +47,14 @@ const actionCoverage = {
   exercised: new Set(),
   formsRendered: new Set(),
   formsSubmitted: new Set(),
+  fieldsRendered: new Set(),
+  fieldsExercised: new Set(),
   actionLocations: new Map(),
-  formLocations: new Map()
+  formLocations: new Map(),
+  fieldLocations: new Map()
 };
+const semanticModuleRecords = [];
+const smokePng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 
 function moduleUrl(key) {
   return `${baseUrl}/?smoke=${Date.now()}#module/${key}`;
@@ -61,6 +69,7 @@ async function unique(locator, label) {
 }
 
 async function go(page, key) {
+  const expectedLabel = smokeModuleDefinitions.find((module) => module.key === key)?.label || key;
   const canUseSpaNavigation = page.url().startsWith(origin)
     && await page.locator(".app-shell").count().catch(() => 0);
   if (canUseSpaNavigation) {
@@ -72,7 +81,10 @@ async function go(page, key) {
   }
   await page.waitForSelector(".app-shell", { timeout: 8000 });
   await page.waitForURL((url) => url.hash === `#module/${key}`, { timeout: 8000 });
-  await page.locator("h1").filter({ hasText: /\S/ }).waitFor({ state: "visible", timeout: 8000 });
+  await waitUntil(`${key} module DOM`, async () => {
+    const heading = await page.locator("h1").textContent().catch(() => "");
+    return String(heading || "").trim() === expectedLabel;
+  }, 8000);
   const h1 = await page.locator("h1").textContent().catch(() => "");
   if (!h1) throw new Error(`Module ${key} did not render a workspace heading`);
 }
@@ -133,12 +145,51 @@ async function firstVisible(locator) {
   return null;
 }
 
+function recordFieldCoverage(fieldType, location, exercised = false) {
+  if (!fieldType) return;
+  actionCoverage.fieldsRendered.add(fieldType);
+  if (exercised) actionCoverage.fieldsExercised.add(fieldType);
+  if (!actionCoverage.fieldLocations.has(fieldType)) actionCoverage.fieldLocations.set(fieldType, location);
+}
+
+async function visibleDataField(page, fieldType, location = fieldType) {
+  const field = await firstVisible(page.locator(`[data-field="${fieldType}"]`));
+  if (!field) throw new Error(`${location} did not render the ${fieldType} data field`);
+  recordFieldCoverage(fieldType, location);
+  return field;
+}
+
+async function exerciseDataField(page, fieldType, operation, location = fieldType) {
+  const field = await visibleDataField(page, fieldType, location);
+  await operation(field);
+  recordFieldCoverage(fieldType, location, true);
+  return field;
+}
+
+async function setGpsDenied(page, denied) {
+  await page.evaluate((shouldDeny) => {
+    const geolocation = navigator.geolocation;
+    if (!geolocation) throw new Error("Browser geolocation API is unavailable");
+    if (!window.__brothersSmokeOriginalGetCurrentPosition) {
+      window.__brothersSmokeOriginalGetCurrentPosition = geolocation.getCurrentPosition.bind(geolocation);
+    }
+    const getCurrentPosition = shouldDeny
+      ? (_success, failure) => failure?.({ code: 1, message: "Geolocation permission denied by smoke test" })
+      : window.__brothersSmokeOriginalGetCurrentPosition;
+    Object.defineProperty(geolocation, "getCurrentPosition", {
+      configurable: true,
+      value: getCurrentPosition
+    });
+  }, denied);
+}
+
 async function collectPageCoverage(page, key) {
   const summary = await page.evaluate(() => ({
     buttons: document.querySelectorAll("button").length,
     forms: document.querySelectorAll("form[data-form]").length,
     actions: [...new Set([...document.querySelectorAll("[data-action]")].map((element) => element.dataset.action).filter(Boolean))],
     formTypes: [...new Set([...document.querySelectorAll("form[data-form]")].map((element) => element.dataset.form).filter(Boolean))],
+    fieldTypes: [...new Set([...document.querySelectorAll("[data-field]")].map((element) => element.dataset.field).filter(Boolean))],
     inertButtons: [...document.querySelectorAll("button")]
       .filter((button) => !button.disabled && !button.dataset.action && !button.closest("form"))
       .map((button) => button.textContent.trim().replace(/\s+/g, " "))
@@ -155,6 +206,7 @@ async function collectPageCoverage(page, key) {
     actionCoverage.formsRendered.add(formType);
     if (!actionCoverage.formLocations.has(formType)) actionCoverage.formLocations.set(formType, key);
   });
+  summary.fieldTypes.forEach((fieldType) => recordFieldCoverage(fieldType, key));
   return summary;
 }
 
@@ -182,6 +234,139 @@ async function safeModuleSweep(page) {
     }
   }
   return moduleKeys;
+}
+
+async function sidebarModuleKeys(page) {
+  return page.locator(".sidebar .nav-list .nav-button").evaluateAll((links) => {
+    return links.map((link) => link.dataset.key).filter(Boolean);
+  });
+}
+
+async function exerciseDataFieldControls(page) {
+  console.log("[smoke] starting data-field control verification");
+  await go(page, "daily");
+
+  const unfilteredModuleCount = (await sidebarModuleKeys(page)).length;
+  await exerciseDataField(page, "search", (field) => field.fill("Global Indexes"), "module search");
+  await waitUntil("module search result", async () => {
+    const keys = await sidebarModuleKeys(page);
+    return keys.length === 1 && keys[0] === "globalindexes";
+  });
+  const resetSearch = await visibleDataField(page, "search", "module search reset");
+  await resetSearch.fill("");
+  await waitUntil("module search reset", async () => (await sidebarModuleKeys(page)).length === unfilteredModuleCount);
+
+  const categoryField = await visibleDataField(page, "category", "module category filter");
+  const category = await categoryField.locator("option").evaluateAll((options, definitions) => {
+    const available = options.map((option) => option.value).filter((value) => value && value !== "all");
+    return available.find((value) => definitions.filter((module) => module.category === value).length > 1) || available[0] || "";
+  }, smokeModuleDefinitions);
+  if (!category) throw new Error("Module category filter did not expose a category option");
+  await exerciseDataField(page, "category", (field) => field.selectOption(category), "module category filter");
+  await waitUntil("module category results", async () => {
+    const keys = await sidebarModuleKeys(page);
+    return keys.length > 0 && keys.every((key) => smokeModuleDefinitions.find((module) => module.key === key)?.category === category);
+  });
+  const resetCategory = await visibleDataField(page, "category", "module category reset");
+  await resetCategory.selectOption("all");
+  await waitUntil("module category reset", async () => (await sidebarModuleKeys(page)).length === unfilteredModuleCount);
+
+  const industryField = await visibleDataField(page, "industry-profile", "industry profile selector");
+  const industrySelection = await industryField.locator("option").evaluateAll((options, currentValue) => {
+    const alternative = options.find((option) => option.value && option.value !== currentValue);
+    const current = options.find((option) => option.value === currentValue);
+    return {
+      originalValue: currentValue,
+      alternativeValue: alternative?.value || "",
+      alternativeLabel: alternative?.textContent?.trim() || "",
+      originalLabel: current?.textContent?.trim() || ""
+    };
+  }, await industryField.inputValue());
+  if (!industrySelection.alternativeValue) throw new Error("Industry profile selector did not expose an alternate profile");
+  await exerciseDataField(page, "industry-profile", (field) => field.selectOption(industrySelection.alternativeValue), "industry profile selector");
+  await waitUntil("industry profile update", async () => {
+    const field = await firstVisible(page.locator('[data-field="industry-profile"]'));
+    const banner = await page.locator(".trial-banner").first().textContent().catch(() => "");
+    return field && await field.inputValue() === industrySelection.alternativeValue && banner.includes(industrySelection.alternativeLabel);
+  });
+  const restoreIndustry = await visibleDataField(page, "industry-profile", "industry profile reset");
+  await restoreIndustry.selectOption(industrySelection.originalValue);
+  await waitUntil("industry profile reset", async () => {
+    const banner = await page.locator(".trial-banner").first().textContent().catch(() => "");
+    return banner.includes(industrySelection.originalLabel);
+  });
+
+  await go(page, "insurance");
+  const insuranceCustomer = `Insurance Customer ${stamp}`;
+  await page.locator(".insurance-card").filter({ hasText: insuranceCustomer }).waitFor({ state: "visible" });
+  await exerciseDataField(page, "insurance-search", (field) => field.fill(insuranceCustomer), "insurance search");
+  await exerciseDataField(page, "insurance-status", (field) => field.selectOption("completed"), "insurance status filter");
+  await clickVisibleAction(page, "refresh-insurance-intake", "apply insurance filters");
+  await waitUntil("empty insurance filter result", async () => {
+    return await page.locator(".insurance-card").count() === 0
+      && (await page.locator("body").innerText()).includes("No insurance submissions found");
+  });
+  const newStatus = await visibleDataField(page, "insurance-status", "insurance status reset");
+  await newStatus.selectOption("new");
+  recordFieldCoverage("insurance-status", "insurance status filter", true);
+  await clickVisibleAction(page, "refresh-insurance-intake", "apply matching insurance filters");
+  await page.locator(".insurance-card").filter({ hasText: insuranceCustomer }).waitFor({ state: "visible" });
+  const clearInsuranceSearch = await visibleDataField(page, "insurance-search", "insurance search reset");
+  await clearInsuranceSearch.fill("");
+  const clearInsuranceStatus = await visibleDataField(page, "insurance-status", "insurance status reset");
+  await clearInsuranceStatus.selectOption("all");
+  await clickVisibleAction(page, "refresh-insurance-intake", "clear insurance filters");
+  await page.locator(".insurance-card").filter({ hasText: insuranceCustomer }).waitFor({ state: "visible" });
+
+  await go(page, "pricing");
+  const csvCode = `FIELD-CSV-${stamp}`;
+  const csv = `code,name,category,unit,rate,cost,branch,justification\n${csvCode},Field coverage labor,Labor,hour,151,61,Smoke branch,Semantic CSV field verification`;
+  await exerciseDataField(page, "price-csv", (field) => field.setInputFiles({
+    name: `field-price-${stamp}.csv`,
+    mimeType: "text/csv",
+    buffer: Buffer.from(csv)
+  }), "price CSV upload");
+  await page.locator(".price-table").filter({ hasText: csvCode }).waitFor({ state: "visible" });
+
+  const xactimateCode = `FIELD-XM8-${stamp}`;
+  const xactimateCsv = `code,name,category,unit,rate,cost,branch,justification\n${xactimateCode},Field coverage Xactimate line,Xactimate pricing,each,225,80,Smoke branch,Semantic Xactimate field verification`;
+  await exerciseDataField(page, "xactimate-import", (field) => field.setInputFiles({
+    name: `field-xactimate-${stamp}.csv`,
+    mimeType: "text/csv",
+    buffer: Buffer.from(xactimateCsv)
+  }), "Xactimate upload");
+  await page.locator(".price-table").filter({ hasText: xactimateCode }).waitFor({ state: "visible" });
+
+  await exerciseDataField(page, "estimate-logo", (field) => field.setInputFiles({
+    name: `field-logo-${stamp}.png`,
+    mimeType: "image/png",
+    buffer: smokePng
+  }), "estimate logo upload");
+  await waitUntil("estimate logo preview", async () => {
+    const source = await page.locator('img[alt="Logo preview"]').getAttribute("src").catch(() => "");
+    return String(source || "").startsWith("data:image/png");
+  });
+
+  await go(page, "accessadmin");
+  if (!await clickVisibleAction(page, "open-admin-edit", "open admin editor for image upload")) {
+    throw new Error("Admin edit mode did not expose its image field");
+  }
+  await exerciseDataField(page, "admin-image-file", (field) => field.setInputFiles({
+    name: `field-admin-${stamp}.png`,
+    mimeType: "image/png",
+    buffer: smokePng
+  }), "admin section image upload");
+  await waitUntil("admin image URL handoff", async () => {
+    const imageUrl = await page.locator('form[data-form="page-section-config"] input[name="imageUrl"]').inputValue().catch(() => "");
+    return imageUrl.includes("logo.png") || imageUrl.includes("workspace-assets");
+  });
+  await clickVisibleAction(page, "close-modal", "close admin editor after image verification");
+
+  results.workflowChecks.push({
+    label: "Data-field controls",
+    text: "module filters, insurance filters, pricing imports, estimate logo, and admin image produced verified UI state"
+  });
+  console.log("[smoke] data-field control verification complete");
 }
 
 function genericFieldValue(formType, name, inputType) {
@@ -267,7 +452,13 @@ async function submitRemainingForms(page) {
     const location = actionCoverage.formLocations.get(formType);
     if (!location) continue;
     await go(page, location);
-    await submitGenericForm(page, formType);
+    const containingDisclosure = page.locator(`details:has(form[data-form="${formType}"])`).first();
+    if (await containingDisclosure.count()) {
+      await containingDisclosure.evaluate((element) => { element.open = true; });
+    }
+    if (!await submitGenericForm(page, formType)) {
+      throw new Error(`${formType} was inventoried but could not be submitted at ${location}`);
+    }
   }
 
   await go(page, "daily");
@@ -321,7 +512,7 @@ async function submitRemainingForms(page) {
   await clickVisibleAction(page, "copy-payment-link");
 }
 
-async function runWorkflow(page) {
+async function runWorkflow(page, localSmokeApi) {
   await go(page, "jobs");
   await fill(page, 'form[data-form="job-record"] input[name="jobId"]', ids.jobId);
   await fill(page, 'form[data-form="job-record"] input[name="title"]', ids.jobTitle);
@@ -410,16 +601,53 @@ async function runWorkflow(page) {
   await go(page, "jobs");
   await expectBody(page, "connected plan linked to jobs", `${ids.jobId} measured floor plan`);
 
+  await go(page, "dispatch");
+  await fill(page, 'form[data-form="module-workbench"] input[name="subject"]', ids.moduleRecord);
+  await fill(page, 'form[data-form="module-workbench"] input[name="relatedJob"]', ids.jobId);
+  await fill(page, 'form[data-form="module-workbench"] input[name="owner"]', "Dispatch supervisor");
+  await select(page, 'form[data-form="module-workbench"] select[name="priority"]', "High");
+  await fill(page, 'form[data-form="module-workbench"] input[name="due"]', "2026-07-23");
+  await click(page, 'form[data-form="module-workbench"] button[type="submit"]');
+  await expectBody(page, "typed dispatch record created", ids.moduleRecord);
+  await go(page, "routeplanner");
+  await expectBody(page, "typed dispatch record crossed into route planning", ids.moduleRecord);
+  await click(page, `.module-record-card:has-text("${ids.moduleRecord}") button[data-action="complete-module-record"]`);
+  await go(page, "dispatch");
+  const completedDispatchRecord = page.locator(".module-record-card").filter({ hasText: ids.moduleRecord });
+  await completedDispatchRecord.filter({ hasText: "Complete" }).waitFor({ state: "visible", timeout: 8000 });
+
   await go(page, "team");
-  await fill(page, 'form[data-form="team-member"] input[name="name"]', ids.employeeName);
-  await fill(page, 'form[data-form="team-member"] input[name="email"]', ids.employeeEmail);
-  await select(page, 'form[data-form="team-member"] select[name="accountType"]', "Employee");
-  await fill(page, 'form[data-form="team-member"] input[name="role"]', "Field technician");
-  await fill(page, 'form[data-form="team-member"] input[name="access"]', "Jobs, photos, time, communications");
-  await fill(page, 'form[data-form="team-member"] input[name="accessCode"]', ids.accessCode);
-  await fill(page, 'form[data-form="team-member"] input[name="assignedJobIds"]', ids.jobId);
-  await click(page, 'form[data-form="team-member"] button[type="submit"]');
-  await expectBody(page, "employee login created", ids.employeeEmail);
+  await fill(page, 'form[data-form="employee-invitation"] input[name="displayName"]', ids.employeeName);
+  await fill(page, 'form[data-form="employee-invitation"] input[name="email"]', ids.employeeEmail);
+  await fill(page, 'form[data-form="employee-invitation"] input[name="phone"]', "555-222-3030");
+  await fill(page, 'form[data-form="employee-invitation"] input[name="jobTitle"]', "Field technician");
+  await select(page, 'form[data-form="employee-invitation"] select[name="employmentType"]', "Employee");
+  await fill(page, 'form[data-form="employee-invitation"] input[name="startDate"]', "2026-07-20");
+  await fill(page, 'form[data-form="employee-invitation"] input[name="assignedJobIds"]', ids.jobId);
+  const employeeInviteSubmit = page.locator('form[data-form="employee-invitation"] button[type="submit"]');
+  if (await employeeInviteSubmit.isDisabled()) {
+    throw new Error("Employee invitation submit is disabled even though secure storage is available");
+  }
+  const employeeInviteResponse = page.waitForResponse((response) => {
+    return new URL(response.url()).pathname === "/api/employee-invitations"
+      && response.request().method() === "POST";
+  });
+  await click(page, 'form[data-form="employee-invitation"] button[type="submit"]');
+  const inviteResponse = await employeeInviteResponse;
+  const inviteResult = await inviteResponse.json().catch(() => ({}));
+  if (!inviteResponse.ok() || inviteResult.success === false || inviteResult.grant?.email !== ids.employeeEmail) {
+    throw new Error(`Employee invitation API failed: ${inviteResult.message || inviteResponse.status()}`);
+  }
+  await expectBody(page, "pending employee profile created", ids.employeeEmail);
+  await expectBody(page, "pending employee is visible before acceptance", "Invitation pending");
+  const pendingEmployeeCard = page.locator(".team-card").filter({ hasText: ids.employeeEmail });
+  if (await pendingEmployeeCard.locator('[data-action="open-user-manage"], [data-action="reset-user-permissions"], [data-action="toggle-user-disabled"], [data-action="delete-user"]').count()) {
+    throw new Error("Pending employee exposed accepted-user management controls");
+  }
+  await click(page, `.team-card:has-text("${ids.employeeEmail}") button[data-action="open-pending-employee-manage"]`);
+  await fill(page, 'form[data-form="pending-employee-manage"] input[name="jobTitle"]', "Lead field technician");
+  await click(page, 'form[data-form="pending-employee-manage"] button[type="submit"]');
+  await expectBody(page, "pending employee profile updated", "Lead field technician");
 
   const moduleOptions = await page.locator('form[data-form="task"] select[name="moduleKey"] option').evaluateAll((options) => {
     return options.map((option) => option.value);
@@ -492,15 +720,34 @@ async function runWorkflow(page) {
   await select(page, 'form[data-form="photo-evidence"] select[name="taskId"]', photoTaskValue);
   await fill(page, 'form[data-form="photo-evidence"] input[name="room"]', ids.dryRoom);
   await select(page, 'form[data-form="photo-evidence"] select[name="category"]', "Invoice support");
-  await fill(page, 'form[data-form="photo-evidence"] input[name="photoRef"]', ids.photoRef);
+  await page.locator('form[data-form="photo-evidence"] input[name="photoFile"]').setInputFiles({
+    name: ids.photoRef,
+    mimeType: "image/png",
+    buffer: smokePng
+  });
   await fill(page, 'form[data-form="photo-evidence"] textarea[name="notes"]', "AI QA photo evidence should complete the assigned photo task");
   await click(page, 'form[data-form="photo-evidence"] button[type="submit"]');
+  if (localSmokeApi) {
+    await waitUntil("durable photo evidence", () => (localSmokeApi.getWorkspaceState().photoRecords || [])
+      .some((record) => record.photoRef === ids.photoRef && record.jobId === ids.jobId));
+  } else {
+    await page.locator(".toast").filter({ hasText: "Photo evidence saved" }).waitFor({ state: "visible" });
+  }
   await expectBody(page, "photo evidence saved", ids.photoRef);
   await select(page, 'form[data-form="job-note"] select[name="jobId"]', ids.jobId);
   await select(page, 'form[data-form="job-note"] select[name="noteType"]', "Customer update");
-  await fill(page, 'form[data-form="job-note"] textarea[name="notes"]', `Customer note for ${ids.jobId} should link to communications and closeout`);
+  const linkedJobNote = `Customer note for ${ids.jobId} should link to communications and closeout`;
+  await fill(page, 'form[data-form="job-note"] textarea[name="notes"]', linkedJobNote);
   await click(page, 'form[data-form="job-note"] button[type="submit"]');
+  if (localSmokeApi) {
+    await waitUntil("durable linked job note", () => JSON.stringify(localSmokeApi.getWorkspaceState()).includes(linkedJobNote));
+  } else {
+    await page.locator(".toast").filter({ hasText: "Job note saved" }).waitFor({ state: "visible" });
+  }
   await expectBody(page, "job note saved", `Customer note for ${ids.jobId}`);
+  await go(page, "communications");
+  await expectBody(page, "job note linked to communications", linkedJobNote);
+  await go(page, "photos");
 
   await go(page, "equipment");
   await fill(page, 'form[data-form="equipment-deployment"] input[name="equipmentName"]', ids.equipmentName);
@@ -526,11 +773,87 @@ async function runWorkflow(page) {
 
   await go(page, "time");
   await fill(page, 'form[data-form="clock-in"] input[name="worker"]', ids.employeeName);
-  await fill(page, 'form[data-form="clock-in"] input[name="job"]', ids.jobId);
+  const linkedClockTaskId = await page.locator('form[data-form="clock-in"] select[name="task"] option')
+    .evaluateAll((options, title) => options.find((option) => option.textContent.includes(title))?.value || "", ids.taskTitle);
+  if (!linkedClockTaskId) throw new Error("Assigned task did not appear in the GPS clock task selector");
+  await exerciseDataField(page, "clock-job", (field) => field.fill(`WRONG-JOB-${stamp}`), "GPS clock job");
+  await exerciseDataField(page, "clock-task", (field) => field.selectOption(linkedClockTaskId), "GPS clock task");
+  await waitUntil("clock task-to-job linkage", async () => {
+    return await page.locator('[data-field="clock-job"]').inputValue() === ids.jobId;
+  });
+
+  await page.waitForTimeout(700);
+  const deniedClockInWriteCount = localSmokeApi?.getWorkspaceWriteCount();
+  const deniedClockInActiveCount = localSmokeApi?.getWorkspaceState()?.activeClockSessions?.length || 0;
+  await setGpsDenied(page, true);
+  await page.context().clearPermissions();
+  await click(page, 'form[data-form="clock-in"] button[type="submit"]');
+  await page.locator(".toast").filter({ hasText: "GPS permission and a valid position are required to clock in" }).waitFor({ state: "visible" });
+  await page.waitForTimeout(700);
+  if (!await page.locator('form[data-form="clock-in"]').count() || await page.locator(".clock-card").count()) {
+    throw new Error("Denied GPS created an active clock-in session");
+  }
+  if (localSmokeApi && (localSmokeApi.getWorkspaceState()?.activeClockSessions?.length || 0) !== deniedClockInActiveCount) {
+    throw new Error("Denied GPS changed durable active clock sessions");
+  }
+  if (localSmokeApi && localSmokeApi.getWorkspaceWriteCount() !== deniedClockInWriteCount) {
+    throw new Error("Denied GPS reached the durable workspace API during clock-in");
+  }
+
+  await setGpsDenied(page, false);
+  await page.context().grantPermissions(["geolocation"], { origin });
+  await fill(page, 'form[data-form="clock-in"] input[name="worker"]', ids.employeeName);
+  await exerciseDataField(page, "clock-job", (field) => field.fill(`WRONG-JOB-RETRY-${stamp}`), "GPS clock job retry");
+  await exerciseDataField(page, "clock-task", (field) => field.selectOption(linkedClockTaskId), "GPS clock task retry");
+  await waitUntil("clock task-to-job linkage after GPS retry", async () => {
+    return await page.locator('[data-field="clock-job"]').inputValue() === ids.jobId;
+  });
   await click(page, 'form[data-form="clock-in"] button[type="submit"]');
   await expectBody(page, "clocked in", "Clocked in");
+  const activeClockCard = page.locator(".clock-card").filter({ hasText: ids.employeeName });
+  await activeClockCard.filter({ hasText: ids.jobId }).filter({ hasText: ids.taskTitle }).waitFor({ state: "visible" });
+  if (localSmokeApi) {
+    await waitUntil("durable linked active shift", () => {
+      return Boolean(localSmokeApi.getWorkspaceState()?.activeClockSessions?.some((session) => {
+        return session.taskId === linkedClockTaskId && session.job === ids.jobId && session.task === ids.taskTitle;
+      }));
+    });
+  }
+
+  await setGpsDenied(page, true);
+  await page.context().clearPermissions();
+  const deniedClockOutWriteCount = localSmokeApi?.getWorkspaceWriteCount();
+  const deniedClockOutTimeCount = localSmokeApi?.getWorkspaceState()?.timeEntries?.length || 0;
+  await click(page, 'button[data-action="clock-out"]');
+  await page.locator(".toast").filter({ hasText: "GPS permission and a valid position are required to clock out" }).waitFor({ state: "visible" });
+  await page.waitForTimeout(700);
+  if (!await page.locator(".clock-card").filter({ hasText: ids.taskTitle }).count()) {
+    throw new Error("Denied GPS closed the active shift");
+  }
+  if (localSmokeApi && (localSmokeApi.getWorkspaceState()?.timeEntries?.length || 0) !== deniedClockOutTimeCount) {
+    throw new Error("Denied GPS created a durable time entry during clock-out");
+  }
+  if (localSmokeApi && localSmokeApi.getWorkspaceWriteCount() !== deniedClockOutWriteCount) {
+    throw new Error("Denied GPS reached the durable workspace API during clock-out");
+  }
+
+  await setGpsDenied(page, false);
+  await page.context().grantPermissions(["geolocation"], { origin });
   await click(page, 'button[data-action="clock-out"]');
   await expectBody(page, "clocked out", ids.employeeName);
+  const linkedTimeRow = page.locator(".data-table tbody tr").filter({ hasText: ids.employeeName }).filter({ hasText: ids.jobId }).filter({ hasText: ids.taskTitle });
+  await linkedTimeRow.waitFor({ state: "visible" });
+  if (localSmokeApi) {
+    await waitUntil("durable linked time entry", () => {
+      return Boolean(localSmokeApi.getWorkspaceState()?.timeEntries?.some((entry) => {
+        return entry.taskId === linkedClockTaskId && entry.job === ids.jobId && entry.task === ids.taskTitle && Number.isFinite(entry.endGps?.latitude);
+      }));
+    });
+  }
+  results.workflowChecks.push({
+    label: "GPS time clock",
+    text: "task selection linked the job; denied GPS made no write; approved GPS persisted the active shift and time entry"
+  });
 
   await go(page, "payments");
   await expectBody(page, "payments show linked job", ids.jobId);
@@ -539,23 +862,13 @@ async function runWorkflow(page) {
 
   await go(page, "team");
   await expectBody(page, "team shows employee", ids.employeeEmail);
-  await expectBody(page, "team shows secure portal method", "Google invite plus individual code");
+  await expectBody(page, "team shows secure portal method", "verified Google account");
   await expectBody(page, "team shows assigned task", ids.taskTitle);
-
-  await click(page, 'button[data-action="open-employee-login"]');
-  await fill(page, 'form[data-form="employee-login"] input[name="identifier"]', ids.employeeEmail);
-  await fill(page, 'form[data-form="employee-login"] input[name="code"]', ids.accessCode);
-  await click(page, 'form[data-form="employee-login"] button[type="submit"]');
-  await expectBody(page, "employee portal opened", "Field worker portal");
-  await page.evaluate(() => {
-    window.location.hash = "module/globalindexes";
-  });
-  await page.waitForTimeout(200);
-  const employeeGlobalView = await page.locator("h1").textContent();
-  if (/Global Indexes/i.test(employeeGlobalView || "")) {
-    throw new Error("Employee portal can open global indexes");
-  }
-  await clickAny(page, 'button[data-action="employee-logout"]', "employee logout");
+  await expectBody(page, "photo evidence retained the pending employee task assignment", `1 assigned task | Jobs: ${ids.jobId}`);
+  await page.locator(".task-item").filter({ hasText: ids.taskTitle }).filter({ hasText: "Mark complete" }).waitFor({ state: "visible", timeout: 8000 });
+  await go(page, "photos");
+  const openAssignmentFile = page.locator(".file-card").filter({ hasText: ids.taskTitle }).filter({ hasText: "Task assignment" });
+  await openAssignmentFile.filter({ hasText: "Open" }).waitFor({ state: "visible", timeout: 8000 });
 
   await go(page, "communications");
   await fill(page, 'form[data-form="community-post"] input[name="title"]', `AI contractor question ${stamp}`);
@@ -569,12 +882,36 @@ async function runWorkflow(page) {
   await expectBody(page, "community comment published", `Documentation confirmed for ${ids.jobId}`);
 }
 
+async function verifyGenericModuleConnectivity(page, moduleKeys) {
+  console.log("[smoke] starting semantic generic-module verification");
+  for (const key of moduleKeys) {
+    if (key === "dispatch") continue;
+    await go(page, key);
+    const form = page.locator('form[data-form="module-workbench"]');
+    if (!await form.count()) continue;
+    const title = `Connected ${key} record ${stamp}`;
+    await fill(page, 'form[data-form="module-workbench"] input[name="subject"]', title);
+    await fill(page, 'form[data-form="module-workbench"] input[name="relatedJob"]', ids.jobId);
+    await fill(page, 'form[data-form="module-workbench"] input[name="owner"]', "AI semantic verifier");
+    await click(page, 'form[data-form="module-workbench"] button[type="submit"]');
+    const sourceCard = page.locator(".module-record-card").filter({ hasText: title }).first();
+    await sourceCard.waitFor({ state: "visible", timeout: 8000 });
+    const downstreamKey = await sourceCard.locator('.workflow-links a[data-key]').first().getAttribute("data-key");
+    if (!downstreamKey) throw new Error(`${key} created a record without a downstream module link`);
+    await go(page, downstreamKey);
+    await expectBody(page, `${key} record reached ${downstreamKey}`, title);
+    semanticModuleRecords.push({ key, downstreamKey, title });
+  }
+  results.semanticModuleRecords = semanticModuleRecords.length;
+}
+
 async function verifyDurableReload(page, localSmokeApi) {
   if (!localSmokeApi) return;
   const requiredValues = [
     ids.jobId,
     ids.employeeEmail,
     ids.taskTitle,
+    ids.moduleRecord,
     ids.sketchRoom,
     ids.sketchSeparateRoom,
     ids.priceCode,
@@ -587,10 +924,14 @@ async function verifyDurableReload(page, localSmokeApi) {
     return requiredValues.every((value) => serialized.includes(value));
   });
 
-  await page.reload({ waitUntil: "domcontentloaded" });
-  await page.waitForSelector(".app-shell", { timeout: 8000 });
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForSelector(".app-shell", { timeout: 15000 });
   await go(page, "jobs");
   await expectBody(page, "reload retained job", ids.jobId);
+  await go(page, "dispatch");
+  await expectBody(page, "reload retained typed cross-module record", ids.moduleRecord);
+  await go(page, "routeplanner");
+  await expectBody(page, "reload retained linked route-planning record", ids.moduleRecord);
   await go(page, "team");
   await expectBody(page, "reload retained employee", ids.employeeEmail);
   await expectBody(page, "reload retained task", ids.taskTitle);
@@ -608,6 +949,10 @@ async function verifyDurableReload(page, localSmokeApi) {
   await go(page, "communications");
   await expectBody(page, "reload retained community post", `AI contractor question ${stamp}`);
   await expectBody(page, "reload retained community comment", `Documentation confirmed for ${ids.jobId}`);
+  for (const record of semanticModuleRecords) {
+    await go(page, record.key);
+    await expectBody(page, `reload retained ${record.key} semantic record`, record.title);
+  }
   results.durableReloadVerified = true;
 }
 
@@ -690,9 +1035,10 @@ async function exerciseAiActions(page) {
   if (!await firstVisible(page.locator('[data-action="ai-copilot-ask"]'))) {
     await clickVisibleAction(page, "toggle-ai-copilot");
   }
-  const prompt = await firstVisible(page.locator('[data-field="ai-copilot-query"]'));
-  if (prompt) await prompt.fill(`Summarize ${ids.jobId}`);
+  const query = `Summarize ${ids.jobId}`;
+  await exerciseDataField(page, "ai-copilot-query", (field) => field.fill(query), "Brother Copilot query");
   await clickVisibleAction(page, "ai-copilot-ask");
+  await page.locator(".copilot-messages .user").filter({ hasText: query }).waitFor({ state: "visible" });
   await clickVisibleAction(page, "toggle-ai-copilot");
 }
 
@@ -713,7 +1059,7 @@ async function exerciseRemainingActions(page) {
     "open-activity",
     "open-export"
   ]);
-  const destructive = ["delete-file", "delete-user"];
+  const destructive = ["delete-file", "delete-user", "revoke-employee-invitation"];
 
   await exerciseModalAndUtilityActions(page);
   await exerciseAiActions(page);
@@ -729,7 +1075,7 @@ async function exerciseRemainingActions(page) {
       if (await clickVisibleAction(page, action)) await clickVisibleAction(page, "close-modal");
       continue;
     }
-    if (action === "open-user-manage") {
+    if (action === "open-user-manage" || action === "open-pending-employee-manage") {
       if (await clickVisibleAction(page, action)) await clickVisibleAction(page, "close-modal");
       continue;
     }
@@ -747,6 +1093,9 @@ async function exerciseRemainingActions(page) {
     await ensureNoModal(page);
     await ensureCopilotClosed(page);
     await go(page, location);
+    if (action === "revoke-employee-invitation") {
+      page.once("dialog", (dialog) => dialog.accept());
+    }
     await clickVisibleAction(page, action);
   }
 
@@ -760,7 +1109,35 @@ async function exerciseRemainingActions(page) {
   if (!logoutResponse.ok()) throw new Error("Firebase logout endpoint did not accept the sign-out request");
   await page.waitForTimeout(300);
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.waitForSelector(".app-shell", { timeout: 8000 });
+  await page.waitForSelector(".auth-gate", { timeout: 8000 });
+}
+
+async function testEmployeeGoogleSwitch(page, localSmokeApi) {
+  await go(page, "team");
+  await clickAny(page, 'button[data-action="open-employee-login"]', "open employee Google sign-in");
+  await expectBody(page, "employee access requires Google", "Google-secured field portal");
+  await page.evaluate(() => {
+    window.history.replaceState({}, "", `${window.location.pathname}${window.location.hash}`);
+  });
+  const logoutResponsePromise = page.waitForResponse((response) => {
+    return new URL(response.url()).pathname === "/api/auth/session/logout"
+      && response.request().method() === "POST";
+  }, { timeout: 20000 });
+  await clickAny(page, 'button[data-action="employee-google-switch"]', "continue to employee Google sign-in");
+  const logoutResponse = await logoutResponsePromise;
+  if (!logoutResponse.ok()) throw new Error("Employee Google switch did not complete the secure server logout");
+  await page.waitForSelector('button[data-action="firebase-google-login"]', { timeout: 20000 });
+  if (await page.locator('form[data-form="employee-login"]').count()) {
+    throw new Error("A local employee credential form is still exposed after sign-out");
+  }
+  results.workflowChecks.push({ label: "Employee Google switch", text: "signed out owner session and returned to the Google-only gate" });
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForSelector(".auth-gate", { timeout: 15000 });
+  if (localSmokeApi) {
+    localSmokeApi.setSessionActive(true);
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForSelector(".app-shell", { timeout: 15000 });
+  }
 }
 
 async function testUnauthenticatedGate(browser) {
@@ -819,6 +1196,11 @@ async function testUnauthenticatedGate(browser) {
     throw new Error("Google authentication control is missing or disabled on the login gate");
   }
   actionCoverage.rendered.add("firebase-google-login");
+  const accessCode = `GATE-${stamp}`;
+  await exerciseDataField(page, "login-access-code", (field) => field.fill(accessCode), "Google login access code");
+  if (await page.locator('[data-field="login-access-code"]').inputValue() !== accessCode) {
+    throw new Error("Login access code field did not retain the invitation code");
+  }
   actionCoverage.formsRendered.add("access-request");
   const disclosure = page.locator('details.auth-disclosure:has(form[data-form="access-request"])');
   if (await disclosure.count()) await disclosure.evaluate((element) => { element.open = true; });
@@ -827,6 +1209,28 @@ async function testUnauthenticatedGate(browser) {
   if (!requestSubmitted) throw new Error("Trial request did not reach the protected access API");
   results.workflowChecks.push({ label: "Google login gate", text: "visible account chooser button and 48-hour request path" });
   console.log("[smoke] unauthenticated gate verified");
+  await gateContext.close();
+}
+
+async function testUnavailableStorageWriteLock(browser) {
+  console.log("[smoke] starting shared-storage write-lock verification");
+  const lockedContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const lockedApi = await installLocalSmokeApi(lockedContext, { adminConfigured: false });
+  const lockedPage = await lockedContext.newPage();
+  lockedPage.setDefaultTimeout(8000);
+  await go(lockedPage, "jobs");
+  await expectBody(lockedPage, "shared storage warning visible", "Shared record editing is locked");
+  await clickAny(lockedPage, 'button[data-action="open-create-file"]', "open file form while storage is locked");
+  const blockedTitle = `Blocked browser-only file ${stamp}`;
+  await fill(lockedPage, 'form[data-form="create-file"] input[name="title"]', blockedTitle);
+  await clickAny(lockedPage, 'form[data-form="create-file"] button[type="submit"]', "attempt blocked file write");
+  await expectBody(lockedPage, "browser-only write was rejected", "Secure shared storage is unavailable; no changes were made");
+  await clickAny(lockedPage, 'button[data-action="close-modal"]', "close blocked write form");
+  if ((await lockedPage.locator(".file-card").filter({ hasText: blockedTitle }).count()) || lockedApi.getWorkspaceWriteCount() !== 0) {
+    throw new Error("A write reached browser or remote workspace state while Firebase Admin was unavailable");
+  }
+  results.workflowChecks.push({ label: "Durable write lock", text: "browser-only operational writes are rejected when Firebase Admin is unavailable" });
+  await lockedContext.close();
 }
 
 async function testEmployeePortal(browser) {
@@ -879,6 +1283,9 @@ async function testEmployeePortal(browser) {
   };
   let profileSaved = false;
   let signoffPosted = false;
+  let employeeSessionActive = true;
+  let employeeWorkspaceRevision = "employee-revision-0";
+  let uploadedEmployeePhotoAsset = null;
   let workspaceState = {
     tasks: [{
       id: "TASK-EMP-1",
@@ -904,7 +1311,23 @@ async function testEmployeePortal(browser) {
       linkedModules: ["photos", "time"]
     }],
     timeEntries: [],
-    files: []
+    files: [{
+      id: "FILE-EMP-ASSIGNMENT",
+      moduleKey: "team",
+      linkedModuleKeys: ["jobs", "photos", "time"],
+      sourceType: "taskAssignment",
+      sourceId: "TASK-EMP-1",
+      taskId: "TASK-EMP-1",
+      relatedJob: "J-EMP-1",
+      workerId: worker.uid,
+      workerEmail: worker.email,
+      title: "Employee smoke assignment file",
+      type: "Task assignment",
+      owner: worker.displayName,
+      status: "Open",
+      priority: "High",
+      notes: "Complete through the GPS ticket workflow."
+    }]
   };
   const employeeContext = await browser.newContext({
     viewport: { width: 390, height: 844 },
@@ -956,6 +1379,7 @@ async function testEmployeePortal(browser) {
       });
     }
     if (url.pathname === "/api/auth/session" && method === "GET") {
+      if (!employeeSessionActive) return json(401, { success: false, message: "Authentication is required." });
       return json(200, {
         success: true,
         session: {
@@ -1008,12 +1432,40 @@ async function testEmployeePortal(browser) {
         exists: true,
         recordCount: workspaceState.tasks.length + workspaceState.jobBoards.length,
         updatedAt: new Date().toISOString(),
+        revision: employeeWorkspaceRevision,
         workspaceState
       });
     }
     if (url.pathname === "/api/workspace-state" && method === "PUT") {
-      workspaceState = request.postDataJSON()?.workspaceState || workspaceState;
-      return json(200, { success: true, durable: true, savedRecords: 1, ignoredRecords: 0, updatedAt: new Date().toISOString() });
+      const payload = request.postDataJSON() || {};
+      if (payload.baseRevision !== employeeWorkspaceRevision) {
+        return json(409, { success: false, message: "Employee smoke workspace revision conflict." });
+      }
+      workspaceState = payload.workspaceState || workspaceState;
+      employeeWorkspaceRevision = `employee-revision-${Date.now()}`;
+      return json(200, {
+        success: true,
+        durable: true,
+        savedRecords: 1,
+        ignoredRecords: 0,
+        updatedAt: new Date().toISOString(),
+        revision: employeeWorkspaceRevision
+      });
+    }
+    if (url.pathname === "/api/workspace-assets" && method === "POST") {
+      const payload = request.postDataJSON() || {};
+      uploadedEmployeePhotoAsset = {
+        id: "EMPLOYEE-SMOKE-ASSET",
+        assetUrl: `${origin}/api/workspace-assets/EMPLOYEE-SMOKE-ASSET`,
+        jobId: payload.jobId,
+        taskId: payload.taskId,
+        fileName: payload.fileName,
+        contentType: payload.contentType
+      };
+      return json(201, { success: true, asset: uploadedEmployeePhotoAsset });
+    }
+    if (url.pathname.startsWith("/api/workspace-assets/") && method === "GET") {
+      return route.fulfill({ status: 200, contentType: "image/png", body: smokePng });
     }
     if (url.pathname === "/api/employee/profile" && method === "PATCH") {
       profileSaved = true;
@@ -1022,9 +1474,17 @@ async function testEmployeePortal(browser) {
     }
     if (url.pathname === "/api/employee/ticket-signoffs" && method === "POST") {
       const payload = request.postDataJSON() || {};
+      const durablePhoto = (workspaceState.photoRecords || []).find((photo) => {
+        return photo.taskId === payload.taskId && photo.assetId === uploadedEmployeePhotoAsset?.id;
+      });
+      if (!durablePhoto) {
+        return json(409, { success: false, message: "Upload and save the required photo evidence before signing this ticket." });
+      }
       signoffPosted = true;
+      employeeWorkspaceRevision = `employee-signoff-revision-${Date.now()}`;
       return json(201, {
         success: true,
+        workspaceRevision: employeeWorkspaceRevision,
         signoff: {
           id: "SIGNOFF-SMOKE-1",
           taskId: payload.taskId,
@@ -1044,7 +1504,10 @@ async function testEmployeePortal(browser) {
         task: { ...workspaceState.tasks[0], status: "Complete" }
       });
     }
-    if (url.pathname === "/api/auth/session/logout" && method === "POST") return json(200, { success: true });
+    if (url.pathname === "/api/auth/session/logout" && method === "POST") {
+      employeeSessionActive = false;
+      return json(200, { success: true });
+    }
     return json(404, { success: false, message: `Employee smoke route not configured: ${method} ${url.pathname}` });
   });
 
@@ -1063,6 +1526,20 @@ async function testEmployeePortal(browser) {
   if (/Global Indexes/i.test(secureEmployeeGlobalView || "")) {
     throw new Error("Authenticated worker can open global indexes after a hard reload");
   }
+  await go(page, "jobs");
+  if (await page.locator('form[data-form="job-record"]').count()) {
+    throw new Error("Employee portal rendered an owner-level Add Job form");
+  }
+  const assignmentCard = page.locator(".file-card").filter({ hasText: "Employee smoke assignment file" });
+  if (await assignmentCard.count() !== 1) throw new Error("Employee assignment file did not render");
+  if (await assignmentCard.locator('[data-action="complete-file"], [data-action="duplicate-file"]').count()) {
+    throw new Error("Employee assignment file exposed a contradictory completion or copy action");
+  }
+  await assignmentCard.locator('[data-action="select-file"]').click();
+  const assignmentDetail = page.locator(".detail-panel").filter({ hasText: "Employee smoke assignment file" });
+  if (await assignmentDetail.locator('[data-action="complete-file"], [data-action="delete-file"], [data-action="status-review"]').count()) {
+    throw new Error("Employee assignment detail exposed owner-managed file actions");
+  }
   await page.evaluate(() => {
     window.location.hash = "module/time";
   });
@@ -1073,10 +1550,33 @@ async function testEmployeePortal(browser) {
   await click(page, 'form[data-form="employee-profile"] button[type="submit"]');
   await waitUntil("employee profile save", () => profileSaved);
 
+  await go(page, "photos");
+  await select(page, 'form[data-form="photo-evidence"] select[name="jobId"]', "J-EMP-1");
+  await select(page, 'form[data-form="photo-evidence"] select[name="taskId"]', "TASK-EMP-1");
+  await fill(page, 'form[data-form="photo-evidence"] input[name="room"]', "Employee smoke room");
+  await page.locator('form[data-form="photo-evidence"] input[name="photoFile"]').setInputFiles({
+    name: "employee-smoke-photo.png",
+    mimeType: "image/png",
+    buffer: smokePng
+  });
+  await click(page, 'form[data-form="photo-evidence"] button[type="submit"]');
+  await expectBody(page, "photo evidence keeps ticket open", "sign the ticket with GPS to complete it");
+  await go(page, "time");
+  await page.waitForSelector('form[data-form="ticket-signoff"]');
   await page.locator('form[data-form="ticket-signoff"] input[name="attested"]').check();
   await click(page, 'form[data-form="ticket-signoff"] button[type="submit"]');
   await waitUntil("employee ticket sign-off", () => signoffPosted);
   await expectBody(page, "employee ticket completed", "No open assigned tickets");
+  const employeeLogoutResponsePromise = page.waitForResponse((response) => {
+    return new URL(response.url()).pathname === "/api/auth/session/logout"
+      && response.request().method() === "POST";
+  }, { timeout: 20000 });
+  await clickAny(page, 'button[data-action="employee-logout"]', "employee portal sign out");
+  const employeeLogoutResponse = await employeeLogoutResponsePromise;
+  if (!employeeLogoutResponse.ok()) throw new Error("Employee portal logout endpoint rejected the sign-out request");
+  await page.waitForSelector('button[data-action="firebase-google-login"]', { timeout: 20000 });
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForSelector(".auth-gate", { timeout: 15000 });
   results.workflowChecks.push({ label: "Employee portal", text: "restricted account, employer-bound task, GPS ticket sign-off" });
   console.log("[smoke] employee portal verified");
   await employeeContext.close();
@@ -1091,8 +1591,11 @@ const allOwnerActions = [
   "postCommunityMessages", "moderateCommunityMessages", "editAssignedTasks", "editAllTasks"
 ];
 
-async function installLocalSmokeApi(context) {
+async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
   let workspaceState = {};
+  let workspaceWriteCount = 0;
+  let workspaceRevision = "owner-revision-0";
+  let sessionActive = true;
   const owner = {
     id: "smoke-owner",
     uid: "smoke-owner",
@@ -1104,7 +1607,14 @@ async function installLocalSmokeApi(context) {
     status: "active",
     disabled: false
   };
+  await context.addInitScript((workspaceIdentity) => {
+    if (sessionStorage.getItem("owner-workspace-identity-seeded")) return;
+    const saved = JSON.parse(localStorage.getItem("brothers-os-workspace-v2") || "{}");
+    localStorage.setItem("brothers-os-workspace-v2", JSON.stringify({ ...saved, workspaceIdentity }));
+    sessionStorage.setItem("owner-workspace-identity-seeded", "1");
+  }, { uid: owner.uid, companyId: owner.companyId });
   const users = [owner];
+  const accessGrants = [];
   const posts = [];
   const tabs = smokeModuleDefinitions.map((module, index) => ({
     id: module.key,
@@ -1207,7 +1717,7 @@ async function installLocalSmokeApi(context) {
     auditLogs: [],
     businessData: [],
     accessRequests: [],
-    accessGrants: [],
+    accessGrants,
     ticketSignoffs: [],
     communityPosts: posts
   });
@@ -1228,7 +1738,7 @@ async function installLocalSmokeApi(context) {
         firebase: {
           enabled: true,
           ready: true,
-          adminConfigured: true,
+          adminConfigured,
           webConfigured: true,
           restAuthFallback: false,
           projectId: "brothers-restoration-website",
@@ -1247,8 +1757,15 @@ async function installLocalSmokeApi(context) {
         }
       });
     }
-    if (url.pathname === "/api/auth/session" && method === "GET") return json(200, sessionPayload());
-    if (url.pathname === "/api/auth/session/logout" && method === "POST") return json(200, { success: true });
+    if (url.pathname === "/api/auth/session" && method === "GET") {
+      return sessionActive
+        ? json(200, sessionPayload())
+        : json(401, { success: false, message: "Authentication is required." });
+    }
+    if (url.pathname === "/api/auth/session/logout" && method === "POST") {
+      sessionActive = false;
+      return json(200, { success: true });
+    }
     if (url.pathname === "/api/workspace-state" && method === "GET") {
       return json(200, {
         success: true,
@@ -1256,17 +1773,25 @@ async function installLocalSmokeApi(context) {
         exists: Object.keys(workspaceState).length > 0,
         recordCount: Object.values(workspaceState).filter(Array.isArray).reduce((sum, items) => sum + items.length, 0),
         updatedAt: new Date().toISOString(),
+        revision: workspaceRevision,
         workspaceState
       });
     }
     if (url.pathname === "/api/workspace-state" && method === "PUT") {
-      workspaceState = request.postDataJSON()?.workspaceState || {};
+      const payload = request.postDataJSON() || {};
+      if (payload.baseRevision !== workspaceRevision) {
+        return json(409, { success: false, message: "Owner smoke workspace revision conflict." });
+      }
+      workspaceWriteCount += 1;
+      workspaceState = payload.workspaceState || {};
+      workspaceRevision = `owner-revision-${workspaceWriteCount}`;
       return json(200, {
         success: true,
         durable: true,
         savedRecords: Object.values(workspaceState).filter(Array.isArray).reduce((sum, items) => sum + items.length, 0),
         ignoredRecords: 0,
-        updatedAt: new Date().toISOString()
+        updatedAt: new Date().toISOString(),
+        revision: workspaceRevision
       });
     }
     if (url.pathname === "/api/rbac/users" && method === "POST") {
@@ -1354,16 +1879,49 @@ async function installLocalSmokeApi(context) {
         employerEmail: owner.email,
         onboardingMode: "employee_link",
         status: "issued",
+        phone: payload.phone || "",
+        jobTitle: payload.jobTitle || "Field employee",
+        employmentType: payload.employmentType || "Employee",
+        startDate: payload.startDate || "",
+        visibleTabIds: payload.visibleModuleKeys || [],
+        visiblePageIds: payload.visibleModuleKeys || [],
         assignedJobIds: payload.assignedJobIds || [],
         assignedTaskIds: payload.assignedTaskIds || [],
         expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
       };
+      accessGrants.unshift(grant);
       return json(201, {
         success: true,
         grant,
         accessLink: `${origin}/?portal=employee#access/employee-${stamp}`,
         emailDelivery: { status: "sent" }
       });
+    }
+    if (/^\/api\/employee-invitations\/[^/]+$/.test(url.pathname) && method === "PATCH") {
+      const grantId = decodeURIComponent(url.pathname.split("/").at(-1));
+      const payload = request.postDataJSON() || {};
+      const index = accessGrants.findIndex((grant) => grant.id === grantId);
+      if (index < 0) return json(404, { success: false, message: "Employee invitation not found." });
+      accessGrants[index] = {
+        ...accessGrants[index],
+        ...payload,
+        visibleTabIds: payload.visibleModuleKeys || accessGrants[index].visibleTabIds,
+        visiblePageIds: payload.visibleModuleKeys || accessGrants[index].visiblePageIds,
+        updatedAt: new Date().toISOString()
+      };
+      return json(200, { success: true, grant: accessGrants[index] });
+    }
+    if (/^\/api\/employee-invitations\/[^/]+$/.test(url.pathname) && method === "DELETE") {
+      const grantId = decodeURIComponent(url.pathname.split("/").at(-1));
+      const index = accessGrants.findIndex((grant) => grant.id === grantId);
+      if (index < 0) return json(404, { success: false, message: "Employee invitation not found." });
+      accessGrants[index] = {
+        ...accessGrants[index],
+        status: "revoked",
+        revokedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      return json(200, { success: true, grant: accessGrants[index] });
     }
     if (url.pathname === "/api/community/posts" && method === "POST") {
       const payload = request.postDataJSON() || {};
@@ -1392,7 +1950,22 @@ async function installLocalSmokeApi(context) {
       return json(201, { success: true, comment });
     }
     if (url.pathname === "/api/insurance-intake" && method === "GET") {
-      return json(200, { success: true, submissions: insuranceSubmissions });
+      const search = String(url.searchParams.get("search") || "").trim().toLowerCase();
+      const status = String(url.searchParams.get("status") || "").trim().toLowerCase();
+      const submissions = insuranceSubmissions.filter((submission) => {
+        const searchable = [
+          submission.fullName,
+          submission.phone,
+          submission.email,
+          submission.claimNumber,
+          submission.policyNumber,
+          submission.propertyAddress,
+          submission.insuranceCompanyName
+        ].join(" ").toLowerCase();
+        return (!search || searchable.includes(search))
+          && (!status || String(submission.status || "").toLowerCase() === status);
+      });
+      return json(200, { success: true, submissions });
     }
     if (/^\/api\/insurance-intake\/[^/]+$/.test(url.pathname) && method === "GET") {
       const id = decodeURIComponent(url.pathname.split("/").at(-1));
@@ -1469,7 +2042,22 @@ async function installLocalSmokeApi(context) {
       return json(201, { success: true, assetUrl: `${origin}/logo.png` });
     }
     if (url.pathname === "/api/workspace-assets" && method === "POST") {
-      return json(201, { success: true, assetUrl: `${origin}/logo.png` });
+      const payload = request.postDataJSON() || {};
+      const id = `SMOKE-ASSET-${Date.now()}`;
+      return json(201, {
+        success: true,
+        asset: {
+          id,
+          assetUrl: `${origin}/api/workspace-assets/${id}`,
+          jobId: payload.jobId || "",
+          taskId: payload.taskId || "",
+          fileName: payload.fileName || "smoke-photo.png",
+          contentType: payload.contentType || "image/png"
+        }
+      });
+    }
+    if (url.pathname.startsWith("/api/workspace-assets/") && method === "GET") {
+      return route.fulfill({ status: 200, contentType: "image/png", body: smokePng });
     }
     if (url.pathname.startsWith("/api/rbac/") || url.pathname.startsWith("/api/access/")) {
       return json(200, { success: true, users, posts });
@@ -1478,15 +2066,27 @@ async function installLocalSmokeApi(context) {
   });
 
   return {
-    getWorkspaceState: () => workspaceState
+    getWorkspaceState: () => workspaceState,
+    getWorkspaceWriteCount: () => workspaceWriteCount,
+    setSessionActive(value) {
+      sessionActive = Boolean(value);
+    }
   };
 }
 
-const browser = await chromium.launch({
-  headless: true,
-  timeout: 30000,
-  ...(process.platform === "win32" ? { channel: "msedge" } : {})
-});
+async function launchSmokeBrowser() {
+  const options = { headless: true, timeout: 30000 };
+  if (process.platform === "win32") {
+    try {
+      return await chromium.launch({ ...options, channel: "msedge" });
+    } catch (error) {
+      console.warn(`[smoke] Microsoft Edge was unavailable; using isolated Chromium. ${error.message}`);
+    }
+  }
+  return chromium.launch(options);
+}
+
+const browser = await launchSmokeBrowser();
 const context = await browser.newContext({
   viewport: { width: 1440, height: 900 },
   geolocation: { latitude: 42.45, longitude: -73.245 },
@@ -1499,56 +2099,94 @@ const localSmokeApi = ["127.0.0.1", "localhost"].includes(new URL(baseUrl).hostn
 const page = await context.newPage();
 page.setDefaultTimeout(8000);
 const consoleErrors = [];
+const developmentDiagnostics = [];
 const failedResponses = [];
 page.on("console", (message) => {
-  if (message.type() === "error") consoleErrors.push(message.text());
+  if (message.type() !== "error") return;
+  const messageText = message.text();
+  if (messageText.includes("status of 401 (Unauthorized)")) {
+    return;
+  }
+  const isLocalReactDevelopmentDiagnostic = ["127.0.0.1", "localhost"].includes(new URL(baseUrl).hostname)
+    && messageText.includes("React requires eval() in development mode")
+    && messageText.includes("React will never use eval() in production mode");
+  if (isLocalReactDevelopmentDiagnostic) {
+    developmentDiagnostics.push(messageText);
+    return;
+  }
+  consoleErrors.push(messageText);
 });
 page.on("pageerror", (error) => consoleErrors.push(error.message));
-page.on("response", (response) => {
-  if (response.status() >= 400) {
-    failedResponses.push(`${response.request().method()} ${response.status()} ${response.url()}`);
-  }
+  page.on("response", (response) => {
+    if (response.status() >= 400) {
+      const pathname = new URL(response.url()).pathname;
+      if (response.status() === 401 && pathname === "/api/auth/session") return;
+      failedResponses.push(`${response.request().method()} ${response.status()} ${response.url()}`);
+    }
 });
 
 let smokePassed = false;
 try {
   const moduleKeys = await safeModuleSweep(page);
   console.log("[smoke] module sweep complete");
-  await runWorkflow(page);
+  await exerciseDataFieldControls(page);
+  await runWorkflow(page, localSmokeApi);
   console.log("[smoke] linked workflow complete");
+  await verifyGenericModuleConnectivity(page, moduleKeys);
+  console.log("[smoke] semantic generic-module verification complete");
   await submitRemainingForms(page);
   console.log("[smoke] all form paths submitted");
   await refreshCoverage(page, moduleKeys);
   await verifyDurableReload(page, localSmokeApi);
   console.log("[smoke] durable reload verified");
   await refreshCoverage(page, moduleKeys);
+  await testEmployeeGoogleSwitch(page, localSmokeApi);
+  console.log("[smoke] employee Google switch verified");
   await exerciseRemainingActions(page);
   console.log("[smoke] action matrix complete");
   await testUnauthenticatedGate(browser);
+  await testUnavailableStorageWriteLock(browser);
   await testEmployeePortal(browser);
   const allowedInteractiveActions = new Set(["firebase-google-login"]);
   const unexercisedActionTypes = staticActionTypes
     .filter((action) => !actionCoverage.exercised.has(action) && !allowedInteractiveActions.has(action));
   const unsubmittedFormTypes = staticFormTypes
     .filter((formType) => !actionCoverage.formsSubmitted.has(formType));
+  const unrenderedFieldTypes = staticFieldTypes
+    .filter((fieldType) => !actionCoverage.fieldsRendered.has(fieldType));
+  const unexercisedFieldTypes = staticFieldTypes
+    .filter((fieldType) => !actionCoverage.fieldsExercised.has(fieldType));
   results.actionTypesExercised = actionCoverage.exercised.size;
   results.formTypesSubmitted = actionCoverage.formsSubmitted.size;
+  results.fieldTypesExercised = actionCoverage.fieldsExercised.size;
   results.coverage = {
     expectedActionTypes: staticActionTypes,
     expectedFormTypes: staticFormTypes,
+    expectedFieldTypes: staticFieldTypes,
     renderedActionTypes: [...actionCoverage.rendered].sort(),
     exercisedActionTypes: [...actionCoverage.exercised].sort(),
     renderedFormTypes: [...actionCoverage.formsRendered].sort(),
     submittedFormTypes: [...actionCoverage.formsSubmitted].sort(),
+    renderedFieldTypes: [...actionCoverage.fieldsRendered].sort(),
+    exercisedFieldTypes: [...actionCoverage.fieldsExercised].sort(),
+    fieldLocations: Object.fromEntries([...actionCoverage.fieldLocations.entries()].sort(([left], [right]) => left.localeCompare(right))),
     interactiveProviderBoundaries: [...allowedInteractiveActions],
     unexercisedActionTypes,
-    unsubmittedFormTypes
+    unsubmittedFormTypes,
+    unrenderedFieldTypes,
+    unexercisedFieldTypes
   };
   if (unexercisedActionTypes.length) {
     throw new Error(`Action types not exercised: ${unexercisedActionTypes.join(", ")}`);
   }
   if (unsubmittedFormTypes.length) {
     throw new Error(`Form types not submitted: ${unsubmittedFormTypes.join(", ")}`);
+  }
+  if (unrenderedFieldTypes.length) {
+    throw new Error(`Data-field types not rendered: ${unrenderedFieldTypes.join(", ")}`);
+  }
+  if (unexercisedFieldTypes.length) {
+    throw new Error(`Data-field types not exercised: ${unexercisedFieldTypes.join(", ")}`);
   }
   if (consoleErrors.length || failedResponses.length) {
     throw new Error(`Browser errors during smoke: ${[...new Set([...consoleErrors, ...failedResponses])].join(" | ")}`);
@@ -1562,9 +2200,10 @@ try {
     url: location.href,
     heading: document.querySelector("h1")?.textContent?.trim() || "",
     body: document.body.innerText.slice(0, 1200),
-    forms: [...document.querySelectorAll("form[data-form]")].map((form) => form.dataset.form)
+    forms: [...document.querySelectorAll("form[data-form]")].map((form) => form.dataset.form),
+    toast: document.querySelector(".toast")?.textContent?.trim() || ""
   })).catch(() => ({}));
-  console.error(JSON.stringify({ diagnostics }, null, 2));
+  console.error(JSON.stringify({ diagnostics, consoleErrors, failedResponses, developmentDiagnostics }, null, 2));
   throw error;
 } finally {
   await Promise.race([

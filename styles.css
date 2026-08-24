@@ -2677,6 +2677,51 @@ dd {
   color: var(--muted);
 }
 
+.module-record-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.module-record-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.module-record-card h3,
+.module-record-card p {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.module-record-card p,
+.module-record-card small {
+  color: var(--muted);
+}
+
+.module-record-fields {
+  display: grid;
+  gap: 5px;
+  margin: 10px 0;
+}
+
+.module-record-fields span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.module-record-fields strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
 .job-layout,
 .relationship-layout,
 .branch-layout,
@@ -2845,6 +2890,13 @@ dd {
   white-space: normal;
   text-align: left;
   background: #fff;
+}
+
+.gate-readonly {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  cursor: default;
 }
 
 .gate-chip span,
@@ -3744,6 +3796,88 @@ dd {
   font-size: 13px;
 }
 
+.critical-notice {
+  border-color: #c2413b;
+  background: #fff1f0;
+  color: #7f1d1d;
+}
+
+.critical-notice strong {
+  color: #661818;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f6f7f8;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.status-chip.is-ready {
+  border-color: #6ca580;
+  background: #eef8f1;
+  color: #1f6138;
+}
+
+.status-chip.is-blocked {
+  border-color: #d98580;
+  background: #fff1f0;
+  color: #8a2621;
+}
+
+.advanced-access-panel {
+  margin: 16px 0;
+  border-block: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.advanced-access-panel > summary {
+  padding: 14px 0;
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.advanced-access-panel[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-definition-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 20px;
+  margin: 0;
+}
+
+.settings-definition-list div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-definition-list dt {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.settings-definition-list dd {
+  margin: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
 details.sketch-tool-panel > summary {
   cursor: pointer;
   color: var(--ink);
@@ -3889,6 +4023,11 @@ details.sketch-tool-panel[open] > summary {
 }
 
 @media (max-width: 720px) {
+  .module-record-grid,
+  .settings-definition-list {
+    grid-template-columns: 1fr;
+  }
+
   .floor-plan,
   .sketch-svg {
     min-height: 380px;
