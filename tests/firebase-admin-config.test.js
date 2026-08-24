@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
-const { buildWorkloadIdentityClientOptions, getFirebasePublicConfig } = require("../lib/firebase-admin");
+const {
+  buildWorkloadIdentityClientOptions,
+  getFirebasePublicConfig,
+  probeFirebaseAdminReadiness
+} = require("../lib/firebase-admin");
 
 const trackedKeys = [
   "FIREBASE_PROJECT_ID",
@@ -72,6 +76,60 @@ describe("Firebase production configuration", () => {
     expect(tokenSupplier).toHaveBeenCalledWith({
       audience: "https://iam.googleapis.com/projects/80592032671/locations/global/workloadIdentityPools/vercel/providers/vercel"
     });
+  });
+
+  it("probes the keyless identity and Firestore path without exposing the access token", async () => {
+    const fetchImpl = vi.fn(async (_url, request) => ({ ok: true, status: 200, request }));
+    const clientFactory = vi.fn(() => ({
+      getAccessToken: vi.fn(async () => ({ token: "short-lived-google-token" }))
+    }));
+
+    const result = await probeFirebaseAdminReadiness({
+      config: {
+        projectId: "brothers-restoration-website",
+        projectNumber: "80592032671",
+        serviceAccountEmail: "firebase-adminsdk-fbsvc@brothers-restoration-website.iam.gserviceaccount.com",
+        poolId: "vercel",
+        providerId: "vercel"
+      },
+      tokenSupplier: vi.fn(async () => "vercel-oidc-token"),
+      clientFactory,
+      fetchImpl
+    });
+
+    expect(result).toEqual({
+      ready: true,
+      credentialSource: "vercel-oidc",
+      projectId: "brothers-restoration-website",
+      stage: "complete",
+      reason: ""
+    });
+    expect(JSON.stringify(result)).not.toContain("short-lived-google-token");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl.mock.calls[0][1].headers.authorization).toBe("Bearer short-lived-google-token");
+  });
+
+  it("returns a sanitized Firestore readiness failure", async () => {
+    const result = await probeFirebaseAdminReadiness({
+      config: {
+        projectId: "brothers-restoration-website",
+        projectNumber: "80592032671",
+        serviceAccountEmail: "firebase-adminsdk-fbsvc@brothers-restoration-website.iam.gserviceaccount.com",
+        poolId: "vercel",
+        providerId: "vercel"
+      },
+      clientFactory: () => ({ getAccessToken: async () => ({ token: "sensitive-token" }) }),
+      fetchImpl: async () => ({ ok: false, status: 403 })
+    });
+
+    expect(result).toEqual({
+      ready: false,
+      credentialSource: "vercel-oidc",
+      projectId: "brothers-restoration-website",
+      stage: "firestore-read",
+      reason: "firestore-read-failed"
+    });
+    expect(JSON.stringify(result)).not.toContain("sensitive-token");
   });
 
   it("rejects workload identity credentials for another project", () => {

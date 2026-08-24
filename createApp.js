@@ -9,7 +9,8 @@ const {
   getFirebasePublicConfig,
   getFirebaseStorageBucket,
   getFirestore,
-  isFirebaseConfigured
+  isFirebaseConfigured,
+  probeFirebaseAdminReadiness
 } = require("./lib/firebase-admin");
 const { createFirebaseRbacRouter } = require("./lib/firebase-rbac-routes");
 
@@ -1543,6 +1544,15 @@ function createApp() {
 
   app.get("/api/health", (request, response) => {
     return response.json(getHealthStatus(request));
+  });
+
+  app.get("/api/health/firebase-admin", rateLimit("firebase-admin-health", { max: 6, windowMs: 15 * 60 * 1000 }), async (_request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    const firebaseAdmin = await probeFirebaseAdminReadiness();
+    return response.status(firebaseAdmin.ready ? 200 : 503).json({
+      success: firebaseAdmin.ready,
+      firebaseAdmin
+    });
   });
 
   app.use("/api/auth/session/login", rateLimit("firebase-session-login", { max: 12, windowMs: 15 * 60 * 1000 }));
