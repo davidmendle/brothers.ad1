@@ -1237,6 +1237,7 @@ describe("insurance intake logic", () => {
           employmentStatus: "active",
           assignedJobIds: ["J-ASSIGNED"],
           assignedTaskIds: ["TASK-ASSIGNED"],
+          permissionsOverride: { actions: { viewGlobalIndexes: true } },
           visibleTabIds: ["jobs", "photos"],
           visiblePageIds: ["jobs", "photos"],
           status: "active",
@@ -1300,7 +1301,10 @@ describe("insurance intake logic", () => {
         workspaceState: {
           files: [
             { id: "file-assigned", moduleKey: "jobs", relatedJob: "J-ASSIGNED", contractorId: "contractor-a", title: "Assigned file", accessCode: "DO-NOT-STORE" },
-            { id: "file-other", moduleKey: "jobs", relatedJob: "J-OTHER", contractorId: "contractor-b", title: "Other file" }
+            { id: "file-other", moduleKey: "jobs", relatedJob: "J-OTHER", contractorId: "contractor-b", title: "Other file" },
+            { id: "file-invoice", sourceType: "contractorInvoice", moduleKey: "jobs", relatedJob: "J-ASSIGNED", contractorId: "contractor-a", title: "Canonical contractor invoice" },
+            { id: "file-standards", sourceType: "standardsOutput", moduleKey: "compliance", relatedJob: "J-ASSIGNED", contractorId: "contractor-a", title: "Compliance review" },
+            { id: "file-module-record", sourceType: "moduleRecord", moduleKey: "reports", relatedJob: "J-ASSIGNED", contractorId: "contractor-a", title: "Financial report" }
           ],
           moduleRecords: [
             { id: "record-assigned", moduleKey: "jobs", linkedModuleKeys: ["photos"], relatedJob: "J-ASSIGNED", contractorId: "contractor-a", subject: "Assigned job record" },
@@ -1323,18 +1327,110 @@ describe("insurance intake logic", () => {
       });
 
     expect(saveResponse.status).toBe(200);
-    expect(saveResponse.body.savedRecords).toBe(8);
+    expect(saveResponse.body.savedRecords).toBe(11);
+
+    const storedWorkspaceRecords = Object.values(fakeDb.dump("osWorkspaceRecords"));
+    expect(storedWorkspaceRecords.find((stored) => stored.data?.id === "record-assigned")).toEqual(
+      expect.objectContaining({
+        applicationId: "general-contracting",
+        applicationIds: ["general-contracting"],
+        applicationContractVersion: 1,
+        data: expect.objectContaining({
+          applicationId: "general-contracting",
+          applicationContractVersion: 1
+        })
+      })
+    );
+    expect(storedWorkspaceRecords.find((stored) => stored.data?.id === "bill-1")).toEqual(
+      expect.objectContaining({ applicationId: "finance-and-reporting" })
+    );
+    expect(storedWorkspaceRecords.find((stored) => stored.data?.id === "file-invoice")).toEqual(
+      expect.objectContaining({
+        applicationId: "finance-and-reporting",
+        data: expect.objectContaining({ moduleKey: "payments" })
+      })
+    );
+    expect(storedWorkspaceRecords.find((stored) => stored.data?.id === "file-standards")).toEqual(
+      expect.objectContaining({
+        applicationId: "restoration-claims",
+        data: expect.objectContaining({ moduleKey: "compliance" })
+      })
+    );
+    expect(storedWorkspaceRecords.find((stored) => stored.data?.id === "file-module-record")).toEqual(
+      expect.objectContaining({
+        applicationId: "finance-and-reporting",
+        data: expect.objectContaining({ moduleKey: "reports" })
+      })
+    );
+    await fakeDb.collection("osWorkspaceSettings").doc("setting-estimate").set({
+      companyId: "default-company",
+      field: "estimateDraft",
+      value: { estimateNo: "EST-GLOBAL" },
+      updatedAt: "2026-08-01T10:00:00.000Z"
+    });
+    await fakeDb.collection("osWorkspaceAssets").doc("asset-photo-1").set({
+      id: "asset-photo-1",
+      companyId: "default-company",
+      jobId: "J-ASSIGNED",
+      contractorId: "contractor-a",
+      fileName: "kitchen.jpg",
+      updatedAt: "2026-08-01T11:00:00.000Z"
+    });
 
     const ownerResponse = await request(app)
       .get("/api/workspace-state")
       .set("Cookie", ["brothers_os_session=owner-cookie"]);
     expect(ownerResponse.status).toBe(200);
     expect(ownerResponse.body.durable).toBe(true);
-    expect(ownerResponse.body.workspaceState.files).toHaveLength(2);
+    expect(ownerResponse.body.workspaceState.files).toHaveLength(5);
     expect(ownerResponse.body.workspaceState.moduleRecords).toHaveLength(3);
     expect(ownerResponse.body.workspaceState.files[0].accessCode).toBeUndefined();
     expect(ownerResponse.body.workspaceState.estimateDraft.privateKey).toBeUndefined();
     expect(ownerResponse.body.workspaceState.contractorBills[0].invoiceId).toBe("CINV-1");
+
+    const unregisteredModuleWrite = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=owner-cookie"])
+      .send({
+        baseRevision: ownerResponse.body.revision,
+        baseUpdatedAt: ownerResponse.body.updatedAt,
+        workspaceState: {
+          moduleRecords: [{ id: "unregistered-record", moduleKey: "unregistered-module", subject: "Must remain unowned" }]
+        }
+      });
+    expect(unregisteredModuleWrite.status).toBe(403);
+    expect(Object.values(fakeDb.dump("osWorkspaceRecords")).map((stored) => stored.data?.id))
+      .not.toContain("unregistered-record");
+
+    const ownerContextResponse = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=owner-cookie"]);
+    expect(ownerContextResponse.status).toBe(200);
+    expect(ownerContextResponse.body.applicationGlobalIndex).toEqual(expect.objectContaining({
+      durable: true,
+      applicationContractVersion: 1,
+      totalRecords: expect.any(Number),
+      applications: expect.any(Array)
+    }));
+    expect(ownerContextResponse.body.applicationGlobalIndex.applications.find(
+      (application) => application.applicationId === "general-contracting"
+    )).toEqual(expect.objectContaining({
+      recordCount: 8,
+      fields: expect.objectContaining({ workspaceAssets: 1 })
+    }));
+    expect(ownerContextResponse.body.applicationGlobalIndex.applications.find(
+      (application) => application.applicationId === "workforce"
+    ).recordCount).toBeGreaterThanOrEqual(2);
+    expect(ownerContextResponse.body.applicationGlobalIndex.applications.find(
+      (application) => application.applicationId === "command-governance"
+    ).recordCount).toBeGreaterThan(0);
+    const restorationIndexFields = ownerContextResponse.body.applicationGlobalIndex.applications.find(
+      (application) => application.applicationId === "restoration-claims"
+    ).fields;
+    expect(restorationIndexFields["workspaceSettings.estimateDraft"]).toBeGreaterThan(0);
+    expect(restorationIndexFields.workspaceAssets).toBe(1);
+    expect(ownerContextResponse.body.applicationGlobalIndex.applicationRecordLinks)
+      .toBeGreaterThanOrEqual(ownerContextResponse.body.applicationGlobalIndex.totalRecords);
 
     const workerResponse = await request(app)
       .get("/api/workspace-state")
@@ -1346,12 +1442,49 @@ describe("insurance intake logic", () => {
     expect(workerResponse.body.workspaceState.contractorBills).toBeUndefined();
     expect(workerResponse.body.workspaceState.estimateDraft).toBeUndefined();
 
-    const workerWrite = await request(app)
+    const workerContextResponse = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=worker-cookie"]);
+    expect(workerContextResponse.status).toBe(200);
+    expect(workerContextResponse.body.applicationGlobalIndex).toBeNull();
+    expect(workerContextResponse.body.applications.map((application) => application.id)).not.toContain("command-governance");
+
+    const workerCanonicalWrite = await request(app)
       .put("/api/workspace-state")
       .set("Cookie", ["brothers_os_session=worker-cookie"])
       .send({
         baseRevision: ownerResponse.body.revision,
         baseUpdatedAt: ownerResponse.body.updatedAt,
+        workspaceState: {
+          files: [{
+            id: "file-assigned",
+            sourceType: "jobNote",
+            moduleKey: "globalindexes",
+            linkedModuleKeys: ["globalindexes"],
+            relatedJob: "J-ASSIGNED",
+            contractorId: "contractor-a",
+            title: "Worker job note"
+          }]
+        }
+      });
+    expect(workerCanonicalWrite.status).toBe(200);
+    const canonicalWorkerFile = Object.values(fakeDb.dump("osWorkspaceRecords"))
+      .find((stored) => stored.data?.id === "file-assigned");
+    expect(canonicalWorkerFile).toEqual(expect.objectContaining({
+      applicationId: "general-contracting",
+      applicationIds: ["general-contracting"],
+      data: expect.objectContaining({
+        moduleKey: "jobs",
+        linkedModuleKeys: []
+      })
+    }));
+
+    const workerWrite = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=worker-cookie"])
+      .send({
+        baseRevision: workerCanonicalWrite.body.revision,
+        baseUpdatedAt: workerCanonicalWrite.body.updatedAt,
         workspaceState: {
           moduleRecords: [{ id: "record-assigned", moduleKey: "jobs", relatedJob: "J-ASSIGNED", subject: "Worker replacement" }],
           files: [{ id: "file-spoof", moduleKey: "jobs", relatedJob: "J-OTHER", workerEmail: "worker@example.com", title: "Spoofed file" }]
@@ -1367,6 +1500,109 @@ describe("insurance intake logic", () => {
       expect.objectContaining({ id: "record-assigned", subject: "Assigned job record" })
     );
     expect(ownerAfterWorkerWrite.body.workspaceState.files.map((file) => file.id)).not.toContain("file-spoof");
+
+    await fakeDb.collection("osWorkspaceRecords").doc("legacy-unowned-document").set({
+      companyId: "default-company",
+      field: "moduleRecords",
+      recordId: "legacy-unowned-record",
+      applicationId: "",
+      applicationIds: [],
+      data: { id: "legacy-unowned-record", moduleKey: "retired-module", subject: "Legacy data awaiting migration" },
+      sortIndex: 99,
+      deletedAt: "",
+      updatedAt: "2026-08-05T12:00:00.000Z"
+    });
+    await fakeDb.collection("osWorkspaceRecords").doc("legacy-unowned-file-document").set({
+      companyId: "default-company",
+      field: "files",
+      recordId: "legacy-unowned-file",
+      applicationId: "",
+      applicationIds: [],
+      data: { id: "legacy-unowned-file", moduleKey: "retired-module", title: "Legacy file awaiting migration" },
+      sortIndex: 99,
+      deletedAt: "",
+      updatedAt: "2026-08-05T12:00:00.000Z"
+    });
+    await fakeDb.collection("osWorkspaceRecords").doc("legacy-unowned-task-file-document").set({
+      companyId: "default-company",
+      field: "files",
+      recordId: "legacy-unowned-task-file",
+      applicationId: "",
+      applicationIds: [],
+      data: {
+        id: "legacy-unowned-task-file",
+        moduleKey: "team",
+        sourceType: "taskAssignment",
+        taskModuleKey: "retired-module",
+        title: "Legacy task-assignment file awaiting migration"
+      },
+      sortIndex: 100,
+      deletedAt: "",
+      updatedAt: "2026-08-05T12:00:00.000Z"
+    });
+    await fakeDb.collection("osWorkspaceRecords").doc("legacy-unowned-task-document").set({
+      companyId: "default-company",
+      field: "tasks",
+      recordId: "legacy-unowned-task",
+      applicationId: "",
+      applicationIds: [],
+      data: { id: "legacy-unowned-task", moduleKey: "retired-module", title: "Legacy task awaiting migration" },
+      sortIndex: 99,
+      deletedAt: "",
+      updatedAt: "2026-08-05T12:00:00.000Z"
+    });
+    const ownerWithLegacy = await request(app)
+      .get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=owner-cookie"]);
+    const legacyRecord = ownerWithLegacy.body.workspaceState.moduleRecords.find((record) => record.id === "legacy-unowned-record");
+    expect(legacyRecord).toEqual(expect.objectContaining({ moduleKey: "retired-module" }));
+    const legacyFile = ownerWithLegacy.body.workspaceState.files.find((record) => record.id === "legacy-unowned-file");
+    const legacyTaskFile = ownerWithLegacy.body.workspaceState.files.find((record) => record.id === "legacy-unowned-task-file");
+    const legacyTask = ownerWithLegacy.body.workspaceState.tasks.find((record) => record.id === "legacy-unowned-task");
+    expect(legacyFile).toEqual(expect.objectContaining({ title: "Legacy file awaiting migration" }));
+    expect(legacyTaskFile).toEqual(expect.objectContaining({ taskModuleKey: "retired-module" }));
+    expect(legacyTask).toEqual(expect.objectContaining({ title: "Legacy task awaiting migration" }));
+
+    const legacyRoundTrip = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=owner-cookie"])
+      .send({
+        baseRevision: ownerWithLegacy.body.revision,
+        baseUpdatedAt: ownerWithLegacy.body.updatedAt,
+        workspaceState: {
+          moduleRecords: [
+            ...ownerWithLegacy.body.workspaceState.moduleRecords,
+            { id: "registered-after-legacy", moduleKey: "jobs", subject: "Valid record saved beside legacy data" }
+          ],
+          files: ownerWithLegacy.body.workspaceState.files,
+          tasks: ownerWithLegacy.body.workspaceState.tasks
+        }
+      });
+    expect(legacyRoundTrip.status).toBe(200);
+    expect(fakeDb.dump("osWorkspaceRecords")["legacy-unowned-document"].data.subject).toBe("Legacy data awaiting migration");
+    expect(fakeDb.dump("osWorkspaceRecords")["legacy-unowned-file-document"].data).toEqual(legacyFile);
+    expect(fakeDb.dump("osWorkspaceRecords")["legacy-unowned-task-file-document"].data).toEqual(legacyTaskFile);
+    expect(fakeDb.dump("osWorkspaceRecords")["legacy-unowned-task-document"].data).toEqual(legacyTask);
+    expect(Object.values(fakeDb.dump("osWorkspaceRecords")).find((stored) => stored.data?.id === "registered-after-legacy"))
+      .toEqual(expect.objectContaining({ applicationId: "general-contracting" }));
+
+    const legacyModification = await request(app)
+      .put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=owner-cookie"])
+      .send({
+        baseRevision: legacyRoundTrip.body.revision,
+        baseUpdatedAt: legacyRoundTrip.body.updatedAt,
+        workspaceState: {
+          moduleRecords: [{ ...legacyRecord, subject: "Forbidden legacy modification" }]
+        }
+      });
+    expect(legacyModification.status).toBe(403);
+    expect(fakeDb.dump("osWorkspaceRecords")["legacy-unowned-document"].data.subject).toBe("Legacy data awaiting migration");
+
+    const ownerContextWithLegacy = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=owner-cookie"]);
+    expect(ownerContextWithLegacy.body.applicationGlobalIndex.unownedRecordCount).toBe(4);
   });
 
   it("persists measured walls and fails closed across franchise workspace scopes", async () => {
@@ -1376,6 +1612,15 @@ describe("insurance intake logic", () => {
           email: "david@brothersrestoration.org",
           displayName: "David",
           roleId: "super_admin",
+          companyId: "default-company",
+          franchiseIds: ["franchise-a", "franchise-b"],
+          status: "active",
+          disabled: false
+        },
+        "business-owner-uid": {
+          email: "business@example.com",
+          displayName: "Business Owner",
+          roleId: "business_owner",
           companyId: "default-company",
           franchiseIds: ["franchise-a", "franchise-b"],
           status: "active",
@@ -1412,12 +1657,14 @@ describe("insurance intake logic", () => {
     });
     const users = {
       "owner-uid": { uid: "owner-uid", email: "david@brothersrestoration.org", displayName: "David", disabled: false },
+      "business-owner-uid": { uid: "business-owner-uid", email: "business@example.com", displayName: "Business Owner", disabled: false },
       "franchise-a-uid": { uid: "franchise-a-uid", email: "owner-a@example.com", displayName: "Franchise A", disabled: false },
       "franchise-b-uid": { uid: "franchise-b-uid", email: "owner-b@example.com", displayName: "Franchise B", disabled: false },
       "multi-franchise-uid": { uid: "multi-franchise-uid", email: "multi@example.com", displayName: "Multi Franchise", disabled: false }
     };
     const identities = {
       "owner-cookie": freshGoogleIdentity(),
+      "business-owner-cookie": freshGoogleIdentity({ uid: "business-owner-uid", email: "business@example.com", name: "Business Owner" }),
       "franchise-a-cookie": freshGoogleIdentity({ uid: "franchise-a-uid", email: "owner-a@example.com", name: "Franchise A" }),
       "franchise-b-cookie": freshGoogleIdentity({ uid: "franchise-b-uid", email: "owner-b@example.com", name: "Franchise B" }),
       "multi-franchise-cookie": freshGoogleIdentity({ uid: "multi-franchise-uid", email: "multi@example.com", name: "Multi Franchise" })
@@ -1464,12 +1711,58 @@ describe("insurance intake logic", () => {
           sketchWalls: [
             { id: "predictable-wall-id", franchiseId: "franchise-a", start: { x: 0, y: 0 }, end: { x: 8, y: 0 }, notes: "Franchise A original" },
             { id: "predictable-wall-id", franchiseId: "franchise-b", start: { x: 0, y: 0 }, end: { x: 10, y: 0 }, notes: "Franchise B original" }
-          ]
+          ],
+          skillPacks: [{ id: "owner-skill-pack", name: "Super Admin standards" }],
+          dataVaults: [{ id: "owner-data-vault", name: "Super Admin global data" }]
         }
       });
 
     expect(seedResponse.status).toBe(200);
-    expect(seedResponse.body.savedRecords).toBe(7);
+    expect(seedResponse.body.savedRecords).toBe(9);
+
+    const businessOwnerWorkspace = await request(app)
+      .get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=business-owner-cookie"]);
+    expect(businessOwnerWorkspace.status).toBe(200);
+    expect(businessOwnerWorkspace.body.workspaceState.skillPacks || []).toEqual([]);
+    expect(businessOwnerWorkspace.body.workspaceState.dataVaults || []).toEqual([]);
+
+    for (const cookie of ["business-owner-cookie", "franchise-a-cookie"]) {
+      const forgedPrimaryApplication = await request(app)
+        .put("/api/workspace-state")
+        .set("Cookie", [`brothers_os_session=${cookie}`])
+        .send({
+          baseRevision: seedResponse.body.revision,
+          baseUpdatedAt: seedResponse.body.updatedAt,
+          workspaceState: {
+            files: [{
+              id: `forged-global-file-${cookie}`,
+              moduleKey: "globalindexes",
+              franchiseId: "franchise-a",
+              title: "Must not become a global-index record"
+            }]
+          }
+        });
+      expect(forgedPrimaryApplication.status).toBe(403);
+      expect(forgedPrimaryApplication.body.message).toMatch(/no records were saved/i);
+
+      const forgedCanonicalGlobalRecord = await request(app)
+        .put("/api/workspace-state")
+        .set("Cookie", [`brothers_os_session=${cookie}`])
+        .send({
+          baseRevision: seedResponse.body.revision,
+          baseUpdatedAt: seedResponse.body.updatedAt,
+          workspaceState: {
+            skillPacks: [{
+              id: `forged-skill-pack-${cookie}`,
+              franchiseId: "franchise-a",
+              name: "Must remain Super Admin only"
+            }]
+          }
+        });
+      expect(forgedCanonicalGlobalRecord.status).toBe(403);
+      expect(forgedCanonicalGlobalRecord.body.message).toMatch(/no records were saved/i);
+    }
 
     const franchiseAResponse = await request(app)
       .get("/api/workspace-state")
@@ -1477,6 +1770,8 @@ describe("insurance intake logic", () => {
     expect(franchiseAResponse.status).toBe(200);
     expect(franchiseAResponse.body.workspaceState.sketchRooms.map((room) => room.id)).toEqual(["room-a"]);
     expect(franchiseAResponse.body.workspaceState.sketchWalls.map((wall) => wall.id)).toEqual(["predictable-wall-id"]);
+    expect(franchiseAResponse.body.workspaceState.skillPacks || []).toEqual([]);
+    expect(franchiseAResponse.body.workspaceState.dataVaults || []).toEqual([]);
 
     const franchiseBResponse = await request(app)
       .get("/api/workspace-state")
@@ -1733,10 +2028,39 @@ describe("insurance intake logic", () => {
     expect(createResponse.body.user.portalCodeHash).toBeUndefined();
     expect(createResponse.body.grant.tokenHash).toBeUndefined();
     expect(createResponse.body.grant.portalCodeHash).toBeUndefined();
+    expect(createResponse.body.grant.visibleApplicationIds).toEqual(expect.arrayContaining([
+      "general-contracting", "restoration-claims", "communications-intelligence"
+    ]));
+    expect(createResponse.body.grant.applicationAccess).toEqual(expect.any(Array));
     expect(listResponse.status).toBe(200);
     expect(listResponse.body.users.map((user) => user.email)).toContain("created.worker@example.com");
     expect(listResponse.body.users.every((user) => user.portalCodeHash === undefined)).toBe(true);
     expect(fakeDb.dump("osUsers")["created-worker-uid"].roleId).toBe("worker");
+    expect(fakeDb.dump("osUsers")["created-worker-uid"].visibleApplicationIds).toEqual(expect.arrayContaining([
+      "general-contracting", "restoration-claims", "communications-intelligence"
+    ]));
+
+    const roleUpdateResponse = await request(app)
+      .patch("/api/rbac/users/created-worker-uid")
+      .set("Cookie", ["brothers_os_session=session-cookie"])
+      .send({
+        roleId: "contractor",
+        visibleTabIds: ["payments"],
+        visiblePageIds: ["payments"]
+      });
+    expect(roleUpdateResponse.status).toBe(200);
+    expect(roleUpdateResponse.body.user.visibleApplicationIds).toEqual(["finance-and-reporting"]);
+    expect(fakeDb.dump("osAccessGrants")[createResponse.body.grant.id].visibleApplicationIds)
+      .toEqual(["finance-and-reporting"]);
+
+    const resetResponse = await request(app)
+      .post("/api/rbac/users/created-worker-uid/reset-permissions")
+      .set("Cookie", ["brothers_os_session=session-cookie"]);
+    expect(resetResponse.status).toBe(200);
+    expect(fakeDb.dump("osUsers")["created-worker-uid"].visibleApplicationIds).toEqual(expect.arrayContaining([
+      "command-governance", "general-contracting", "finance-and-reporting", "contractor-network", "communications-intelligence"
+    ]));
+    expect(fakeDb.dump("osAccessGrants")[createResponse.body.grant.id].applicationAccess).toEqual(expect.any(Array));
   });
 
   it("filters managed account lists to a franchise owner's assigned scope", async () => {
@@ -1835,6 +2159,235 @@ describe("insurance intake logic", () => {
       "franchise@example.com",
       "same-worker@example.com"
     ]);
+
+    const blankCompanyPivot = await request(app)
+      .patch("/api/rbac/users/franchise-owner-uid")
+      .set("Cookie", ["brothers_os_session=session-cookie"])
+      .send({ companyId: "   " });
+    expect(blankCompanyPivot.status).toBe(400);
+
+    const foreignCompanyPivot = await request(app)
+      .patch("/api/rbac/users/franchise-owner-uid")
+      .set("Cookie", ["brothers_os_session=session-cookie"])
+      .send({ companyId: "other-company" });
+    expect(foreignCompanyPivot.status).toBe(403);
+    expect(fakeDb.dump("osUsers")["franchise-owner-uid"].companyId).toBe("default-company");
+
+    await fakeDb.collection("osUsers").doc("franchise-owner-uid").set({ companyId: "" }, { merge: true });
+    const malformedTenantSession = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=session-cookie"]);
+    expect(malformedTenantSession.status).toBe(403);
+    expect(malformedTenantSession.body.message).toMatch(/invalid tenant assignment/i);
+    expect(fakeDb.dump("osUsers")["franchise-owner-uid"].companyId).toBe("");
+  });
+
+  it("isolates company settings, franchise settings, and audit logs by immutable tenant scope", async () => {
+    const companyASettingsId = hashSecret("company-a\u0000company-settings").slice(0, 48);
+    const companyBSettingsId = hashSecret("company-b\u0000company-settings").slice(0, 48);
+    const fakeDb = createFakeFirestore({
+      osUsers: {
+        "franchise-owner-uid": {
+          email: "franchise@example.com",
+          displayName: "Franchise Owner",
+          roleId: "franchise_owner",
+          companyId: "company-a",
+          franchiseIds: ["franchise-a"],
+          status: "active",
+          disabled: false
+        },
+        "business-owner-uid": {
+          email: "business@example.com",
+          displayName: "Business Owner",
+          roleId: "business_owner",
+          companyId: "company-a",
+          franchiseIds: ["franchise-a"],
+          status: "active",
+          disabled: false
+        },
+        "business-owner-b-uid": {
+          email: "business-b@example.com",
+          displayName: "Business Owner B",
+          roleId: "business_owner",
+          companyId: "company-b",
+          franchiseIds: ["foreign-franchise"],
+          status: "active",
+          disabled: false
+        }
+      },
+      osCompanySettings: {
+        [companyASettingsId]: { id: companyASettingsId, companyId: "company-a", brandName: "Company A" },
+        [companyBSettingsId]: { id: companyBSettingsId, companyId: "company-b", brandName: "Company B" }
+      },
+      osFranchiseSettings: {
+        "franchise-a": { id: "franchise-a", companyId: "company-a", franchiseId: "franchise-a", displayName: "Franchise A" },
+        "franchise-b": { id: "franchise-b", companyId: "company-a", franchiseId: "franchise-b", displayName: "Franchise B" },
+        "foreign-franchise": { id: "foreign-franchise", companyId: "company-b", franchiseId: "foreign-franchise", displayName: "Foreign Franchise" },
+        "legacy-unscoped": { id: "legacy-unscoped", displayName: "Legacy Unscoped" }
+      },
+      osAuditLogs: {
+        "audit-own": { actorUid: "actor-a", companyId: "company-a", franchiseIds: ["franchise-a"], eventType: "own_event", createdAt: "2026-08-04T12:00:00.000Z" },
+        "audit-sibling": { actorUid: "actor-b", companyId: "company-a", franchiseIds: ["franchise-b"], eventType: "sibling_event", createdAt: "2026-08-03T12:00:00.000Z" },
+        "audit-foreign": { actorUid: "actor-c", companyId: "company-b", franchiseIds: ["foreign-franchise"], eventType: "foreign_event", createdAt: "2026-08-02T12:00:00.000Z" },
+        "audit-legacy": { actorUid: "actor-legacy", eventType: "legacy_event", createdAt: "2026-08-01T12:00:00.000Z" }
+      },
+      osBusinessRecords: {
+        "customer-a": { id: "customer-a", type: "customer", companyId: "company-a", franchiseId: "franchise-a", name: "Assigned Customer" },
+        "revenue-a": { id: "revenue-a", type: "revenueInvoice", companyId: "company-a", franchiseId: "franchise-a", amount: 1000 },
+        "contractor-a": { id: "contractor-a", type: "contractorInvoice", companyId: "company-a", franchiseId: "franchise-a", amount: 400 },
+        "customer-b": { id: "customer-b", type: "customer", companyId: "company-a", franchiseId: "franchise-b", name: "Sibling Customer" },
+        "revenue-b": { id: "revenue-b", type: "revenueInvoice", companyId: "company-a", franchiseId: "franchise-b", amount: 2000 },
+        "foreign-customer": { id: "foreign-customer", type: "customer", companyId: "company-b", franchiseId: "foreign-franchise", name: "Foreign Customer" }
+      }
+    });
+    const identities = {
+      "franchise-cookie": freshGoogleIdentity({ uid: "franchise-owner-uid", email: "franchise@example.com", name: "Franchise Owner" }),
+      "business-cookie": freshGoogleIdentity({ uid: "business-owner-uid", email: "business@example.com", name: "Business Owner" }),
+      "business-b-cookie": freshGoogleIdentity({ uid: "business-owner-b-uid", email: "business-b@example.com", name: "Business Owner B" })
+    };
+    const app = express();
+    app.use(express.json());
+    const { router } = createFirebaseRbacRouter({
+      express,
+      parseCookies(headerValue = "") {
+        return Object.fromEntries(String(headerValue).split(";").map((part) => part.trim().split("=")).filter((parts) => parts.length === 2));
+      },
+      jsonError(response, statusCode, message) {
+        return response.status(statusCode).json({ success: false, message });
+      },
+      getFirebaseAuth() {
+        return {
+          verifySessionCookie: async (cookie) => identities[cookie],
+          getUser: async (uid) => ({
+            uid,
+            email: fakeDb.dump("osUsers")[uid]?.email,
+            displayName: fakeDb.dump("osUsers")[uid]?.displayName,
+            disabled: false
+          }),
+          setCustomUserClaims: async () => undefined
+        };
+      },
+      getFirebasePublicConfig: () => ({ enabled: true, adminConfigured: true, webConfigured: true }),
+      getFirestore: () => fakeDb,
+      isFirebaseConfigured: () => true
+    });
+    app.use(router);
+
+    const franchiseContext = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=franchise-cookie"]);
+    expect(franchiseContext.status).toBe(200);
+    expect(franchiseContext.body.franchiseSettings.map((record) => record.id)).toEqual(["franchise-a"]);
+    expect(franchiseContext.body.businessData.map((record) => record.id).sort()).toEqual([
+      "contractor-a", "customer-a", "revenue-a"
+    ]);
+
+    const directFranchiseBusinessData = await request(app)
+      .get("/api/business-data")
+      .set("Cookie", ["brothers_os_session=franchise-cookie"]);
+    expect(directFranchiseBusinessData.status).toBe(200);
+    expect(directFranchiseBusinessData.body.businessData.map((record) => record.id).sort())
+      .toEqual(["contractor-a", "customer-a", "revenue-a"]);
+
+    const ownUpdate = await request(app)
+      .patch("/api/rbac/franchise-settings/franchise-a")
+      .set("Cookie", ["brothers_os_session=franchise-cookie"])
+      .send({ displayName: "Franchise A Updated" });
+    expect(ownUpdate.status).toBe(200);
+
+    const siblingUpdate = await request(app)
+      .patch("/api/rbac/franchise-settings/franchise-b")
+      .set("Cookie", ["brothers_os_session=franchise-cookie"])
+      .send({ displayName: "Forbidden sibling update" });
+    expect(siblingUpdate.status).toBe(403);
+
+    const foreignUpdate = await request(app)
+      .patch("/api/rbac/franchise-settings/foreign-franchise")
+      .set("Cookie", ["brothers_os_session=franchise-cookie"])
+      .send({ displayName: "Forbidden foreign update" });
+    expect(foreignUpdate.status).toBe(403);
+
+    const scopeMutation = await request(app)
+      .patch("/api/rbac/franchise-settings/franchise-a")
+      .set("Cookie", ["brothers_os_session=franchise-cookie"])
+      .send({ companyId: "company-b", franchiseId: "franchise-b" });
+    expect(scopeMutation.status).toBe(400);
+    expect(fakeDb.dump("osFranchiseSettings")["franchise-a"]).toMatchObject({
+      companyId: "company-a",
+      franchiseId: "franchise-a",
+      displayName: "Franchise A Updated"
+    });
+
+    const stampedAudit = Object.values(fakeDb.dump("osAuditLogs")).find((record) => (
+      record.eventType === "osFranchiseSettings_updated" && record.targetId === "franchise-a"
+    ));
+    expect(stampedAudit).toMatchObject({
+      companyId: "company-a",
+      franchiseIds: ["franchise-a"],
+      tenantScopeVersion: 1
+    });
+
+    const businessContext = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=business-cookie"]);
+    expect(businessContext.status).toBe(200);
+    expect(businessContext.body.franchiseSettings.map((record) => record.id).sort()).toEqual(["franchise-a", "franchise-b"]);
+    expect(businessContext.body.businessData.map((record) => record.id).sort()).toEqual([
+      "contractor-a", "customer-a", "customer-b", "revenue-a", "revenue-b"
+    ]);
+    expect(businessContext.body.companySettings).toMatchObject({
+      id: companyASettingsId,
+      companyId: "company-a",
+      brandName: "Company A"
+    });
+
+    const companyAUpdate = await request(app)
+      .patch("/api/rbac/company-settings/default")
+      .set("Cookie", ["brothers_os_session=business-cookie"])
+      .send({ brandName: "Company A Updated" });
+    expect(companyAUpdate.status).toBe(200);
+
+    const companyScopeMutation = await request(app)
+      .patch("/api/rbac/company-settings/default")
+      .set("Cookie", ["brothers_os_session=business-cookie"])
+      .send({ companyId: "company-b", brandName: "Cross-tenant write" });
+    expect(companyScopeMutation.status).toBe(400);
+
+    const companyBContext = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=business-b-cookie"]);
+    expect(companyBContext.status).toBe(200);
+    expect(companyBContext.body.companySettings).toMatchObject({
+      id: companyBSettingsId,
+      companyId: "company-b",
+      brandName: "Company B"
+    });
+    expect(fakeDb.dump("osCompanySettings")[companyASettingsId]).toMatchObject({
+      companyId: "company-a",
+      brandName: "Company A Updated"
+    });
+    expect(fakeDb.dump("osCompanySettings")[companyBSettingsId]).toMatchObject({
+      companyId: "company-b",
+      brandName: "Company B"
+    });
+    const companyAContextAfterUpdate = await request(app)
+      .get("/api/auth/session")
+      .set("Cookie", ["brothers_os_session=business-cookie"]);
+    expect(companyAContextAfterUpdate.body.companySettings.brandName).toBe("Company A Updated");
+    expect(companyAContextAfterUpdate.body.auditLogs.map((record) => record.eventType)).toEqual(expect.arrayContaining([
+      "own_event", "osFranchiseSettings_updated", "osCompanySettings_updated"
+    ]));
+    expect(companyAContextAfterUpdate.body.auditLogs.map((record) => record.eventType)).not.toEqual(expect.arrayContaining([
+      "sibling_event", "foreign_event", "legacy_event"
+    ]));
+
+    const directAudit = await request(app)
+      .get("/api/rbac/audit-logs")
+      .set("Cookie", ["brothers_os_session=business-cookie"]);
+    expect(directAudit.status).toBe(200);
+    expect(directAudit.body.auditLogs.map((record) => record.eventType)).toEqual(
+      companyAContextAfterUpdate.body.auditLogs.map((record) => record.eventType)
+    );
   });
 
   it("rejects Super Admin assignment for any email outside the owner allowlist", async () => {

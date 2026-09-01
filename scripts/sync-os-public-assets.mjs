@@ -7,6 +7,7 @@ const publicDir = join(rootDir, "public");
 
 const osAssets = [
   "app.js",
+  "application-registry.js",
   "module-data.js",
   "firebase-client.js",
   "ui-security.js",

@@ -1,4 +1,5 @@
 import "./module-data.js";
+import "./application-registry.js";
 import {
   fetchOsSession,
   loadFirebaseConfig,
@@ -9,6 +10,8 @@ import { brothersLogoDataUrl } from "./logo-data.js";
 import { normalizeSectionButtonUrl } from "./ui-security.js";
 
 const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES : [];
+const applications = Array.isArray(window.BROTHERS_APPLICATIONS) ? window.BROTHERS_APPLICATIONS : [];
+const applicationRegistry = window.BROTHERS_APPLICATION_REGISTRY || {};
 const storageKey = "brothers-os-workspace-v2";
 const remoteWorkspaceFields = [
   "files", "moduleRecords", "queue", "activity", "standardsOutputs", "learnedJargon",
@@ -107,50 +110,16 @@ const categoryLabels = {
   vendors: "Vendors"
 };
 
-const taskTypeGroups = [
-  {
-    id: "command",
-    label: "Command, Access, and Admin",
-    description: "Owner-only controls, launch status, security, user access, and global visibility.",
-    categories: ["core", "security", "platform"],
-    keys: ["daily", "launchcenter", "accessadmin", "globalindexes", "settings", "securitycenter", "auditlog", "datamodel", "sessiondevices", "trustsafety"]
-  },
-  {
-    id: "jobs-field",
-    label: "Jobs, Field, and Dispatch",
-    description: "Intake, job tracking, drying, routes, equipment, photos, properties, and field execution.",
-    categories: ["jobs", "field", "dispatch", "property"],
-    keys: ["universalintake", "insurance", "jobs", "workorders", "dispatch", "routeplanner", "drylogs", "time", "equipment", "photos", "fieldmobile", "properties", "sketch"]
-  },
-  {
-    id: "money",
-    label: "Money, Pricing, and Invoices",
-    description: "Pricing, supplements, revenue files, payments, accounting, and proof of value.",
-    categories: ["revenue", "finance"],
-    keys: ["pricing", "supplement", "revenueengine", "justification", "evidencechain", "payments", "accounting", "proofvalue"]
-  },
-  {
-    id: "people",
-    label: "People, Contractors, and Board",
-    description: "Team access, contractor portals, internal posts, vendors, training, contracts, and liens.",
-    categories: ["training", "vendors", "legal"],
-    keys: ["team", "contractorportal", "communications", "vendors", "marketplace", "partnerscore", "training", "sops", "certbadge", "contracts", "liens"]
-  },
-  {
-    id: "compliance",
-    label: "Compliance, Documents, and Closeout",
-    description: "Defensibility, standards, code checks, forms, closeout, reviews, safety, and warranty.",
-    categories: ["compliance", "documents"],
-    keys: ["defensibility", "compliance", "nationalcodes", "safetyintel", "forms", "closeout", "reviews", "warranty"]
-  },
-  {
-    id: "growth",
-    label: "Growth, Reports, and Strategy",
-    description: "Business health, licensing, subscriptions, branches, AI review, reports, and integrations.",
-    categories: ["reports", "strategy", "marketing", "ai", "branch"],
-    keys: ["reports", "businesshealth", "licensing", "subscriptionbilling", "featuregates", "planmatrix", "setupwizard", "leads", "campaigns", "aicopilots", "aireview", "branches", "moduletoggles", "integrations"]
-  }
-];
+const taskTypeGroups = applications.map((application) => ({
+  id: application.id,
+  label: application.label,
+  description: application.description,
+  categories: [],
+  keys: application.moduleKeys,
+  connections: application.connections || [],
+  dataNamespace: application.dataNamespace,
+  defaultModuleKey: application.defaultModuleKey
+}));
 
 const basePinnedKeys = ["daily", "contractorportal", "accessadmin", "launchcenter", "globalindexes", "team", "communications", "payments", "accounting", "insurance", "sketch", "drylogs", "jobs", "pricing", "defensibility", "supplement", "compliance", "aicopilots", "time", "dispatch", "reports"];
 
@@ -1135,14 +1104,60 @@ function normalizeModuleKeyList(value, primaryKey = "") {
     .filter((key) => key !== primaryKey && moduleByKey(key));
 }
 
+function applicationForModuleKey(moduleKey) {
+  return typeof applicationRegistry.getApplicationForModule === "function"
+    ? applicationRegistry.getApplicationForModule(moduleKey)
+    : null;
+}
+
+function applicationById(applicationId) {
+  return applications.find((application) => application.id === applicationId) || null;
+}
+
+function applicationIdsForModuleKeys(moduleKeys) {
+  return typeof applicationRegistry.getApplicationIdsForModuleKeys === "function"
+    ? applicationRegistry.getApplicationIdsForModuleKeys(moduleKeys)
+    : [];
+}
+
+function applicationScopeForModules(moduleKey, linkedModuleKeys = []) {
+  const applicationIds = applicationIdsForModuleKeys([moduleKey, ...linkedModuleKeys]);
+  const applicationId = applicationForModuleKey(moduleKey)?.id || applicationIds[0] || "";
+  return {
+    applicationId,
+    linkedApplicationIds: applicationIds.filter((id) => id !== applicationId),
+    applicationContractVersion: Number(applicationRegistry.contractVersion || 1)
+  };
+}
+
+function normalizeModuleRecord(record = {}) {
+  if (!applicationForModuleKey(record.moduleKey)) {
+    return { ...record };
+  }
+  const linkedModuleKeys = normalizeModuleKeyList(record.linkedModuleKeys || [], record.moduleKey);
+  return {
+    ...record,
+    linkedModuleKeys,
+    ...applicationScopeForModules(record.moduleKey, linkedModuleKeys)
+  };
+}
+
 function fileLinkedModules(file) {
   return normalizeModuleKeyList(file.linkedModuleKeys || file.linkedModules || [], file.moduleKey);
 }
 
 function normalizeFileRecord(file) {
+  const primaryModuleKey = typeof applicationRegistry.resolveWorkspaceFilePrimaryModule === "function"
+    ? applicationRegistry.resolveWorkspaceFilePrimaryModule(file)
+    : file.moduleKey;
+  if (!applicationForModuleKey(primaryModuleKey)) {
+    return { ...file };
+  }
+  const linkedModuleKeys = fileLinkedModules(file);
   return {
     ...file,
-    linkedModuleKeys: fileLinkedModules(file),
+    linkedModuleKeys,
+    ...applicationScopeForModules(primaryModuleKey, linkedModuleKeys),
     sourceType: file.sourceType || "",
     sourceId: file.sourceId || "",
     customer: file.customer || "",
@@ -1162,7 +1177,12 @@ function normalizeJobRecord(job) {
   }
   const linkedModules = Array.isArray(job.linkedModules) ? [...job.linkedModules] : ["photos", "time", "equipment", "payments"];
   if (!linkedModules.includes("drylogs")) linkedModules.splice(Math.min(2, linkedModules.length), 0, "drylogs");
-  return { ...job, gates, linkedModules };
+  return {
+    ...job,
+    gates,
+    linkedModules,
+    ...applicationScopeForModules("jobs", linkedModules)
+  };
 }
 
 function normalizeListValue(value) {
@@ -1197,7 +1217,8 @@ function moduleVisibilityPayload(formData) {
   const selectedKeys = moduleKeysFromList(formData.getAll("visibleModuleKeys"));
   return {
     visibleTabIds: selectedKeys,
-    visiblePageIds: selectedKeys
+    visiblePageIds: selectedKeys,
+    visibleApplicationIds: applicationIdsForModuleKeys(selectedKeys)
   };
 }
 
@@ -1215,8 +1236,11 @@ function renderModuleAccessPicker({ selectedKeys = [], allowedKeys = null, legen
       <legend>${escapeHtml(legend)}</legend>
       <input type="hidden" name="visibilityConfigured" value="1" />
       ${groupedKeys.map((group) => `
-        <div class="module-access-group">
-          <strong>${escapeHtml(group.label)}</strong>
+        <div class="module-access-group" data-application-access-group="${escapeHtml(group.id)}">
+          <label class="application-access-toggle">
+            <input type="checkbox" data-application-access="${escapeHtml(group.id)}" data-module-keys="${escapeHtml(group.moduleKeys.join(","))}" ${group.moduleKeys.every((key) => selected.has(key)) ? "checked" : ""} />
+            <span><strong>${escapeHtml(group.label)}</strong><small>Grant or remove the complete application</small></span>
+          </label>
           <div class="module-access-options">
             ${group.moduleKeys.map((key) => {
               const module = moduleByKey(key);
@@ -1261,9 +1285,13 @@ function normalizeTeamMember(member) {
 }
 
 function normalizeTaskRecord(task, teamMembers = []) {
+  if (!applicationForModuleKey(task.moduleKey)) {
+    return { ...task };
+  }
   const assignee = teamMembers.find((member) => member.id === task.assigneeId || member.email === task.assigneeEmail);
   return {
     ...task,
+    ...applicationScopeForModules(task.moduleKey || "jobs"),
     assigneeName: task.assigneeName || assignee?.name || "",
     assigneeEmail: task.assigneeEmail || assignee?.email || "",
     status: task.status || "Open",
@@ -1291,7 +1319,7 @@ function normalizeState(next, { includeDefaults = true } = {}) {
 
   next.files = mergedArray(next.files, defaultFiles);
   next.files = next.files.map(normalizeFileRecord);
-  next.moduleRecords = Array.isArray(next.moduleRecords) ? next.moduleRecords : [];
+  next.moduleRecords = Array.isArray(next.moduleRecords) ? next.moduleRecords.map(normalizeModuleRecord) : [];
   next.queue = plainArray(next.queue, defaultQueue);
   next.activity = plainArray(next.activity, defaultActivity);
   next.standardsOutputs = plainArray(next.standardsOutputs, defaultStandardsOutputs);
@@ -2128,12 +2156,12 @@ function renderTaskTypeModuleDirectory() {
     <section class="module-directory-panel">
       <div class="panel-head">
         <div>
-          <h2>Module map</h2>
-          <p>All available modules are grouped by task type so owners, admins, and contractors can find the right workspace without hunting through the sidebar.</p>
+          <h2>Application portfolio</h2>
+          <p>Each module belongs to one bounded application. Access can be granted by application or narrowed to individual modules, and server-approved record links can connect finance, workforce, claims, and global reporting.</p>
         </div>
         <div class="source-status">
           <span>${available.length} modules</span>
-          <span>${groups.length} task groups</span>
+          <span>${groups.length} applications</span>
         </div>
       </div>
       <div class="module-directory-grid">
@@ -2144,6 +2172,14 @@ function renderTaskTypeModuleDirectory() {
 }
 
 function renderTaskTypeGroup(group) {
+  const connectionLabels = typeof applicationRegistry.areApplicationsConnected === "function"
+    ? applications
+        .filter((application) => application.id !== group.id
+          && applicationRegistry.areApplicationsConnected(group.id, application.id))
+        .map((application) => application.label)
+    : (group.connections || [])
+        .map((connection) => applicationById(connection.applicationId)?.label)
+        .filter(Boolean);
   return `
     <article class="task-type-group">
       <div class="task-type-head">
@@ -2151,6 +2187,7 @@ function renderTaskTypeGroup(group) {
         <span>${group.modules.length}</span>
       </div>
       ${group.description ? `<p class="task-type-description">${escapeHtml(group.description)}</p>` : ""}
+      ${connectionLabels.length ? `<p class="application-connections"><strong>Permitted links:</strong> ${escapeHtml(connectionLabels.join(", "))}</p>` : ""}
       <div class="module-tile-grid">
         ${group.modules.map(renderDirectoryModuleTile).join("")}
       </div>
@@ -2719,6 +2756,7 @@ function ensureWorkflowTask(taskData) {
     sourceId: taskData.sourceId || "",
     workflowKey: ""
   };
+  Object.assign(task, applicationScopeForModules(task.moduleKey));
   task.workflowKey = workflowTaskKey(task);
   if (task.workflowKey && state.tasks.some((item) => item.workflowKey === task.workflowKey && item.status !== "Complete")) {
     return null;
@@ -2766,6 +2804,7 @@ function createFile(data) {
     updatedAt: now,
     history: [`Created in ${module.label}`, ...(linkedLabels.length ? [`Visible in ${linkedLabels.join(", ")}`] : [])]
   };
+  Object.assign(file, applicationScopeForModules(module.key, linkedModuleKeys));
   state.files = [file, ...state.files];
   state.selectedFileId = file.id;
   addActivity(`Created ${file.title} in ${module.label}.`);
@@ -4426,12 +4465,14 @@ async function bootstrapFirebaseAuth() {
       pageSections: session.pageSections || [],
       roles: session.roles || [],
       permissions: session.permissions || [],
+      applications: session.applications || [],
       companySettings: session.companySettings || null,
       franchiseSettings: session.franchiseSettings || [],
       user: session.user || null,
       users: session.users || [],
       auditLogs: session.auditLogs || [],
       businessData: session.businessData || [],
+      applicationGlobalIndex: session.applicationGlobalIndex || null,
       accessRequests: session.accessRequests || [],
       accessGrants: session.accessGrants || [],
       ticketSignoffs: session.ticketSignoffs || [],
@@ -4473,12 +4514,14 @@ async function refreshAccessContext({ hydrateWorkspace = false } = {}) {
     pageSections: session.pageSections || [],
     roles: session.roles || [],
       permissions: session.permissions || [],
+      applications: session.applications || [],
       companySettings: session.companySettings || null,
       franchiseSettings: session.franchiseSettings || [],
       user: session.user || null,
       users: session.users || [],
       auditLogs: session.auditLogs || [],
       businessData: session.businessData || [],
+      applicationGlobalIndex: session.applicationGlobalIndex || null,
       accessRequests: session.accessRequests || [],
       accessGrants: session.accessGrants || [],
       ticketSignoffs: session.ticketSignoffs || [],
@@ -4614,6 +4657,7 @@ async function createAccessGrant(formData) {
 }
 
 async function createEmployeeInvitation(formData) {
+  const visibleModuleKeys = formData.getAll("visibleModuleKeys").map(String);
   const payload = {
     displayName: String(formData.get("displayName") || "").trim(),
     email: String(formData.get("email") || "").trim(),
@@ -4626,7 +4670,8 @@ async function createEmployeeInvitation(formData) {
     contractorId: String(formData.get("contractorId") || currentContractorId()).trim(),
     assignedJobIds: csvValues(formData.get("assignedJobIds")),
     assignedTaskIds: csvValues(formData.get("assignedTaskIds")),
-    visibleModuleKeys: formData.getAll("visibleModuleKeys").map(String),
+    visibleModuleKeys,
+    visibleApplicationIds: applicationIdsForModuleKeys(visibleModuleKeys),
     sendEmail: formData.has("sendEmail")
   };
   const result = await apiRequest("/api/employee-invitations", {
@@ -4669,6 +4714,7 @@ async function updatePendingEmployeeInvitation(grantId, updates = {}) {
 
 async function savePendingEmployeeInvitation(formData) {
   const grantId = String(formData.get("grantId") || "").trim();
+  const visibleModuleKeys = formData.getAll("visibleModuleKeys").map(String);
   await updatePendingEmployeeInvitation(grantId, {
     displayName: String(formData.get("displayName") || "").trim(),
     phone: String(formData.get("phone") || "").trim(),
@@ -4677,7 +4723,8 @@ async function savePendingEmployeeInvitation(formData) {
     startDate: String(formData.get("startDate") || "").trim(),
     assignedJobIds: csvValues(formData.get("assignedJobIds")),
     assignedTaskIds: csvValues(formData.get("assignedTaskIds")),
-    visibleModuleKeys: formData.getAll("visibleModuleKeys").map(String)
+    visibleModuleKeys,
+    visibleApplicationIds: applicationIdsForModuleKeys(visibleModuleKeys)
   });
   state.modal = null;
   setToast("Pending employee profile updated");
@@ -6393,7 +6440,7 @@ async function connectQuickBooks() {
 
 async function addTeamMember(formData) {
   const accountType = String(formData.get("accountType") || "Contractor portal");
-  const permissions = formData.getAll("permissions").map(String);
+  const permissions = formData.getAll("visibleModuleKeys").map(String);
   const assignedJobIds = csvValues(formData.get("assignedJobIds"));
   const roleId = {
     "Contractor portal": "contractor",
@@ -6412,6 +6459,7 @@ async function addTeamMember(formData) {
     assignedTaskIds: [],
     visibleTabIds: permissions.length ? permissions : defaultModuleAccessForRole(roleId),
     visiblePageIds: permissions.length ? permissions : defaultModuleAccessForRole(roleId),
+    visibleApplicationIds: applicationIdsForModuleKeys(permissions.length ? permissions : defaultModuleAccessForRole(roleId)),
     ttlHours: 48,
     sendEmail: true
   };
@@ -7456,6 +7504,7 @@ function createWorkbenchRecord(formData) {
     createdAt: now,
     updatedAt: now
   };
+  Object.assign(record, applicationScopeForModules(module.key, config.links));
   const notes = [
     `${config.title}`,
     module.purpose,
@@ -10897,6 +10946,7 @@ function renderGlobalIndexesModule(module) {
     </section>
     ${!state.firebase.enabled ? `<section class="panel"><div class="empty-state warning-state"><strong>Local preview note</strong><span>This preview is visible only because Firebase auth is not configured locally. On Vercel, Super Admin RBAC hides this module from contractors and workers.</span></div></section>` : ""}
     ${renderSkillsAndDatabasePanel()}
+    ${renderGlobalApplicationIndexPanel()}
     ${renderGlobalBusinessIndexPanel()}
     <section class="panel">
       <div class="panel-head">
@@ -10911,6 +10961,73 @@ function renderGlobalIndexesModule(module) {
     </section>
     ${renderModuleFiles(module)}
     ${renderFileDetail(module)}
+  `;
+}
+
+function renderGlobalApplicationIndexPanel() {
+  const globalIndex = state.accessContext?.applicationGlobalIndex || {
+    durable: false,
+    capped: false,
+    totalRecords: 0,
+    applicationRecordLinks: 0,
+    limitedSources: [],
+    applications: applications.map((application) => ({
+      applicationId: application.id,
+      label: application.label,
+      recordCount: 0,
+      companyCount: 0,
+      franchiseCount: 0,
+      contractorCount: 0,
+      fields: {},
+      latestUpdatedAt: ""
+    }))
+  };
+  const indexedApplications = Array.isArray(globalIndex.applications) ? globalIndex.applications : [];
+  const activeApplications = indexedApplications.filter((application) => Number(application.recordCount || 0) > 0).length;
+  return `
+    <section class="panel application-global-index">
+      <div class="panel-head">
+        <div>
+          <h2>Combined application index</h2>
+          <p>Super Admin projection across every bounded application. Records retain their owning application while approved links remain visible across connected workflows.</p>
+        </div>
+        <div class="source-status">
+          <span>${indexedApplications.length} applications</span>
+          <span>${globalIndex.durable ? "Firestore" : "Readiness view"}</span>
+        </div>
+      </div>
+      <div class="metric-strip">
+        <div><strong>${Number(globalIndex.totalRecords || 0)}</strong><span>Unique indexed records</span></div>
+        <div><strong>${Number(globalIndex.applicationRecordLinks || 0)}</strong><span>Application record links</span></div>
+        <div><strong>${activeApplications}</strong><span>Applications with data</span></div>
+        <div><strong>${indexedApplications.reduce((total, application) => total + Number(application.contractorCount || 0), 0)}</strong><span>Application contractor scopes</span></div>
+        <div><strong>${globalIndex.capped ? "Limited" : "Current"}</strong><span>Snapshot status</span></div>
+      </div>
+      <div class="application-index-grid">
+        ${indexedApplications.map((entry) => {
+          const application = applicationById(entry.applicationId);
+          const fieldSummary = Object.entries(entry.fields || {})
+            .sort((left, right) => Number(right[1]) - Number(left[1]))
+            .slice(0, 3)
+            .map(([field, count]) => `${field}: ${count}`)
+            .join(" | ");
+          return `
+            <article class="application-index-card">
+              <div class="file-card-head"><span>${escapeHtml(application?.label || entry.label || entry.applicationId)}</span><strong>${Number(entry.recordCount || 0)}</strong></div>
+              <p>${escapeHtml(application?.description || "Bounded Brothers OS application")}</p>
+              <dl>
+                <div><dt>Companies</dt><dd>${Number(entry.companyCount || 0)}</dd></div>
+                <div><dt>Franchises</dt><dd>${Number(entry.franchiseCount || 0)}</dd></div>
+                <div><dt>Contractors</dt><dd>${Number(entry.contractorCount || 0)}</dd></div>
+                <div><dt>Updated</dt><dd>${entry.latestUpdatedAt ? escapeHtml(formatTime(entry.latestUpdatedAt)) : "No records"}</dd></div>
+              </dl>
+              ${fieldSummary ? `<small>${escapeHtml(fieldSummary)}</small>` : `<small>No durable records indexed yet.</small>`}
+              ${application?.defaultModuleKey ? `<div class="card-actions"><a href="#module/${escapeHtml(application.defaultModuleKey)}" data-action="set-active" data-key="${escapeHtml(application.defaultModuleKey)}">Open application</a></div>` : ""}
+            </article>
+          `;
+        }).join("")}
+      </div>
+    </section>
   `;
 }
 
@@ -11509,14 +11626,7 @@ function renderTeamForm() {
       <datalist id="team-job-options">
         ${state.jobBoards.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}
       </datalist>
-      <fieldset class="source-picker compact-picker">
-        <legend>Module permissions</legend>
-        ${["jobs", "drylogs", "time", "equipment", "photos", "communications", "pricing", "payments", "reports", "settings"]
-          .map((key) => moduleByKey(key))
-          .filter(Boolean)
-          .map((module) => `<label class="source-check"><input name="permissions" type="checkbox" value="${module.key}" ${employeeAllowedModuleKeys.includes(module.key) ? "checked" : ""} /><span><strong>${escapeHtml(module.label)}</strong><small>${escapeHtml(categoryLabels[module.category] || module.category)}</small></span></label>`)
-          .join("")}
-      </fieldset>
+      ${renderModuleAccessPicker({ selectedKeys: defaultContractorModuleKeys, legend: "Application and module access" })}
       <button type="submit">Create restricted login invite</button>
     </form>
   `;
@@ -11568,6 +11678,9 @@ function renderTeamMemberCard(member) {
   const visibleModules = visibleModuleKeysForMember(member)
     .map((key) => moduleByKey(key)?.label || key)
     .filter(Boolean);
+  const visibleApplications = applicationIdsForModuleKeys(visibleModuleKeysForMember(member))
+    .map((applicationId) => applicationById(applicationId)?.label || applicationId)
+    .filter(Boolean);
   const cardActions = [
     pendingGrantId && canDo("inviteWorkers") ? `<button type="button" data-action="open-pending-employee-manage" data-id="${escapeHtml(pendingGrantId)}">Edit invitation</button>` : "",
     pendingGrantId && canDo("inviteWorkers") ? `<button type="button" data-action="revoke-employee-invitation" data-id="${escapeHtml(pendingGrantId)}">Revoke invitation</button>` : "",
@@ -11587,6 +11700,7 @@ function renderTeamMemberCard(member) {
         : "Portal access: verified Google account"}</small>
       <small>${assignedTasks.length} assigned task${assignedTasks.length === 1 ? "" : "s"}${assignedJobs.length ? ` | Jobs: ${escapeHtml(assignedJobs.join(", "))}` : ""}</small>
       <small>${ticketSignoffs.length} GPS ticket sign-off${ticketSignoffs.length === 1 ? "" : "s"}${ticketSignoffs[0] ? ` | Last ${escapeHtml(formatTime(ticketSignoffs[0].signedAt))}` : ""}</small>
+      <small>Applications: ${escapeHtml(visibleApplications.join(", ") || "No applications assigned")}</small>
       <small>Modules: ${escapeHtml(visibleModules.join(", ") || "No modules assigned")}</small>
       ${member.companyId ? `<small>Company: ${escapeHtml(member.companyId)}${member.franchiseIds?.length ? ` | Franchise: ${escapeHtml(member.franchiseIds.join(", "))}` : ""}</small>` : ""}
       ${cardActions ? `<div class="card-actions">${cardActions}</div>` : ""}
@@ -13270,6 +13384,26 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const applicationToggle = event.target.closest("[data-application-access]");
+  if (applicationToggle) {
+    const group = applicationToggle.closest("[data-application-access-group]");
+    const moduleKeys = new Set(String(applicationToggle.dataset.moduleKeys || "").split(",").filter(Boolean));
+    group?.querySelectorAll('input[name="visibleModuleKeys"]').forEach((input) => {
+      if (moduleKeys.has(input.value)) input.checked = applicationToggle.checked;
+    });
+    return;
+  }
+  const moduleAccessToggle = event.target.closest('input[name="visibleModuleKeys"]');
+  if (moduleAccessToggle) {
+    const group = moduleAccessToggle.closest("[data-application-access-group]");
+    const applicationInput = group?.querySelector("[data-application-access]");
+    const moduleInputs = [...(group?.querySelectorAll('input[name="visibleModuleKeys"]') || [])];
+    if (applicationInput && moduleInputs.length) {
+      const selectedCount = moduleInputs.filter((input) => input.checked).length;
+      applicationInput.checked = selectedCount > 0;
+      applicationInput.indeterminate = selectedCount > 0 && selectedCount < moduleInputs.length;
+    }
+  }
   const field = event.target.closest("[data-field]");
   if (!field) return;
   if (["industry-profile", "price-csv", "xactimate-import", "estimate-logo", "admin-image-file"].includes(field.dataset.field) && !workspaceWritesReady()) {

@@ -624,6 +624,28 @@ async function runWorkflow(page, localSmokeApi) {
   await select(page, 'form[data-form="employee-invitation"] select[name="employmentType"]', "Employee");
   await fill(page, 'form[data-form="employee-invitation"] input[name="startDate"]', "2026-07-20");
   await fill(page, 'form[data-form="employee-invitation"] input[name="assignedJobIds"]', ids.jobId);
+  const employeeApplicationGroup = page.locator('form[data-form="employee-invitation"] [data-application-access-group="general-contracting"]');
+  const employeeApplicationToggle = employeeApplicationGroup.locator('[data-application-access="general-contracting"]');
+  const employeeApplicationModules = employeeApplicationGroup.locator('input[name="visibleModuleKeys"]');
+  await employeeApplicationModules.first().uncheck();
+  const partialApplicationState = await employeeApplicationToggle.evaluate((input) => ({
+    checked: input.checked,
+    indeterminate: input.indeterminate,
+    moduleStates: [...input.closest("[data-application-access-group]").querySelectorAll('input[name="visibleModuleKeys"]')]
+      .map((moduleInput) => ({ value: moduleInput.value, checked: moduleInput.checked }))
+  }));
+  if (!partialApplicationState.checked || !partialApplicationState.indeterminate) {
+    throw new Error(`A partial application grant did not display its mixed module-access state: ${JSON.stringify(partialApplicationState)}`);
+  }
+  await employeeApplicationToggle.uncheck();
+  if ((await employeeApplicationModules.evaluateAll((inputs) => inputs.some((input) => input.checked)))) {
+    throw new Error("Removing application access left an employee module selected");
+  }
+  await employeeApplicationToggle.check();
+  if (!(await employeeApplicationModules.evaluateAll((inputs) => inputs.every((input) => input.checked)))) {
+    throw new Error("Granting application access did not select every allowed employee module");
+  }
+  results.workflowChecks.push({ label: "Application access controls", text: "full, partial, and removed module grants stay synchronized" });
   const employeeInviteSubmit = page.locator('form[data-form="employee-invitation"] button[type="submit"]');
   if (await employeeInviteSubmit.isDisabled()) {
     throw new Error("Employee invitation submit is disabled even though secure storage is available");
@@ -954,6 +976,36 @@ async function verifyDurableReload(page, localSmokeApi) {
     await expectBody(page, `reload retained ${record.key} semantic record`, record.title);
   }
   results.durableReloadVerified = true;
+}
+
+async function verifyLegacyBrowserRoundTrip(page, localSmokeApi) {
+  if (!localSmokeApi) return;
+  const legacyRecords = localSmokeApi.injectLegacyRecords();
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForSelector(".app-shell", { timeout: 15000 });
+  await go(page, "dispatch");
+  const validTitle = `Registered record after legacy hydration ${stamp}`;
+  await fill(page, 'form[data-form="module-workbench"] input[name="subject"]', validTitle);
+  await fill(page, 'form[data-form="module-workbench"] input[name="relatedJob"]', ids.jobId);
+  await fill(page, 'form[data-form="module-workbench"] input[name="owner"]', "AI legacy verifier");
+  await select(page, 'form[data-form="module-workbench"] select[name="priority"]', "High");
+  await click(page, 'form[data-form="module-workbench"] button[type="submit"]');
+  await waitUntil("legacy browser round-trip write", () => JSON.stringify(localSmokeApi.getWorkspaceState()).includes(validTitle));
+  const savedState = localSmokeApi.getWorkspaceState();
+  const roundTripCases = [
+    ["module record", savedState.moduleRecords, legacyRecords.moduleRecord],
+    ["file", savedState.files, legacyRecords.file],
+    ["task-assignment file", savedState.files, legacyRecords.taskAssignmentFile],
+    ["task", savedState.tasks, legacyRecords.task]
+  ];
+  for (const [label, records, expected] of roundTripCases) {
+    const savedRecord = records?.find((record) => record.id === expected.id);
+    if (JSON.stringify(savedRecord) !== JSON.stringify(expected)) {
+      throw new Error(`Browser hydration modified an opaque legacy ${label}`);
+    }
+  }
+  results.legacyBrowserRoundTripVerified = true;
+  results.workflowChecks.push({ label: "Legacy record round-trip", text: "opaque module, file, and task data remained byte-for-byte unchanged beside a registered write" });
 }
 
 async function refreshCoverage(page, moduleKeys) {
@@ -2068,6 +2120,51 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
   return {
     getWorkspaceState: () => workspaceState,
     getWorkspaceWriteCount: () => workspaceWriteCount,
+    injectLegacyRecords() {
+      const moduleRecord = {
+        id: `legacy-browser-${stamp}`,
+        moduleKey: "retired-browser-module",
+        subject: `Legacy browser record ${stamp}`
+      };
+      const file = {
+        id: `legacy-browser-file-${stamp}`,
+        moduleKey: "retired-browser-module",
+        title: `Legacy browser file ${stamp}`
+      };
+      const taskAssignmentFile = {
+        id: `legacy-browser-task-file-${stamp}`,
+        moduleKey: "team",
+        sourceType: "taskAssignment",
+        taskModuleKey: "retired-browser-module",
+        title: `Legacy task-assignment file ${stamp}`
+      };
+      const task = {
+        id: `legacy-browser-task-${stamp}`,
+        moduleKey: "retired-browser-module",
+        title: `Legacy browser task ${stamp}`
+      };
+      workspaceState = {
+        ...workspaceState,
+        moduleRecords: [
+          ...(Array.isArray(workspaceState.moduleRecords) ? workspaceState.moduleRecords : [])
+            .filter((record) => record.id !== moduleRecord.id),
+          moduleRecord
+        ],
+        files: [
+          ...(Array.isArray(workspaceState.files) ? workspaceState.files : [])
+            .filter((record) => ![file.id, taskAssignmentFile.id].includes(record.id)),
+          file,
+          taskAssignmentFile
+        ],
+        tasks: [
+          ...(Array.isArray(workspaceState.tasks) ? workspaceState.tasks : [])
+            .filter((record) => record.id !== task.id),
+          task
+        ]
+      };
+      workspaceRevision = `owner-revision-external-${Date.now()}`;
+      return structuredClone({ moduleRecord, file, taskAssignmentFile, task });
+    },
     setSessionActive(value) {
       sessionActive = Boolean(value);
     }
@@ -2139,6 +2236,8 @@ try {
   await refreshCoverage(page, moduleKeys);
   await verifyDurableReload(page, localSmokeApi);
   console.log("[smoke] durable reload verified");
+  await verifyLegacyBrowserRoundTrip(page, localSmokeApi);
+  console.log("[smoke] legacy browser round-trip verified");
   await refreshCoverage(page, moduleKeys);
   await testEmployeeGoogleSwitch(page, localSmokeApi);
   console.log("[smoke] employee Google switch verified");
