@@ -10,6 +10,11 @@ export const metadata = {
   },
   description:
     "B2B AI software, custom AI agents, workflow automation, AI sales automation, customer service agents, and AI operating systems for business.",
+  icons: {
+    icon: [{ url: "/logo.png", type: "image/png" }],
+    shortcut: "/logo.png",
+    apple: "/logo.png"
+  },
   keywords: [
     "custom AI agents",
     "AI business automation",
