@@ -191,7 +191,7 @@ async function collectPageCoverage(page, key) {
     formTypes: [...new Set([...document.querySelectorAll("form[data-form]")].map((element) => element.dataset.form).filter(Boolean))],
     fieldTypes: [...new Set([...document.querySelectorAll("[data-field]")].map((element) => element.dataset.field).filter(Boolean))],
     inertButtons: [...document.querySelectorAll("button")]
-      .filter((button) => !button.disabled && !button.dataset.action && !button.closest("form"))
+      .filter((button) => !button.disabled && !button.dataset.action && !button.dataset.emergencyAction && !button.closest("form"))
       .map((button) => button.textContent.trim().replace(/\s+/g, " "))
       .filter(Boolean)
   }));
@@ -1264,6 +1264,113 @@ async function testUnauthenticatedGate(browser) {
   await gateContext.close();
 }
 
+async function testResponsiveInputs(page, localSmokeApi) {
+  if (!localSmokeApi) return;
+  await go(page, "dispatch");
+  await click(page, '[data-action="quick-note"][data-key="dispatch"]');
+  await fill(page, 'form[data-form="quick-note"] input[name="title"]', `Input preservation ${stamp}`);
+  await fill(page, 'form[data-form="quick-note"] textarea[name="notes"]', "Regression test for toast expiry and navigation input.");
+  await click(page, 'form[data-form="quick-note"] button[type="submit"]');
+  const subject = page.locator('form[data-form="module-workbench"] input[name="subject"]');
+  await subject.fill("Unsaved dispatch draft");
+  const draftNode = await subject.elementHandle();
+  await waitUntil("prior write settled", async () => {
+    const stored = localSmokeApi.getWorkspaceState?.();
+    return !stored || JSON.stringify(stored).includes(`Input preservation ${stamp}`);
+  });
+  await page.waitForTimeout(500);
+  const writeCount = localSmokeApi.getWorkspaceWriteCount();
+  const search = page.locator('.sidebar [data-field="search"]');
+  await search.click();
+  const inputNode = await search.elementHandle();
+  await search.pressSequentially("dispatch", { delay: 25 });
+  if (await search.inputValue() !== "dispatch") throw new Error("Typing lost characters in module search");
+  if (!await inputNode.evaluate((node) => node.isConnected && node === document.activeElement)) {
+    throw new Error("Module search replaced the focused input");
+  }
+  if (!await draftNode.evaluate((node) => node.isConnected && node.value === "Unsaved dispatch draft")) {
+    throw new Error("Module search discarded another form draft");
+  }
+  await search.fill("");
+  await page.locator('.sidebar [data-field="category"]').selectOption("dispatch");
+  await page.locator('.sidebar [data-field="category"]').selectOption("all");
+  await page.waitForTimeout(2800);
+  if (!await draftNode.evaluate((node) => node.isConnected && node.value === "Unsaved dispatch draft")) {
+    throw new Error("Toast expiry or category filtering replaced an unsaved form");
+  }
+  if (localSmokeApi.getWorkspaceWriteCount() !== writeCount) throw new Error("View filtering triggered a shared workspace write");
+  await subject.fill("");
+  results.workflowChecks.push({ label: "Responsive inputs", text: "continuous typing keeps focus; filtering and toast expiry preserve form drafts; view changes cause no shared writes" });
+}
+
+async function testEmergencyMonitor(page, localSmokeApi) {
+  if (!localSmokeApi) return;
+  console.log("[smoke] starting emergency incident workflow");
+  await go(page, "dispatch");
+  const monitor = page.locator("[data-emergency-monitor]");
+  await monitor.getByText("No radio or dispatch feed connected.", { exact: false }).waitFor();
+  await monitor.locator("summary").click();
+  const manual = monitor.locator("[data-emergency-manual]");
+  const reference = `FD-${stamp}`;
+  await manual.locator('[name="eventId"]').fill(reference);
+  await manual.locator('[name="location"]').fill("100 Test Avenue");
+  await manual.locator('[name="occurredAt"]').fill("2026-09-19T10:30");
+  await manual.locator('[name="units"]').fill("Engine 1, Ladder 2");
+  await manual.locator('[name="summary"]').fill("Authorized dispatch report; review before assigning a crew.");
+  await manual.getByRole("button", { name: "Save incident", exact: true }).click();
+  const detail = monitor.locator("[data-emergency-detail]");
+  await detail.getByText(reference, { exact: false }).waitFor();
+  const create = detail.getByRole("button", { name: "Create dispatch record", exact: true });
+  if (!await create.isDisabled()) throw new Error("Unreviewed incident allowed dispatch creation");
+  await detail.getByRole("button", { name: "Dismiss", exact: true }).click();
+  await detail.locator(".emergency-badge").filter({ hasText: "dismissed" }).waitFor();
+  await detail.getByRole("button", { name: "Mark reviewed", exact: true }).click();
+  await detail.locator(".emergency-badge").filter({ hasText: "reviewed" }).waitFor();
+  await monitor.locator('[data-emergency-action="select"]').click();
+  await monitor.getByRole("button", { name: "Refresh feed", exact: true }).click();
+  await waitUntil("emergency refresh completed", async () => !await monitor.getByRole("button", { name: "Refresh feed", exact: true }).isDisabled());
+  await create.click();
+  await detail.getByText("Saved to dispatch workspace", { exact: true }).waitFor();
+  const incident = localSmokeApi.getEmergencyIncidents().find((item) => item.eventId === reference);
+  const workspace = localSmokeApi.getWorkspaceState();
+  const record = workspace.moduleRecords?.find((item) => item.id === incident?.linkedRecordId);
+  const file = workspace.files?.find((item) => item.sourceId === record?.id);
+  if (!record || record.sourceIncidentId !== incident.id || record.moduleKey !== "dispatch" || !file?.linkedModuleKeys?.includes("routeplanner")) {
+    throw new Error("Incident did not carry through durable dispatch records and route-planning file links");
+  }
+  await detail.getByRole("link", { name: "Open route planning", exact: true }).click();
+  await expectBody(page, "Emergency incident in route planning", record.subject);
+  await go(page, "dispatch");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.locator('[data-emergency-action="select"]').filter({ hasText: "100 Test Avenue" }).click();
+  await page.getByText("Saved to dispatch workspace", { exact: true }).waitFor();
+  const logo = page.locator('.sidebar img').first();
+  if (!await logo.evaluate((image) => image.complete && image.naturalWidth > 0)) throw new Error("Brand shield failed to load");
+  localSmokeApi.enableTestRadio();
+  await monitor.getByRole("button", { name: "Refresh feed", exact: true }).click();
+  const audio = monitor.locator("audio");
+  await audio.waitFor();
+  await audio.evaluate(async (element) => { element.loop = true; await element.play(); });
+  await waitUntil("test radio playback", () => audio.evaluate((element) => !element.paused && element.readyState >= 2));
+  await audio.evaluate((element) => element.pause());
+  await monitor.locator("summary").click();
+  await manual.locator('[name="eventId"]').fill("Unsaved incident draft");
+  const draft = await manual.locator('[name="eventId"]').elementHandle();
+  await monitor.getByRole("button", { name: "Refresh feed", exact: true }).click();
+  await waitUntil("radio inbox refresh", async () => !await monitor.getByRole("button", { name: "Refresh feed", exact: true }).isDisabled());
+  if (!await draft.evaluate((element) => element.isConnected && element.value === "Unsaved incident draft")) throw new Error("Incident refresh discarded a manual draft");
+  await monitor.locator("summary").click();
+  await monitor.scrollIntoViewIfNeeded();
+  fs.mkdirSync(new URL("../logs/", import.meta.url), { recursive: true });
+  await page.screenshot({ path: "logs/emergency-desktop.png" });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await monitor.scrollIntoViewIfNeeded();
+  if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 2)) throw new Error("Emergency monitor overflows mobile viewport");
+  await page.screenshot({ path: "logs/emergency-mobile.png" });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  results.workflowChecks.push({ label: "Emergency monitor", text: "manual entry, review, dismiss, refresh, dispatch handoff, route planning, reload, fixture audio playback/pause, draft preservation, desktop and mobile layout" });
+}
+
 async function testUnavailableStorageWriteLock(browser) {
   console.log("[smoke] starting shared-storage write-lock verification");
   const lockedContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
@@ -1648,6 +1755,14 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
   let workspaceWriteCount = 0;
   let workspaceRevision = "owner-revision-0";
   let sessionActive = true;
+  const emergencyIncidents = [];
+  let emergencySources = [];
+  const wave = Buffer.alloc(44 + 16000);
+  wave.write("RIFF", 0); wave.writeUInt32LE(wave.length - 8, 4); wave.write("WAVEfmt ", 8);
+  wave.writeUInt32LE(16, 16); wave.writeUInt16LE(1, 20); wave.writeUInt16LE(1, 22);
+  wave.writeUInt32LE(8000, 24); wave.writeUInt32LE(16000, 28); wave.writeUInt16LE(2, 32);
+  wave.writeUInt16LE(16, 34); wave.write("data", 36); wave.writeUInt32LE(16000, 40);
+  await context.route("**/smoke-radio.wav", (route) => route.fulfill({ status: 200, contentType: "audio/wav", body: wave }));
   const owner = {
     id: "smoke-owner",
     uid: "smoke-owner",
@@ -1845,6 +1960,26 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
         updatedAt: new Date().toISOString(),
         revision: workspaceRevision
       });
+    }
+    if (url.pathname === "/api/emergency/status" && method === "GET") {
+      return json(200, { success: true, configured: emergencySources.length > 0, sources: emergencySources, runtime: { available: adminConfigured, storage: "firestore" } });
+    }
+    if (url.pathname === "/api/emergency/incidents" && method === "GET") {
+      return json(200, { success: true, incidents: emergencyIncidents });
+    }
+    if (url.pathname === "/api/emergency/incidents" && method === "POST") {
+      const payload = request.postDataJSON();
+      const existing = emergencyIncidents.find((item) => item.eventId === payload.eventId);
+      if (existing) return json(200, { success: true, id: existing.id, duplicate: true });
+      const incident = { ...payload, id: String(emergencyIncidents.length + 1).padStart(64, "0"), companyId: owner.companyId, sourceLabel: "Manual report", reviewStatus: "new", receivedAt: new Date().toISOString(), linkedRecordId: null };
+      emergencyIncidents.unshift(incident);
+      return json(201, { success: true, id: incident.id, duplicate: false });
+    }
+    if (url.pathname.startsWith("/api/emergency/incidents/") && method === "PATCH") {
+      const incident = emergencyIncidents.find((item) => item.id === url.pathname.split("/").at(-1));
+      if (!incident) return json(404, { success: false, message: "Incident not found" });
+      Object.assign(incident, request.postDataJSON());
+      return json(200, { success: true, incident });
     }
     if (url.pathname === "/api/rbac/users" && method === "POST") {
       const payload = request.postDataJSON() || {};
@@ -2119,6 +2254,8 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
 
   return {
     getWorkspaceState: () => workspaceState,
+    getEmergencyIncidents: () => emergencyIncidents,
+    enableTestRadio: () => { emergencySources = [{ id: "test-radio", label: "Test dispatch radio", area: "Local fixture only", streamUrl: `${origin}/smoke-radio.wav` }]; },
     getWorkspaceWriteCount: () => workspaceWriteCount,
     injectLegacyRecords() {
       const moduleRecord = {
@@ -2226,6 +2363,8 @@ let smokePassed = false;
 try {
   const moduleKeys = await safeModuleSweep(page);
   console.log("[smoke] module sweep complete");
+  await testResponsiveInputs(page, localSmokeApi);
+  await testEmergencyMonitor(page, localSmokeApi);
   await exerciseDataFieldControls(page);
   await runWorkflow(page, localSmokeApi);
   console.log("[smoke] linked workflow complete");
@@ -2290,6 +2429,8 @@ try {
   if (consoleErrors.length || failedResponses.length) {
     throw new Error(`Browser errors during smoke: ${[...new Set([...consoleErrors, ...failedResponses])].join(" | ")}`);
   }
+  fs.mkdirSync(new URL("../logs/", import.meta.url), { recursive: true });
+  fs.writeFileSync(new URL("../logs/browser-workflow-smoke.json", import.meta.url), JSON.stringify({ ok: true, ...results }, null, 2));
   await new Promise((resolve) => {
     process.stdout.write(`${JSON.stringify({ ok: true, ...results }, null, 2)}\n`, resolve);
   });

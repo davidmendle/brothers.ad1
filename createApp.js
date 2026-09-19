@@ -1345,6 +1345,13 @@ const upload = multer({
 const intakeJsonParser = express.json({ limit: "5mb" });
 const intakeUrlencodedParser = express.urlencoded({ extended: true });
 const appJsonParser = express.json({ limit: "5mb" });
+const emergencyJsonParser = express.json({
+  limit: "32kb",
+  inflate: false,
+  verify(request, _response, buffer) {
+    if (request.path.startsWith("/api/emergency/webhooks/")) request.rawBody = Buffer.from(buffer);
+  }
+});
 const appUrlencodedParser = express.urlencoded({ extended: true });
 
 function isMultipartInsuranceIntakeRequest(request) {
@@ -1535,6 +1542,16 @@ function createApp() {
   app.set("trust proxy", 1);
   app.use((request, response, next) => {
     if (isMultipartInsuranceIntakeRequest(request)) return next();
+    if (request.path.startsWith("/api/emergency/")) {
+      return emergencyJsonParser(request, response, (error) => {
+        if (error && [400, 413, 415].includes(error.status)) {
+          const messages = { 400: "Invalid incident JSON.", 413: "Incident payload exceeds 32 KiB.", 415: "Use uncompressed UTF-8 application/json." };
+          response.set("Cache-Control", "no-store");
+          return jsonError(response, error.status, messages[error.status]);
+        }
+        return next(error);
+      });
+    }
     return appJsonParser(request, response, next);
   });
   app.use((request, response, next) => {

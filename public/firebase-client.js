@@ -2,6 +2,7 @@
 // Bare imports like "firebase/app" require a bundler that this static Vercel app does not use.
 import { initializeApp, getApps } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js";
 import { getAuth, GoogleAuthProvider, signInWithPopup } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-auth.js";
+import { requestJson } from "./request-json.js";
 
 let firebaseConfigPromise;
 let firebaseApp;
@@ -10,9 +11,12 @@ let googleProvider;
 
 export async function loadFirebaseConfig() {
   if (!firebaseConfigPromise) {
-    firebaseConfigPromise = fetch("/api/auth/config")
-      .then((response) => response.json())
-      .then((result) => result.firebase || { enabled: false });
+    firebaseConfigPromise = requestJson("/api/auth/config")
+      .then(({ response, result }) => {
+        if (!response.ok) throw new Error(result.message || "Authentication configuration is unavailable.");
+        return result.firebase || { enabled: false };
+      })
+      .catch((error) => { firebaseConfigPromise = null; throw error; });
   }
   return firebaseConfigPromise;
 }
@@ -54,12 +58,11 @@ export async function loginWithFirebaseGoogle(options = {}) {
   }
   const credential = await signInWithPopup(auth, googleProvider);
   const idToken = await credential.user.getIdToken(true);
-  const response = await fetch("/api/auth/session/login", {
+  const { response, result } = await requestJson("/api/auth/session/login", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(buildSessionPayload(idToken, options))
   });
-  const result = await response.json().catch(() => ({}));
   if (!response.ok || !result.success) {
     throw new Error(result.message || "Unable to establish the OS session.");
   }
@@ -67,18 +70,18 @@ export async function loginWithFirebaseGoogle(options = {}) {
 }
 
 export async function logoutFirebaseSession() {
-  await fetch("/api/auth/session/logout", {
+  const { response } = await requestJson("/api/auth/session/logout", {
     method: "POST",
     headers: { "content-type": "application/json" }
   });
+  if (!response.ok) throw new Error("Sign out could not be confirmed. Please try again.");
   if (firebaseAuth) {
     await firebaseAuth.signOut().catch(() => undefined);
   }
 }
 
 export async function fetchOsSession() {
-  const response = await fetch("/api/auth/session");
-  const result = await response.json().catch(() => ({}));
+  const { response, result } = await requestJson("/api/auth/session");
   if (!response.ok || !result.success) {
     return null;
   }

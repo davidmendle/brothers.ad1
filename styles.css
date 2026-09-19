@@ -5004,3 +5004,39 @@ details.sketch-tool-panel[open] > summary {
     grid-template-columns: 1fr;
   }
 }
+/* Dispatch incident monitoring shares the office workspace, with bounded inbox scrolling. */
+.emergency-monitor { padding: 24px 0; border-top: 1px solid #d3dce3; border-bottom: 1px solid #d3dce3; }
+.emergency-monitor h2 { font-size: 22px; }
+.emergency-monitor h3 { font-size: 18px; margin: 0 0 16px; }
+.emergency-monitor [data-emergency-status] { font-size: 14px; color: #455962; margin: 12px 0 18px; }
+.emergency-monitor [data-emergency-status].emergency-error { color: #a13434; }
+.emergency-layout { display: grid; grid-template-columns: minmax(220px, 2fr) minmax(0, 3fr); min-height: 220px; gap: 20px; }
+.emergency-list { max-height: 440px; overflow-y: auto; border: 1px solid #d3dce3; border-radius: 6px; background: #fff; }
+.emergency-incident { display: flex; flex-direction: column; gap: 8px; width: 100%; border: 0; border-bottom: 1px solid #d3dce3; border-radius: 0; background: #fff; color: #22353a; padding: 14px; text-align: left; box-shadow: none; overflow-wrap: anywhere; }
+.emergency-incident:hover, .emergency-incident.selected { background: #eaf5f0; color: #163f32; }
+.emergency-incident-heading { display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.emergency-incident small { font-size: 12px; color: #53646b; font-weight: 400; }
+.emergency-badge { font-size: 12px; text-transform: capitalize; color: #29604a; }
+.emergency-detail { min-width: 0; padding: 4px 0; }
+.emergency-facts { margin: 0; }
+.emergency-facts div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 12px; margin: 8px 0; }
+.emergency-facts dt { color: #586a73; font-size: 13px; }
+.emergency-facts dd { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.emergency-summary { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
+.emergency-review { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 16px 0; }
+.emergency-detail form { display: grid; gap: 12px; }
+.emergency-detail label, .emergency-manual label { display: grid; gap: 6px; min-width: 0; font-size: 13px; }
+.emergency-empty { margin: 20px; color: #66757d; font-size: 14px; }
+.emergency-source { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 12px 0; margin-bottom: 12px; border-bottom: 1px solid #d3dce3; }
+.emergency-source > div { display: grid; gap: 4px; }
+.emergency-source span { font-size: 13px; color: #586a73; }
+.emergency-source audio { height: 38px; max-width: 100%; }
+.emergency-manual { border-top: 1px solid #d3dce3; padding-top: 16px; margin-top: 20px; }
+.emergency-manual summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+.emergency-manual form { margin-top: 16px; }
+.emergency-manual .full { grid-column: 1 / -1; }
+@media (max-width: 700px) {
+  .emergency-layout { grid-template-columns: minmax(0, 1fr); }
+  .emergency-list { max-height: 280px; }
+  .emergency-monitor .form-grid { grid-template-columns: minmax(0, 1fr); }
+}

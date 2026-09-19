@@ -6,13 +6,17 @@ import {
   loginWithFirebaseGoogle,
   logoutFirebaseSession
 } from "./firebase-client.js";
-import { brothersLogoDataUrl } from "./logo-data.js";
 import { normalizeSectionButtonUrl } from "./ui-security.js";
+import { requestJson } from "./request-json.js";
+import { createEmergencyMonitor } from "./emergency-monitor.js";
 
 const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES : [];
 const applications = Array.isArray(window.BROTHERS_APPLICATIONS) ? window.BROTHERS_APPLICATIONS : [];
 const applicationRegistry = window.BROTHERS_APPLICATION_REGISTRY || {};
 const storageKey = "brothers-os-workspace-v2";
+const viewStorageKey = `${storageKey}-view`;
+let viewSaveTimer;
+let moduleSearchFrame;
 const remoteWorkspaceFields = [
   "files", "moduleRecords", "queue", "activity", "standardsOutputs", "learnedJargon",
   "equipmentDeployments", "dryLogs", "jobBoards", "contacts", "branches",
@@ -44,7 +48,7 @@ const durableMutationActions = new Set([
   "clock-out", "reset-user-permissions", "toggle-user-disabled", "delete-user",
   "revoke-employee-invitation", "complete-module-record"
 ]);
-const brandLogoPath = brothersLogoDataUrl;
+const brandLogoPath = "/brothers-shield.png";
 const insuranceStatuses = ["all", "new", "reviewed", "in-progress", "completed", "rejected"];
 const rbacActionKeys = [
   "manageUsers",
@@ -1088,6 +1092,17 @@ let state = loadState();
 let sketchUndoStack = [];
 state.activeKey = getRouteKey() || state.activeKey || "daily";
 applyHighestPricingPolicy();
+const emergencyMonitor = createEmergencyMonitor({
+  request: apiRequest,
+  getContext: () => ({
+    identity: `${state.authSession?.uid || ""}:${state.authSession?.companyId || ""}`,
+    allowed: ["super_admin", "business_owner"].includes(currentRoleId()) && isModuleAllowedByAccess("dispatch"),
+    writable: workspaceWritesReady(),
+    contacts: canDo("viewCustomerDirectory") ? state.contacts : []
+  }),
+  createDispatch: createEmergencyDispatch,
+  notify: setToast
+});
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -1302,8 +1317,13 @@ function normalizeTaskRecord(task, teamMembers = []) {
 function loadState() {
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey) || "null");
-    if (!saved || typeof saved !== "object") return clone(defaultState);
-    return normalizeState({ ...clone(defaultState), ...saved });
+    let view = {};
+    try { view = JSON.parse(localStorage.getItem(viewStorageKey) || "null") || {}; } catch { /* Ignore malformed optional preferences. */ }
+    const preferences = {};
+    for (const key of ["activeKey", "category", "search", "selectedFileId"]) {
+      if (typeof view[key] === "string") preferences[key] = view[key].slice(0, 250);
+    }
+    return normalizeState({ ...clone(defaultState), ...(saved || {}), ...preferences });
   } catch {
     return clone(defaultState);
   }
@@ -1746,6 +1766,25 @@ function persist() {
   scheduleWorkspaceSync();
 }
 
+function flushViewPreferences() {
+  window.clearTimeout(viewSaveTimer);
+  try {
+    localStorage.setItem(viewStorageKey, JSON.stringify({
+      activeKey: state.activeKey,
+      category: state.category,
+      search: state.search,
+      selectedFileId: state.selectedFileId
+    }));
+  } catch {
+    // Navigation preferences are optional; operational saves report their own errors.
+  }
+}
+
+function saveViewPreferences() {
+  window.clearTimeout(viewSaveTimer);
+  viewSaveTimer = window.setTimeout(flushViewPreferences, 200);
+}
+
 function moduleByKey(key) {
   return modules.find((module) => module.key === key);
 }
@@ -1840,7 +1879,7 @@ function routeToModule(key) {
   state.activeKey = key;
   state.mobileOpen = false;
   state.selectedFileId = state.files.find((file) => file.moduleKey === key)?.id || null;
-  persist();
+  saveViewPreferences();
   if (window.location.hash !== `#module/${key}`) {
     window.location.hash = `module/${key}`;
   }
@@ -1894,10 +1933,18 @@ function addActivity(text) {
 
 function setToast(text) {
   state.toast = text;
+  let toast = app.querySelector(".toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.className = "toast";
+    toast.setAttribute("role", "status");
+    app.append(toast);
+  }
+  toast.textContent = text;
   window.clearTimeout(setToast.timer);
   setToast.timer = window.setTimeout(() => {
     state.toast = "";
-    render();
+    app.querySelector(".toast")?.remove();
   }, 2600);
 }
 
@@ -2094,6 +2141,25 @@ function filteredModules() {
 
 function availableModulesForDirectory() {
   return modules.filter((module) => isModuleAllowedByAccess(module.key));
+}
+
+function refreshModuleNavigation() {
+  const visible = filteredModules();
+  app.querySelectorAll(".nav-list").forEach((nav) => {
+    nav.innerHTML = visible.map((module) => `
+      <a class="nav-button${state.activeKey === module.key ? " active" : ""}" href="#module/${module.key}" data-action="set-active" data-key="${module.key}">
+        <span>${escapeHtml(tabConfigByKey(module.key)?.label || module.label)}</span>
+        <small>${escapeHtml(categoryLabels[module.category] || module.category)}</small>
+      </a>`).join("");
+  });
+  app.querySelectorAll(".drawer-list").forEach((nav) => {
+    nav.innerHTML = visible.map((module) => `<a href="#module/${module.key}" data-action="set-active" data-key="${module.key}">${escapeHtml(tabConfigByKey(module.key)?.label || module.label)}<span>${escapeHtml(categoryLabels[module.category] || module.category)}</span></a>`).join("");
+  });
+  app.querySelectorAll("[data-module-count]").forEach((node) => { node.textContent = visible.length; });
+  app.querySelectorAll('[data-field="search"]').forEach((input) => {
+    if (input !== document.activeElement && input.value !== state.search) input.value = state.search;
+  });
+  saveViewPreferences();
 }
 
 function taskAssignableModules() {
@@ -2775,7 +2841,7 @@ function createFile(data) {
   const linkedModuleKeys = normalizeModuleKeyList(data.linkedModuleKeys || data.linkedModules || [], module.key);
   const linkedLabels = linkedModuleKeys.map((key) => moduleByKey(key)?.label || key);
   const file = {
-    id: createId("F"),
+    id: data.id || createId("F"),
     moduleKey: module.key,
     linkedModuleKeys,
     sourceType: data.sourceType || "",
@@ -4588,14 +4654,13 @@ function csvValues(value) {
 }
 
 async function apiRequest(url, options = {}) {
-  const response = await fetch(url, {
+  const { response, result } = await requestJson(url, {
+    ...options,
     headers: {
       "content-type": "application/json",
       ...(options.headers || {})
-    },
-    ...options
+    }
   });
-  const result = await response.json().catch(() => ({}));
   if (!response.ok || result.success === false) {
     throw new Error(result.message || `Request failed: ${response.status}`);
   }
@@ -7473,7 +7538,7 @@ function updateModuleRecordStatus(recordId, status) {
   render();
 }
 
-function createWorkbenchRecord(formData) {
+function createWorkbenchRecord(formData, options = {}) {
   if (!canEditModuleWorkflowRecords()) {
     setToast("Workflow records are managed by the office");
     return render();
@@ -7485,13 +7550,14 @@ function createWorkbenchRecord(formData) {
     value: String(formData.get(field.name) || "").trim()
   }));
   const subject = values.find((item) => item.label === config.subjectLabel)?.value || String(formData.get("subject") || "").trim();
-  const recordId = createId("REC");
+  const recordId = options.recordId || createId("REC");
   const now = new Date().toISOString();
   const record = {
     id: recordId,
     moduleKey: module.key,
     linkedModuleKeys: config.links,
     recordType: config.fileType,
+    ...(options.sourceIncidentId ? { sourceIncidentId: options.sourceIncidentId, contactId: options.contactId || "" } : {}),
     subject: subject || `${module.label} record`,
     fields: Object.fromEntries(values.filter((item) => item.value).map((item) => [item.label, item.value])),
     owner: String(formData.get("owner") || "Office").trim() || "Office",
@@ -7519,6 +7585,7 @@ function createWorkbenchRecord(formData) {
   ].join("\n");
   state.moduleRecords = [record, ...(state.moduleRecords || [])];
   const file = createFile({
+    ...(options.sourceIncidentId ? { id: `F-ER-${options.sourceIncidentId}` } : {}),
     moduleKey: module.key,
     linkedModuleKeys: config.links,
     sourceType: "moduleRecord",
@@ -7534,6 +7601,37 @@ function createWorkbenchRecord(formData) {
   });
   record.fileId = file.id;
   persist();
+  return record;
+}
+
+async function createEmergencyDispatch(incident, contactId) {
+  if (!workspaceWritesReady()) throw new Error("Shared storage must be connected before creating dispatch records.");
+  if (!["super_admin", "business_owner"].includes(currentRoleId()) || !isModuleAllowedByAccess("dispatch")) {
+    throw new Error("Dispatch access is required.");
+  }
+  if (incident.reviewStatus !== "reviewed") throw new Error("Review the incident before creating a dispatch record.");
+  const contact = contactId && canDo("viewCustomerDirectory") ? state.contacts.find((item) => item.id === contactId) : null;
+  if (contactId && !contact) throw new Error("The selected customer is no longer available in your workspace.");
+  const identity = state.authSession?.uid;
+  const recordId = `REC-ER-${incident.id}`;
+  if (!(state.moduleRecords || []).some((record) => record.id === recordId)) {
+    const data = new FormData();
+    data.set("moduleKey", "dispatch");
+    data.set("subject", `${incident.type} incident: ${incident.location}`);
+    data.set("owner", currentUserName() || "Office");
+    data.set("priority", "High");
+    data.set("crew", "Awaiting assignment");
+    data.set("notes", [incident.summary, `Incident source: ${incident.sourceLabel} / ${incident.eventId}`, `Reported: ${incident.occurredAt}`, contact ? `Existing customer: ${contact.name} (${contact.id})` : "No customer linked"].filter(Boolean).join("\n"));
+    createWorkbenchRecord(data, { recordId, sourceIncidentId: incident.id, contactId: contact?.id });
+  }
+  try {
+    await syncWorkspaceState({ force: true });
+    if (identity !== state.authSession?.uid) throw new Error("Your session changed. Reload the incident workspace.");
+  } catch (error) {
+    if (identity === state.authSession?.uid) await recoverRejectedWorkspaceState(error);
+    throw error;
+  }
+  return recordId;
 }
 
 function pinPosition(deployment, bounds) {
@@ -7855,12 +7953,14 @@ async function submitTicketSignoff(formData) {
 }
 
 function render() {
+  const previousMonitor = app.querySelector("[data-emergency-monitor]");
   const localPreviewAllowed = state.firebase.ready
     && ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)
     && (!state.firebase.enabled || isLocalSmokePreview());
   if (!state.authSession && !localPreviewAllowed) {
     app.className = "app-root auth-shell";
     app.innerHTML = renderAuthGate();
+    emergencyMonitor.detach();
     return;
   }
 
@@ -7884,6 +7984,9 @@ function render() {
     ${renderSettingsDock()}
     ${state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
   `;
+  const monitorHost = app.querySelector("[data-emergency-monitor]");
+  if (previousMonitor && monitorHost) monitorHost.replaceWith(previousMonitor);
+  emergencyMonitor.attach(previousMonitor && monitorHost ? previousMonitor : monitorHost);
   if (state.modal) queueMicrotask(activateModalAccessibility);
 }
 
@@ -8039,7 +8142,7 @@ function renderSidebar() {
         <div class="sidebar-nav-shell">
           <div class="sidebar-nav-header">
             <span class="sidebar-section-label">All modules</span>
-            <strong>${visibleModules.length}</strong>
+            <strong data-module-count>${visibleModules.length}</strong>
           </div>
           <nav class="nav-list" aria-label="Modules">
           ${visibleModules
@@ -8061,7 +8164,7 @@ function renderSidebar() {
           </div>
           <div class="sidebar-status">
             <span>Visible modules</span>
-            <strong>${visibleModules.length}</strong>
+            <strong data-module-count>${visibleModules.length}</strong>
           </div>
         </div>
       </div>
@@ -8326,6 +8429,7 @@ function renderScreen(module) {
       </div>
     </section>
     ${module.key === "daily" ? renderDashboardSummary() : ""}
+    ${module.key === "dispatch" && ["super_admin", "business_owner"].includes(currentRoleId()) ? '<section class="emergency-monitor" data-emergency-monitor></section>' : ""}
     ${usesStandardsAI(module) ? renderStandardsAI(module) : ""}
     ${module.key === "daily" ? "" : renderModuleWorkbench(module)}
     ${renderQueue(module.key)}
@@ -12381,7 +12485,7 @@ function renderMobileDrawer() {
           </div>
         </div>
         <div class="panel-head">
-          <div><h2>Modules</h2><p>${visibleModules.length} available in this workspace view</p></div>
+          <div><h2>Modules</h2><p><span data-module-count>${visibleModules.length}</span> available in this workspace view</p></div>
           <button type="button" data-action="mobile-close">Close</button>
         </div>
         <div class="drawer-search">
@@ -13371,15 +13475,14 @@ document.addEventListener("input", (event) => {
   if (!field) return;
   if (field.dataset.field === "search") {
     state.search = field.value;
-    render();
+    window.cancelAnimationFrame(moduleSearchFrame);
+    moduleSearchFrame = window.requestAnimationFrame(refreshModuleNavigation);
   }
   if (field.dataset.field === "ai-copilot-query") {
     state.aiCopilotQuery = field.value;
-    persist();
   }
   if (field.dataset.field === "insurance-search") {
     state.insuranceFilters.search = field.value;
-    persist();
   }
 });
 
@@ -13412,8 +13515,7 @@ document.addEventListener("change", (event) => {
   }
   if (field.dataset.field === "category") {
     state.category = field.value;
-    persist();
-    render();
+    refreshModuleNavigation();
   }
   if (field.dataset.field === "clock-task") {
     const task = state.tasks.find((item) => item.id === field.value);
@@ -13451,7 +13553,6 @@ document.addEventListener("change", (event) => {
   }
   if (field.dataset.field === "insurance-status") {
     state.insuranceFilters.status = field.value;
-    persist();
   }
 });
 
@@ -13462,6 +13563,7 @@ window.addEventListener("hashchange", () => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "hidden" || workspaceHydrating) return;
+  flushViewPreferences();
   window.clearTimeout(workspaceSyncTimer);
   workspaceSyncTimer = null;
   syncWorkspaceState().catch(async (error) => {
@@ -13469,6 +13571,8 @@ document.addEventListener("visibilitychange", () => {
     await recoverRejectedWorkspaceState(error);
   });
 });
+
+window.addEventListener("pagehide", flushViewPreferences);
 
 if (!window.location.hash) {
   window.history.replaceState(null, "", "#module/daily");
