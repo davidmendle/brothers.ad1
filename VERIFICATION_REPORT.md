@@ -41,6 +41,12 @@ Pricing extraction is not a complete proprietary Xactimate ESX interpreter or OC
 
 Workspace limits remain explicit: 2,500 records per array, 3 MB per request and the existing transaction write cap. No large-scale load test, legal/franchise determination or claim of market-leading completeness is made by this report.
 
+## Release Attempt
+
+The repairs were pushed to GitHub `main` as commit `389dbda3078bf4bc82820f0e1f137aba40e128d4`. A production deployment request for the verified `brothers-ad` project and Brothers Restoration Services team was rejected on 2026-11-18 with HTTP 402 `resource_creation_blocked`: Vercel reported the account suspended and required a valid payment method. No new production deployment was created. The custom domain still returned `DEPLOYMENT_DISABLED`.
+
+The first GitHub Actions run stopped during browser installation: `ubuntu-latest` selected Ubuntu 26.04, unsupported by the pinned Playwright 1.55.1. The workflow is now pinned to supported Ubuntu 24.04; application tests were not removed or weakened. Remote CI results are available in the repository's Actions history.
+
 ## Sources
 
 - [Vercel deployment-disabled diagnosis](https://vercel.com/docs/errors/deployment_disabled)
