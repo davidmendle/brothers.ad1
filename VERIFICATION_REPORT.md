@@ -9,6 +9,7 @@ Date: 2026-11-18. Repository: `davidmendle/brothers.ad1`. Production project: `b
 - New jobs select an employer profile matching employee invitations. Job tasks and support files retain ownership instead of becoming unrelated records. Existing jobs are not automatically reassigned.
 - Dispatch creation focuses the structured form and awaits a shared-storage acknowledgment. Rejected saves retain the form draft.
 - Equipment placement, return, rental duration, office billing review and invoice creation share the same record identity. Active assets cannot be deployed twice in the same company/contractor inventory. Field users cannot forge billing fields.
+- Equipment controls remain disabled until the shared save and form refresh finish, preventing the next edit from being overwritten by a delayed acknowledgment. Failure paths restore the prior control state.
 - Job summaries show assigned work, recorded hours and equipment still out. Pickup requests remain active until a return is recorded.
 - Server validation rejects inconsistent job references and unauthorized contractor/franchise scope. Unchanged historical records can round-trip without retroactively rewriting their history.
 - Employee writes inherit the exact scope of persisted, authorized assignments, including branch-only jobs; unknown assignments and mismatched scope are rejected. New job/task forms wait for server acknowledgment before reporting success.
@@ -18,18 +19,19 @@ Date: 2026-11-18. Repository: `davidmendle/brothers.ad1`. Production project: `b
 
 | Check | Result |
 | --- | --- |
-| Full unit/router suite | 574 tests passed across 23 files (`pnpm test`). |
+| Full unit/router suite | 576 tests passed across 23 files (`pnpm test`). |
 | Next.js production build | Passed (`pnpm build`, Next.js 16.4.6). Nonblocking mixed-module/Express static-analysis warnings remain; local blog rendering falls back when Firebase is absent. |
 | Real local API authentication | Unauthenticated `/api/workspace-state` and `/api/rbac/context` requests returned HTTP 401 with no workspace data. |
-| Browser workflow | Two final successful runs, including an independent repeat against the local production build. Each covered 70 modules, 81 action types, 49 form types and 13 field controls; 41 screenshots were captured per run. No unexpected browser errors or failed responses were recorded. |
+| Browser workflow | Repeated successful runs against the local production build. The latest run, including the delayed-acknowledgment regression, covered 70 modules, 81 action types, 49 form types and 13 field controls; 43 screenshots were captured. No unexpected browser errors or failed responses were recorded. |
 | Rejected saves and mobile layout | Eight rejected-save checks retained drafts without false success. Linked workflows and reload checks passed. The mobile time clock fits a 390px viewport; its wide table scrolls internally. |
+| Delayed equipment acknowledgment | An accepted write was held before its response. Equipment inputs remained disabled until the fresh UI acknowledgment; the next rate edit retained the same invoice ID and updated two days at $100 to $200. |
 | Production HTTP | `https://brothers.ad/api/health` returned HTTP 402 with `X-Vercel-Error: DEPLOYMENT_DISABLED`. |
 | Production Firebase Admin | Required Admin/OIDC credentials were absent in Vercel environment-key inspection. Google Cloud requires account-owner reauthentication before configuration can be verified. |
 | Production dependency audit | No critical/high/low findings; two moderate transitive findings remain in optional Firebase/Google dependencies (`glob` and `minimatch`). |
 
 Browser screenshots and detailed run output are in ignored local `logs/`; these are test artifacts, not customer records. Browser API interception is explicitly labeled in the smoke report and does not establish production database, Google OAuth, email or payment-provider success. Router tests use an in-memory Firestore fixture.
 
-Coverage counts refer to distinct action/form/control types, not proof that every possible button instance, permission combination or customer dataset works. An earlier development smoke run failed to find an assigned photo task; this did not recur in either final run. Real employee photo uploads remain a production acceptance check.
+Coverage counts refer to distinct action/form/control types, not proof that every possible button instance, permission combination or customer dataset works. An earlier development smoke run failed to find an assigned photo task; this did not recur in the successful local verification runs. Real employee photo uploads remain a production acceptance check.
 
 ## Release Limits
 
@@ -46,6 +48,8 @@ Workspace limits remain explicit: 2,500 records per array, 3 MB per request and 
 The repairs were pushed to GitHub `main` as commit `389dbda3078bf4bc82820f0e1f137aba40e128d4`. A production deployment request for the verified `brothers-ad` project and Brothers Restoration Services team was rejected on 2026-11-18 with HTTP 402 `resource_creation_blocked`: Vercel reported the account suspended and required a valid payment method. No new production deployment was created. The custom domain still returned `DEPLOYMENT_DISABLED`.
 
 The first GitHub Actions run stopped during browser installation: `ubuntu-latest` selected Ubuntu 26.04, unsupported by the pinned Playwright 1.55.1. The workflow is now pinned to supported Ubuntu 24.04; application tests were not removed or weakened. Remote CI results are available in the repository's Actions history.
+
+The first Ubuntu 24.04 run passed its 574 unit/router tests and production build, then exposed an invoice-edit timing failure in the browser workflow. Equipment controls now remain locked through acknowledgment and rendering. Two additional unit tests and a deterministic delayed-response browser regression cover the correction; final remote rerun status is recorded in GitHub Actions.
 
 ## Sources
 

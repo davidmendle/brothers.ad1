@@ -927,6 +927,82 @@ async function testPricingUploads(page, api) {
   results.workflowChecks.push({ label: "Pricing upload and review", text: "real PDF parser; malformed PDF rejected without writes; duplicate fractional CSV rows total 210; partial import stages until confirm; discard writes nothing; reload retains saved imports" });
 }
 
+function equipmentStateSnapshot(workspace = {}) {
+  const deployments = (workspace.equipmentDeployments || []).filter((item) => item.assetTag === ids.assetTag);
+  const deploymentIds = new Set(deployments.map((item) => item.id));
+  const invoiceIds = new Set(deployments.map((item) => item.invoiceId).filter(Boolean));
+  const files = (workspace.files || []).filter((item) => deploymentIds.has(item.sourceId) || invoiceIds.has(item.id));
+  return { deployments, files };
+}
+
+async function saveEquipmentAndWait(page, api, selector, marker, successMessage, whilePending) {
+  await waitForWorkspaceQuiescence(page, api);
+  results.equipmentStage = `${successMessage}: submitting`;
+  const previousControl = await page.locator(selector).elementHandle();
+  if (!previousControl) throw new Error(`Equipment save control is missing: ${selector}`);
+  const responseResult = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/workspace-state"
+    && response.request().method() === "PUT" && response.status() === 200
+    && response.request().postData()?.includes(marker)).then((response) => ({ response }), (error) => ({ error }));
+  try {
+    await click(page, selector);
+    if (whilePending) await whilePending();
+    const outcome = await responseResult;
+    if (outcome.error) throw outcome.error;
+    const transportError = await outcome.response.finished();
+    if (transportError) throw transportError;
+    results.equipmentStage = `${successMessage}: awaiting fresh unlocked UI`;
+    // The same toast can remain from the preceding save; require this operation's rerender too.
+    await waitUntil(`${successMessage} fresh UI acknowledgment`, async () => !await previousControl.evaluate((element) => element.isConnected)
+      && await page.locator('form[data-form^="equipment-"][aria-busy="true"]').count() === 0
+      && await page.locator(".toast").innerText() === successMessage);
+    results.equipmentStage = `${successMessage}: acknowledged`;
+  } finally { await previousControl.dispose(); }
+}
+
+async function testDelayedEquipmentInvoiceAcknowledgment(page, api, cardSelector, deploymentId, invoiceId) {
+  await waitForWorkspaceQuiescence(page, api);
+  const writesBefore = api.getWorkspaceWriteCount();
+  const hold = api.holdWorkspaceAcknowledgmentContaining(deploymentId);
+  const billingForm = page.locator(`${cardSelector} form[data-form="equipment-billing"]`);
+  const dailyRate = billingForm.locator('[name="dailyRate"]');
+  try {
+    await saveEquipmentAndWait(page, api, `${cardSelector} [data-action="create-equipment-invoice"]`, deploymentId, "Equipment invoice saved", async () => {
+      await waitUntil("repeated invoice request held before acknowledgment", () => hold.received);
+      results.equipmentStage = "Repeated equipment invoice: acknowledgment held";
+      const controls = await page.locator('form[data-form^="equipment-"], [data-action="create-equipment-invoice"]').evaluateAll((elements) => elements.map((element) => ({
+        form: element.dataset.form || "", action: element.dataset.action || "", ariaBusy: element.getAttribute("aria-busy"),
+        controls: [...(element.matches("form") ? element.querySelectorAll('input:not([type="hidden"]), select, textarea, button') : [element])]
+          .filter((control) => control.getClientRects().length)
+          .map((control) => ({ name: control.name || control.dataset.action || control.textContent.trim(), disabled: control.matches(":disabled") }))
+      })));
+      results.equipmentPendingControls = controls;
+      if (!hold.received || hold.released || api.getWorkspaceWriteCount() !== writesBefore + 1) {
+        throw new Error("Delayed invoice fixture did not stop exactly one accepted write before its acknowledgment");
+      }
+      if (!await dailyRate.isDisabled() || await dailyRate.isEditable() || await billingForm.getAttribute("aria-busy") !== "true"
+        || controls.some((entry) => entry.form && entry.ariaBusy !== "true")
+        || controls.some((entry) => entry.controls.some((control) => !control.disabled))) {
+        throw new Error(`Equipment controls accept edits before the invoice acknowledgment: ${JSON.stringify(controls)}`);
+      }
+      if (await dailyRate.inputValue() !== "95" || api.getWorkspaceState().files.find((item) => item.id === invoiceId)?.amount !== 190) {
+        throw new Error("Pending repeated invoice changed the reviewed rate or amount");
+      }
+      await captureResponsiveEvidence(page, "equipment-invoice-pending-ack", billingForm);
+      if (!await dailyRate.isDisabled() || await billingForm.getAttribute("aria-busy") !== "true") {
+        throw new Error("Equipment controls unlocked during responsive rendering before acknowledgment");
+      }
+      hold.release();
+    });
+  } finally { hold.release(); }
+  if (await dailyRate.isDisabled() || !await dailyRate.isEditable()
+    || await billingForm.getAttribute("aria-busy") === "true"
+    || await page.locator(`${cardSelector} [data-action="create-equipment-invoice"]`).isDisabled()
+    || await dailyRate.inputValue() !== "95") {
+    throw new Error("The fresh equipment billing controls did not unlock with the acknowledged rate");
+  }
+  results.workflowChecks.push({ label: "Delayed equipment invoice acknowledgment", text: "accepted write held before response; all equipment controls disabled and forms busy; fresh controls unlocked only after acknowledgment" });
+}
+
 async function testEquipmentLifecycle(page, api) {
   await go(page, "equipment");
   const formSelector = 'form[data-form="equipment-deployment"]';
@@ -955,8 +1031,7 @@ async function testEquipmentLifecycle(page, api) {
   await fillDeployment();
   await captureResponsiveEvidence(page, "equipment-deployment-form", page.locator(formSelector));
   await rejectFormSave(page, api, "equipment-deployment", ids.equipmentName, draft, /equipment deployment saved/i);
-  await click(page, `${formSelector} button[type="submit"]`);
-  await page.locator(".toast").filter({ hasText: "Equipment deployment saved" }).waitFor();
+  await saveEquipmentAndWait(page, api, `${formSelector} button[type="submit"]`, ids.equipmentName, "Equipment deployment saved");
   const deployment = api.getWorkspaceState().equipmentDeployments.find((item) => item.assetTag === ids.assetTag);
   if (!deployment || deployment.status !== "Deployed" || deployment.rentalDays !== 0 || deployment.invoiceId) {
     throw new Error("Equipment deployment did not persist as active and uninvoiced");
@@ -986,8 +1061,7 @@ async function testEquipmentLifecycle(page, api) {
   await rejectFormSave(page, api, "equipment-return", returnNotes, {
     returnedAt: dates.returnedAt, returnNotes
   }, /equipment return saved/i, `${cardSelector} form[data-form="equipment-return"]`);
-  await click(page, `${cardSelector} form[data-form="equipment-return"] button[type="submit"]`);
-  await page.locator(".toast").filter({ hasText: "Equipment return saved" }).waitFor();
+  await saveEquipmentAndWait(page, api, `${cardSelector} form[data-form="equipment-return"] button[type="submit"]`, deployment.id, "Equipment return saved");
   const returned = api.getWorkspaceState().equipmentDeployments.find((item) => item.id === deployment.id);
   if (returned.status !== "Returned" || returned.rentalDays !== 2 || !returned.returnedAt) {
     throw new Error(`Equipment return did not compute two rental days: ${JSON.stringify(returned)}`);
@@ -1002,18 +1076,21 @@ async function testEquipmentLifecycle(page, api) {
   await rejectFormSave(page, api, "equipment-billing", billingInvoiceNumber, {
     dailyRate: "95", invoiceNumber: billingInvoiceNumber, billable: true
   }, /equipment billing saved/i, `${cardSelector} form[data-form="equipment-billing"]`);
-  await click(page, `${cardSelector} form[data-form="equipment-billing"] button[type="submit"]`);
-  await page.locator(".toast").filter({ hasText: "Equipment billing saved" }).waitFor();
-  await click(page, `${cardSelector} [data-action="create-equipment-invoice"]`);
+  await saveEquipmentAndWait(page, api, `${cardSelector} form[data-form="equipment-billing"] button[type="submit"]`, deployment.id, "Equipment billing saved");
+  await saveEquipmentAndWait(page, api, `${cardSelector} [data-action="create-equipment-invoice"]`, deployment.id, "Equipment invoice saved");
   await waitUntil("equipment invoice persisted", () => api.getWorkspaceState().equipmentDeployments.find((item) => item.id === deployment.id)?.invoiceId);
   const invoiceId = api.getWorkspaceState().equipmentDeployments.find((item) => item.id === deployment.id).invoiceId;
   if (api.getWorkspaceState().files.find((item) => item.id === invoiceId)?.amount !== 190) throw new Error("Two rental days at 95 did not invoice 190");
-  const repeatedWrites = api.getWorkspaceWriteCount();
-  await click(page, `${cardSelector} [data-action="create-equipment-invoice"]`);
-  await waitUntil("repeated equipment invoice persisted", () => api.getWorkspaceWriteCount() > repeatedWrites);
+  await testDelayedEquipmentInvoiceAcknowledgment(page, api, cardSelector, deployment.id, invoiceId);
   await page.locator(`${cardSelector} form[data-form="equipment-billing"] [name="dailyRate"]`).fill("100");
-  await click(page, `${cardSelector} form[data-form="equipment-billing"] button[type="submit"]`);
+  await saveEquipmentAndWait(page, api, `${cardSelector} form[data-form="equipment-billing"] button[type="submit"]`, deployment.id, "Equipment billing saved");
   await waitUntil("equipment invoice updated in place", () => api.getWorkspaceState().files.find((item) => item.id === invoiceId)?.amount === 200);
+  const updated = api.getWorkspaceState().equipmentDeployments.find((item) => item.id === deployment.id);
+  if (updated.dailyRate !== 100 || updated.invoiceId !== invoiceId
+    || await page.locator(`${cardSelector} form[data-form="equipment-billing"] [name="dailyRate"]`).inputValue() !== "100") {
+    throw new Error(`Acknowledged billing update did not retain rate 100 and its invoice identity: ${JSON.stringify(updated)}`);
+  }
+  results.equipmentInvoiceVerified = { deploymentId: deployment.id, invoiceId, supportFileId: support.id, dailyRate: 100, rentalDays: 2, amount: 200 };
   await captureResponsiveEvidence(page, "equipment-billing-saved", page.locator(cardSelector));
   const files = api.getWorkspaceState().files;
   if (files.filter((item) => item.sourceType === "equipmentInvoice" && item.sourceId === deployment.id).length !== 1
@@ -1023,12 +1100,12 @@ async function testEquipmentLifecycle(page, api) {
     throw new Error("Equipment invoice or support file was duplicated instead of updated in place");
   }
   await fillDeployment({ ...draft, deployedAt: dates.returnedAt, billable: false });
-  await click(page, `${formSelector} button[type="submit"]`);
+  await saveEquipmentAndWait(page, api, `${formSelector} button[type="submit"]`, ids.assetTag, "Equipment deployment saved");
   await waitUntil("returned asset tag reused", () => api.getWorkspaceState().equipmentDeployments.filter((item) => item.assetTag === ids.assetTag).length === 2);
   const reused = api.getWorkspaceState().equipmentDeployments.find((item) => item.assetTag === ids.assetTag && item.id !== deployment.id);
   const reusedCard = `.equipment-card[data-deployment-id="${reused.id}"]`;
   await page.locator(`${reusedCard} [name="returnedAt"]`).fill(dates.returnedAt);
-  await click(page, `${reusedCard} form[data-form="equipment-return"] button[type="submit"]`);
+  await saveEquipmentAndWait(page, api, `${reusedCard} form[data-form="equipment-return"] button[type="submit"]`, reused.id, "Equipment return saved");
   await waitUntil("reused equipment returned", () => api.getWorkspaceState().equipmentDeployments.find((item) => item.id === reused.id)?.status === "Returned");
   await reloadFromServer(page, api);
   await go(page, "jobs");
@@ -2315,6 +2392,9 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
   let workspaceWriteCount = 0;
   let workspaceReadCount = 0;
   let workspaceRejection = null;
+  let workspaceAcknowledgmentHold = null;
+  let lastAcknowledgmentHold = null;
+  let lastEquipmentWrite = null;
   const workspaceRequests = new Set();
   let workspaceRequestVersion = 0;
   context.on("request", (request) => {
@@ -2535,14 +2615,26 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
       workspaceWriteCount += 1;
       workspaceState = payload.workspaceState || {};
       workspaceRevision = `owner-revision-${workspaceWriteCount}`;
-      return json(200, {
+      const equipment = equipmentStateSnapshot(workspaceState);
+      if (equipment.deployments.length) lastEquipmentWrite = { revision: workspaceRevision, writeCount: workspaceWriteCount, ...equipment };
+      const acknowledgment = {
         success: true,
         durable: true,
         savedRecords: Object.values(workspaceState).filter(Array.isArray).reduce((sum, items) => sum + items.length, 0),
         ignoredRecords: 0,
         updatedAt: new Date().toISOString(),
         revision: workspaceRevision
-      });
+      };
+      if (workspaceAcknowledgmentHold && JSON.stringify(payload.workspaceState).includes(workspaceAcknowledgmentHold.marker)) {
+        const hold = workspaceAcknowledgmentHold;
+        workspaceAcknowledgmentHold = null;
+        hold.received = true;
+        lastAcknowledgmentHold.received = true;
+        lastAcknowledgmentHold.writeCount = workspaceWriteCount;
+        lastAcknowledgmentHold.revision = workspaceRevision;
+        await hold.ready;
+      }
+      return json(200, acknowledgment);
     }
     if (url.pathname === "/api/emergency/status" && method === "GET") {
       return json(200, { success: true, configured: emergencySources.length > 0, sources: emergencySources, runtime: { available: adminConfigured, storage: "firestore" } });
@@ -2849,6 +2941,25 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
     enableTestRadio: () => { emergencySources = [{ id: "test-radio", label: "Test dispatch radio", area: "Local fixture only", streamUrl: `${origin}/smoke-radio.wav` }]; },
     getWorkspaceWriteCount: () => workspaceWriteCount,
     getWorkspaceActivity: () => ({ inFlight: workspaceRequests.size, requestVersion: workspaceRequestVersion, writes: workspaceWriteCount }),
+    getEquipmentWriteDiagnostics: () => structuredClone({ lastAcknowledgmentHold, lastEquipmentWrite }),
+    holdWorkspaceAcknowledgmentContaining(marker) {
+      if (workspaceAcknowledgmentHold) throw new Error("A workspace acknowledgment is already held");
+      let release;
+      const hold = { marker, received: false, released: false, ready: new Promise((resolve) => { release = resolve; }) };
+      const status = { marker, received: false, released: false };
+      workspaceAcknowledgmentHold = hold;
+      lastAcknowledgmentHold = status;
+      return {
+        get received() { return hold.received; },
+        get released() { return hold.released; },
+        release() {
+          hold.released = true;
+          status.released = true;
+          if (workspaceAcknowledgmentHold === hold) workspaceAcknowledgmentHold = null;
+          release();
+        }
+      };
+    },
     injectLegacyRecords() {
       const moduleRecord = {
         id: `legacy-browser-${stamp}`,
@@ -3032,15 +3143,40 @@ page.on("pageerror", (error) => consoleErrors.push(error.message));
     heading: document.querySelector("h1")?.textContent?.trim() || "",
     body: (document.querySelector("main") || document.body).innerText.slice(-8000),
     forms: [...document.querySelectorAll("form[data-form]")].map((form) => form.dataset.form),
+    equipmentForms: [...document.querySelectorAll('form[data-form^="equipment-"]')].map((form) => ({
+      form: form.dataset.form, ariaBusy: form.getAttribute("aria-busy"), saving: form.dataset.saving || "",
+      controls: [...form.elements].filter((control) => control.name || control.matches("button")).map((control) => ({
+        name: control.name || control.dataset.action || control.textContent.trim(), type: control.type,
+        value: control.value, checked: control.type === "checkbox" ? control.checked : undefined,
+        disabled: control.matches(":disabled"), readOnly: control.readOnly
+      }))
+    })),
+    equipmentInvoiceButtons: [...document.querySelectorAll('[data-action="create-equipment-invoice"]')].map((button) => ({
+      deploymentId: button.closest(".equipment-card")?.dataset.deploymentId, text: button.textContent.trim(), disabled: button.matches(":disabled")
+    })),
     toast: document.querySelector(".toast")?.textContent?.trim() || "",
     observedToasts: window.__smokeToastChanges || [],
-    browserTasks: (JSON.parse(localStorage.getItem("brothers-os-workspace-v2") || "{}").tasks || []).filter((task) => task.title === taskTitle)
+    browserTasks: (JSON.parse(localStorage.getItem("brothers-os-workspace-v2") || "{}").tasks || []).filter((task) => task.title === taskTitle),
+    browserEquipmentWorkspace: (() => {
+      const workspace = JSON.parse(localStorage.getItem("brothers-os-workspace-v2") || "{}");
+      return { equipmentDeployments: workspace.equipmentDeployments, files: workspace.files };
+    })()
   }), ids.taskTitle).catch(() => ({}));
   results.failureTaskState = {
     browser: diagnostics?.browserTasks || [],
     server: localSmokeApi?.getWorkspaceState().tasks?.filter((task) => task.title === ids.taskTitle) || []
   };
-  console.error(JSON.stringify({ diagnostics, consoleErrors, failedResponses, developmentDiagnostics }, null, 2));
+  results.failureEquipmentState = {
+    stage: results.equipmentStage || "not started",
+    browser: equipmentStateSnapshot(diagnostics?.browserEquipmentWorkspace),
+    server: equipmentStateSnapshot(localSmokeApi?.getWorkspaceState()),
+    forms: diagnostics?.equipmentForms || [],
+    invoiceButtons: diagnostics?.equipmentInvoiceButtons || [],
+    activity: localSmokeApi?.getWorkspaceActivity(),
+    ...localSmokeApi?.getEquipmentWriteDiagnostics()
+  };
+  if (diagnostics) delete diagnostics.browserEquipmentWorkspace;
+  console.error(JSON.stringify({ diagnostics, equipment: results.failureEquipmentState, consoleErrors, failedResponses, developmentDiagnostics }, null, 2));
   if (page && !page.isClosed()) {
     fs.mkdirSync(new URL("../logs/", import.meta.url), { recursive: true });
     await page.screenshot({ path: fileURLToPath(new URL("../logs/browser-workflow-failure.png", import.meta.url)), timeout: 5000 }).catch(() => {});

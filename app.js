@@ -7592,6 +7592,25 @@ async function captureEquipmentGps() {
 }
 
 let equipmentMutationBusy = false;
+const equipmentControlLocks = new Map();
+
+function setEquipmentControlsSaving(saving) {
+  const forms = document.querySelectorAll('form[data-form^="equipment-"]');
+  if (saving) {
+    const controls = document.querySelectorAll('form[data-form^="equipment-"] input:not([type="hidden"]), form[data-form^="equipment-"] select, form[data-form^="equipment-"] textarea, form[data-form^="equipment-"] button, [data-action="create-equipment-invoice"], [data-action="capture-equipment-gps"]');
+    for (const control of controls) {
+      if (!equipmentControlLocks.has(control)) equipmentControlLocks.set(control, control.disabled);
+      control.disabled = true;
+    }
+    forms.forEach((form) => form.setAttribute("aria-busy", "true"));
+  } else {
+    for (const [control, wasDisabled] of equipmentControlLocks) {
+      if (control.isConnected) control.disabled = wasDisabled;
+    }
+    equipmentControlLocks.clear();
+    forms.forEach((form) => form.removeAttribute("aria-busy"));
+  }
+}
 
 function equipmentActor() {
   return state.authSession || (isOfflineSmokePreview() ? { roleId: "business_owner", uid: "offline-preview" } : {});
@@ -7627,6 +7646,8 @@ async function saveEquipmentMutation(operation, successMessage) {
   const identity = JSON.stringify(currentWorkspaceIdentity());
   const snapshot = Object.fromEntries(["equipmentDeployments", "files", "jobBoards", "tasks", "activity"].map((key) => [key, state[key]]));
   equipmentMutationBusy = true;
+  // A successful save replaces these forms, so block edits until that refresh finishes.
+  setEquipmentControlsSaving(true);
   let saving = false;
   try {
     operation();
@@ -7647,6 +7668,7 @@ async function saveEquipmentMutation(operation, successMessage) {
     throw error;
   } finally {
     equipmentMutationBusy = false;
+    setEquipmentControlsSaving(false);
   }
 }
 
@@ -8057,6 +8079,7 @@ function render() {
   const monitorHost = app.querySelector("[data-emergency-monitor]");
   if (previousMonitor && monitorHost) monitorHost.replaceWith(previousMonitor);
   emergencyMonitor.attach(previousMonitor && monitorHost ? previousMonitor : monitorHost);
+  if (equipmentMutationBusy) setEquipmentControlsSaving(true);
   if (state.modal) queueMicrotask(activateModalAccessibility);
 }
 

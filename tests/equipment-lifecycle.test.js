@@ -137,6 +137,7 @@ function runtime(options = {}) {
   let accepted = structuredClone(state);
   const context = vm.createContext({
     ...lifecycle, state, FormData, Date, console, encodeURIComponent,
+    document: options.document || { querySelectorAll: () => [] },
     normalizeEquipmentDeployment: (record, who, deployments) => normalizeEquipmentDeployment(record, who, deployments, now),
     returnEquipmentDeployment: (record, changes, who) => returnEquipmentDeployment(record, changes, who, now),
     normalizeEquipmentBilling: (record, changes, who) => normalizeEquipmentBilling(record, changes, who, now),
@@ -223,6 +224,37 @@ describe("equipment app workflow", () => {
       assert.ok(events.includes("recovered"));
       assert.ok(!events.includes("Equipment deployment saved"));
     }
+  });
+
+  it("locks equipment controls through pending saves and restores their prior disabled state", async () => {
+    for (const durable of [true, false]) {
+      let finish;
+      let busy = "";
+      const controls = [{ disabled: false, isConnected: true }, { disabled: true, isConnected: true }];
+      const form = { setAttribute: (_, value) => { busy = value; }, removeAttribute: () => { busy = ""; } };
+      const document = { querySelectorAll: (selector) => selector === 'form[data-form^="equipment-"]' ? [form] : controls };
+      const { context: app, placement } = runtime({ document, sync: () => new Promise((resolve) => { finish = resolve; }) });
+      const pending = app.addEquipmentDeployment(placement());
+      assert.equal(busy, "true");
+      assert.ok(controls.every((control) => control.disabled));
+      const replacement = { disabled: false, isConnected: true };
+      controls.push(replacement);
+      app.setEquipmentControlsSaving(true);
+      assert.equal(replacement.disabled, true);
+      finish({ durable });
+      if (durable) await pending;
+      else await assert.rejects(pending, /did not confirm/);
+      assert.deepEqual(controls.map((control) => control.disabled), [false, true, false]);
+      assert.equal(busy, "");
+    }
+  });
+
+  it("restores equipment controls after validation rejects a change before saving", async () => {
+    const control = { disabled: false, isConnected: true };
+    const document = { querySelectorAll: (selector) => selector === 'form[data-form^="equipment-"]' ? [] : [control] };
+    const { context: app, placement } = runtime({ document });
+    await assert.rejects(app.addEquipmentDeployment(placement({ jobId: "missing" })), /exact/);
+    assert.equal(control.disabled, false);
   });
 
   it("does not mutate when storage is locked, a job key is forged or an asset is busy", async () => {
