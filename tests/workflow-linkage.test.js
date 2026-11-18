@@ -50,10 +50,12 @@ describe("cross-module workflow linkage", () => {
   it("links field evidence into billing and closeout modules", () => {
     const addDryLogRecord = functionBody("addDryLogRecord");
     const addEquipmentDeployment = functionBody("addEquipmentDeployment");
+    const equipmentSupportFile = functionBody("upsertEquipmentSupportFile");
     const clockOut = functionBody("clockOut");
     expect(addDryLogRecord).toContain('linkedModuleKeys: ["jobs", "equipment", "payments", "photos", "defensibility", "evidencechain"]');
-    expect(addEquipmentDeployment).toContain('moduleKey: "equipment"');
-    expect(addEquipmentDeployment).toContain('linkedModuleKeys: ["jobs", "drylogs", "payments", "photos", "time"]');
+    expect(addEquipmentDeployment).toContain("upsertEquipmentSupportFile(deployment)");
+    expect(equipmentSupportFile).toContain('moduleKey: "equipment"');
+    expect(equipmentSupportFile).toContain('const linkedModuleKeys = ["jobs", "drylogs", "payments", "photos", "time"]');
     expect(addEquipmentDeployment).toContain('moduleKey: "payments"');
     expect(clockOut).toContain('linkedModuleKeys: ["jobs", "payments", "reports", "closeout", "photos"]');
   });

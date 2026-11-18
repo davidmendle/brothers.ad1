@@ -5,10 +5,21 @@ allowBuilds:
   prisma: true
   protobufjs: true
   sharp: true
+minimumReleaseAgeExclude:
+  - '@fastify/busboy@3.2.6'
+  - baseline-browser-mapping@2.11.38
 overrides:
-  'brace-expansion@>=2.0.0 <2.1.4': 2.1.4
+  'brace-expansion@>=2.0.0 <2.1.7': 2.1.7
   'nanoid@<3.3.18': 3.3.18
   postcss: 8.5.23
-  sharp: 0.35.0
-  undici: 6.28.0
+  sharp: 0.35.5
+  undici: 6.29.1
+  'body-parser@>=2.0.0 <2.4.0': 2.4.0
+  'qs@>=6.0.0 <6.17.1': 6.17.1
+  '@grpc/grpc-js@>=1.0.0 <1.14.7': 1.14.7
+  '@fastify/busboy@>=3.0.0 <3.2.6': 3.2.6
+  'baseline-browser-mapping@>=2.0.0 <2.11.38': 2.11.38
+  'source-map-js@>=1.0.0 <1.2.2': 1.2.2
+  'zod@>=4.0.0 <4.6.6': 4.6.6
+  'fast-xml-parser@>=5.0.0 <5.12.0': 5.12.0
   'uuid@<11.1.1': 11.1.1

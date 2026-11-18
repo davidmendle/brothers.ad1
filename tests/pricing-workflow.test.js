@@ -30,10 +30,13 @@ describe("pricing workflow", () => {
   });
 
   it("uses the linked import path for CSV, pasted, sample, and Xactimate imports", () => {
-    expect(functionBody("handlePriceCsvUpload")).toContain("importPricingLines(items, file.name");
+    expect(functionBody("handlePriceCsvUpload")).toContain("handleXactimateImport(input)");
     expect(functionBody("importPastedPricing")).toContain("importPricingLines(lines, sourceName");
     expect(functionBody("importSamplePricing")).toContain("importPricingLines(lines, sourceName");
-    expect(functionBody("processXactimateFile")).toContain("importPricingLines(lines, file.name");
+    expect(functionBody("handleXactimateImport")).toContain("importPricingLines(lines, file.name");
+    expect(functionBody("handleXactimateImport")).toContain("await syncWorkspaceState({ force: true })");
+    expect(functionBody("validatedPricingLines")).toContain('result.status !== "ready"');
+    expect(source).not.toContain("Captured package - needs line export");
   });
 
   it("prevents blank estimate invoices from entering payments", () => {

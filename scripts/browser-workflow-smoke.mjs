@@ -1,8 +1,15 @@
 import { chromium } from "playwright";
 import fs from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 
 const baseUrl = process.env.BROTHERS_OS_BASE_URL || "http://127.0.0.1:4198";
 const origin = new URL(baseUrl).origin;
+if (!["127.0.0.1", "localhost"].includes(new URL(baseUrl).hostname)) {
+  throw new Error("Workflow smoke requires a local server and mocked APIs; live mutations are not permitted.");
+}
+const execFileAsync = promisify(execFile);
 const appSource = fs.readFileSync(new URL("../app.js", import.meta.url), "utf8");
 const moduleDataSource = fs.readFileSync(new URL("../module-data.js", import.meta.url), "utf8");
 const smokeModuleDefinitions = JSON.parse(moduleDataSource.slice(moduleDataSource.indexOf("["), moduleDataSource.lastIndexOf("]") + 1));
@@ -19,6 +26,7 @@ const ids = {
   accessCode: `EMP${stamp}`,
   taskTitle: `Upload kitchen invoice photos ${stamp}`,
   moduleRecord: `Emergency dispatch record ${stamp}`,
+  manualTask: `Office-entered extraction ${stamp}`,
   priceCode: `AI-LAB-${stamp}`,
   priceName: `AI labor line ${stamp}`,
   paymentCustomer: `AI Payment Customer ${stamp}`,
@@ -32,6 +40,7 @@ const ids = {
 
 const results = {
   baseUrl,
+  verificationBoundary: "Local production UI with intercepted fixture APIs; no production Firestore, email, payment, or deployment verification",
   ids,
   modulesChecked: 0,
   buttonsRendered: 0,
@@ -40,6 +49,7 @@ const results = {
   actionTypesExercised: 0,
   formTypesSubmitted: 0,
   fieldTypesExercised: 0,
+  screenshots: [],
   workflowChecks: []
 };
 const actionCoverage = {
@@ -54,7 +64,233 @@ const actionCoverage = {
   fieldLocations: new Map()
 };
 const semanticModuleRecords = [];
+let expectedWorkspaceFailure = "";
 const smokePng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+
+async function cleanupDeadline(operation, label, timeout = 10000) {
+  let timer;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeout); })
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
+async function closeOwnedBrowser(browser, browserServer) {
+  if (!browserServer) return;
+  const child = browserServer.process();
+  const running = () => child.exitCode === null && child.signalCode === null;
+  const exited = running() ? new Promise((resolve) => child.once("exit", resolve)) : Promise.resolve();
+  try { await cleanupDeadline(browser?.close(), "Browser client disconnect"); }
+  catch (error) { console.warn(error.message); }
+  try { await cleanupDeadline(browserServer.close(), "Browser server shutdown"); }
+  catch {
+    if (running()) {
+      if (process.platform === "win32") {
+        try {
+          await execFileAsync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, timeout: 10000 });
+        } catch (error) {
+          // taskkill can report an already-exited descendant while terminating the owned parent.
+          // Still run Playwright's cleanup before checking the owned process exit.
+          console.warn(`[smoke] taskkill exit race: ${error.message}`);
+        }
+      } else child.kill("SIGKILL");
+    }
+    await cleanupDeadline(browserServer.kill(), "Owned browser process cleanup");
+  }
+  await cleanupDeadline(exited, `Smoke browser ${child.pid} exit`);
+  if (running()) throw new Error(`Smoke browser ${child.pid} survived cleanup`);
+}
+
+async function captureResponsiveEvidence(page, name, target) {
+  const originalViewport = page.viewportSize();
+  fs.mkdirSync(new URL("../logs/", import.meta.url), { recursive: true });
+  try {
+    for (const [layout, viewport] of Object.entries({ desktop: { width: 1440, height: 900 }, mobile: { width: 390, height: 844 } })) {
+      await page.setViewportSize(viewport);
+      await target.scrollIntoViewIfNeeded();
+      const path = fileURLToPath(new URL(`../logs/${name}-${layout}.png`, import.meta.url));
+      await page.screenshot({ path });
+      results.screenshots.push({ name, layout, path });
+      if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 2)) {
+        throw new Error(`${name} overflows the ${layout} viewport; see ${path}`);
+      }
+    }
+  } finally { await page.setViewportSize(originalViewport); }
+}
+
+async function reloadFromServer(page, api) {
+  const readsBefore = api.getWorkspaceReadCount();
+  // Remove the browser cache so this proves hydration from the mock server.
+  await page.evaluate(() => localStorage.removeItem("brothers-os-workspace-v2"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".app-shell");
+  await waitUntil("server-confirmed reload", async () => api.getWorkspaceReadCount() > readsBefore
+    && await page.locator(".workspace-write-lock").count() === 0);
+}
+
+async function inspectTimeMobileLayout(page) {
+  const viewport = page.viewportSize();
+  try {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const submit = page.locator('form[data-form="clock-in"] button[type="submit"]');
+    await submit.scrollIntoViewIfNeeded();
+    const layout = await page.evaluate(() => {
+      const button = document.querySelector('form[data-form="clock-in"] button[type="submit"]');
+      const table = document.querySelector(".data-table");
+      const rect = (element) => {
+        const { x, y, width, height, right, bottom } = element.getBoundingClientRect();
+        return { x, y, width, height, right, bottom };
+      };
+      const range = document.createRange();
+      range.selectNodeContents(button);
+      const style = getComputedStyle(button);
+      const ancestors = [];
+      for (let element = table.parentElement; element && element !== document.body; element = element.parentElement) {
+        ancestors.push({ className: element.className, clientWidth: element.clientWidth, scrollWidth: element.scrollWidth,
+          overflowX: getComputedStyle(element).overflowX, bounds: rect(element) });
+      }
+      return { documentWidth: document.documentElement.scrollWidth, viewportWidth: innerWidth,
+        clockButton: { text: button.textContent.trim(), bounds: rect(button), textBounds: rect(range),
+          color: style.color, background: style.backgroundColor, fontSize: style.fontSize, opacity: style.opacity, visibility: style.visibility },
+        table: { bounds: rect(table), ancestors } };
+    });
+    results.timeMobileLayout = layout;
+    console.log(`[smoke] time mobile layout ${JSON.stringify(layout)}`);
+    const { bounds, textBounds } = layout.clockButton;
+    if (bounds.x < -1 || bounds.right > layout.viewportWidth + 1
+      || !layout.clockButton.text || textBounds.width <= 0 || textBounds.height <= 0
+      || textBounds.x < bounds.x - 1 || textBounds.right > bounds.right + 1
+      || textBounds.y < bounds.y - 1 || textBounds.bottom > bounds.bottom + 1) {
+      throw new Error(`Clock submit text is clipped at 390px: ${JSON.stringify(layout.clockButton)}`);
+    }
+    const scroller = page.locator(".data-table");
+    const tableScroll = await scroller.evaluate((element) => {
+      const previous = element.scrollLeft;
+      element.scrollLeft = element.scrollWidth;
+      const result = { scrollWidth: element.scrollWidth, clientWidth: element.clientWidth, scrollLeft: element.scrollLeft, overflowX: getComputedStyle(element).overflowX };
+      element.scrollLeft = previous;
+      return result;
+    });
+    results.timeMobileLayout.tableScroll = tableScroll;
+    console.log(`[smoke] time table horizontal scroll ${JSON.stringify(tableScroll)}`);
+    if (layout.documentWidth > 392 || tableScroll.clientWidth > 390 || (tableScroll.scrollWidth > tableScroll.clientWidth
+      && (!/auto|scroll/.test(tableScroll.overflowX) || tableScroll.scrollLeft <= 0))) {
+      throw new Error(`Time table does not stay within a usable mobile scroller: ${JSON.stringify(layout)}`);
+    }
+    const path = fileURLToPath(new URL("../logs/time-clock-submit-mobile.png", import.meta.url));
+    await page.screenshot({ path });
+    results.screenshots.push({ name: "time-clock-submit", layout: "mobile", path });
+  } finally { await page.setViewportSize(viewport); }
+}
+
+function pricingPdfFixture(line) {
+  const stream = `BT /F1 12 Tf 30 740 Td (${line.replace(/[\\()]/g, "\\$&")}) Tj ET\n`;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}endstream`
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 6\n0000000000 65535 f \n${offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("")}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(pdf);
+}
+
+async function watchToastChanges(page) {
+  await page.evaluate(() => {
+    window.__smokeToastChanges = [];
+    let previous = document.querySelector(".toast")?.textContent || "";
+    window.__smokeToastObserver = new MutationObserver(() => {
+      const current = document.querySelector(".toast")?.textContent || "";
+      if (current && current !== previous) window.__smokeToastChanges.push(current);
+      previous = current;
+    });
+    window.__smokeToastObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+  });
+}
+
+async function waitForWorkspaceQuiescence(page, api) {
+  let previous = "";
+  let stableSince = Date.now();
+  // Allow the app's 300ms debounce to fire, then require completed requests and stable writes.
+  await waitUntil("prior workspace requests and debounced saves to settle", async () => {
+    const activity = api.getWorkspaceActivity();
+    const current = JSON.stringify(activity);
+    if (activity.inFlight || current !== previous || await page.locator(".workspace-write-lock").count()) {
+      stableSince = Date.now();
+    }
+    previous = current;
+    return Date.now() - stableSince >= 750;
+  }, 20000);
+}
+
+async function formDraft(page, type) {
+  return page.locator(`form[data-form="${type}"]`).evaluate((form) => Object.fromEntries(
+    [...form.elements].filter((field) => field.name && !["submit", "button", "file"].includes(field.type))
+      .map((field) => [field.name, field.type === "checkbox" ? field.checked : field.value])
+  ));
+}
+
+function workspaceStateDiff(before, after) {
+  return Object.fromEntries([...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key]))
+    .map((key) => [key, { before: before[key], after: after[key] }]));
+}
+
+async function rejectFormSave(page, api, formType, marker, expectedDraft, successPattern, selector = `form[data-form="${formType}"]`) {
+  const message = `Test backend rejected ${marker}`;
+  await waitForWorkspaceQuiescence(page, api);
+  const beforeState = api.getWorkspaceState();
+  const before = JSON.stringify(beforeState);
+  const writesBefore = api.getWorkspaceWriteCount();
+  api.rejectWorkspaceWriteContaining(marker, message);
+  expectedWorkspaceFailure = marker;
+  await watchToastChanges(page);
+  try {
+    const rejected = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/workspace-state"
+      && response.request().method() === "PUT" && response.status() === 503);
+    await click(page, `${selector} button[type="submit"]`);
+    await rejected;
+    await page.locator(".toast").filter({ hasText: message }).waitFor();
+    await waitForWorkspaceQuiescence(page, api);
+    const form = page.locator(selector);
+    for (const [name, value] of Object.entries(expectedDraft)) {
+      const control = form.locator(`[name="${name}"]`);
+      const actual = typeof value === "boolean" ? await control.isChecked() : await control.inputValue();
+      if (actual !== value) throw new Error(`${formType} lost ${name} after the rejected save: ${actual}`);
+    }
+    if (await form.locator('button[type="submit"]').isDisabled()) throw new Error(`${formType} remained disabled after rejection`);
+    if (JSON.stringify(api.getWorkspaceState()) !== before || api.getWorkspaceWriteCount() !== writesBefore) {
+      results.rejectedSaveFailure = {
+        formType, marker, writesBefore, writesAfter: api.getWorkspaceWriteCount(),
+        rejectedMarkerInServerState: JSON.stringify(api.getWorkspaceState()).includes(marker),
+        stateDiff: workspaceStateDiff(beforeState, api.getWorkspaceState())
+      };
+      throw new Error(`${formType} changed shared data after a rejected save: ${JSON.stringify(results.rejectedSaveFailure)}`);
+    }
+    await captureResponsiveEvidence(page, `${formType}-rejected-draft`, form);
+    for (const [name, value] of Object.entries(expectedDraft)) {
+      const control = form.locator(`[name="${name}"]`);
+      const actual = typeof value === "boolean" ? await control.isChecked() : await control.inputValue();
+      if (actual !== value) throw new Error(`${formType} lost ${name} when resizing the rejected draft`);
+    }
+    const toasts = await page.evaluate(() => window.__smokeToastChanges);
+    if (toasts.some((text) => successPattern.test(text))) throw new Error(`${formType} displayed false success: ${toasts.join(" | ")}`);
+    results.workflowChecks.push({ label: `${formType} rejected save`, text: "503 preserved every form field, restored shared data, allowed retry, and displayed no success toast" });
+  } finally {
+    await page.evaluate(() => { window.__smokeToastObserver?.disconnect(); });
+    expectedWorkspaceFailure = "";
+  }
+}
 
 function moduleUrl(key) {
   return `${baseUrl}/?smoke=${Date.now()}#module/${key}`;
@@ -103,7 +339,8 @@ async function click(page, selector) {
     action: element.dataset.action || "",
     form: element.closest("form[data-form]")?.dataset.form || ""
   }));
-  await locator.click();
+  // SPA form outcomes are checked explicitly; there is no document navigation to await.
+  await locator.click({ noWaitAfter: Boolean(metadata.form) });
   if (metadata.action) actionCoverage.exercised.add(metadata.action);
   if (metadata.form) actionCoverage.formsSubmitted.add(metadata.form);
 }
@@ -126,6 +363,12 @@ async function clickAny(page, selector, label) {
 async function expectBody(page, label, text) {
   await page.locator("body").filter({ hasText: text }).waitFor({ state: "visible", timeout: 8000 });
   results.workflowChecks.push({ label, text });
+}
+
+function moduleFileCard(page, key, id) {
+  const label = smokeModuleDefinitions.find((module) => module.key === key)?.label || key;
+  return page.locator("section.panel").filter({ has: page.getByRole("heading", { name: `${label} files`, exact: true }) })
+    .locator(`.file-card:has([data-action="select-file"][data-id="${id}"])`);
 }
 
 async function waitUntil(label, predicate, timeoutMs = 10000) {
@@ -512,7 +755,351 @@ async function submitRemainingForms(page) {
   await clickVisibleAction(page, "copy-payment-link");
 }
 
+async function testManualTime(page, api) {
+  if (!api) return;
+  await go(page, "time");
+  const selector = 'form[data-form="manual-time"]';
+  const workerId = await page.locator(`${selector} select[name="workerId"] option`)
+    .evaluateAll((options, name) => options.find((option) => option.textContent.includes(name))?.value || "", ids.employeeName);
+  if (!workerId) throw new Error("The employee directory did not populate manual time's worker selector");
+  const job = api.getWorkspaceState().jobBoards.find((record) => record.jobId === ids.jobId);
+  if (!job) throw new Error("Manual-time fixture job was not persisted");
+  const jobKey = job.id || job.jobId;
+  const member = api.getAccessGrants().find((grant) => grant.email === ids.employeeEmail);
+  const scope = (record = {}) => Object.fromEntries(["id", "jobId", "email", "companyId", "contractorId", "franchiseId", "franchiseIds", "branchId"]
+    .filter((key) => record[key] !== undefined).map((key) => [key, record[key]]));
+  results.manualTimeScope = { job: scope(job), employee: scope(member) };
+  if (!member || String(member.contractorId || "") !== String(job.contractorId || "")) {
+    throw new Error(`Created employee and job have incompatible manual-time scope: ${JSON.stringify(results.manualTimeScope)}`);
+  }
+  const dates = await page.evaluate(() => {
+    const day = new Date();
+    day.setDate(day.getDate() - 2);
+    const date = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
+    return { start: `${date}T09:00`, end: `${date}T11:00` };
+  });
+  const draft = { workerId, job: jobKey, task: ids.manualTask, ...dates, breakMinutes: "30", notes: `Approved office correction ${stamp}`, billable: true };
+  for (const [name, value] of Object.entries(draft)) {
+    const field = page.locator(`${selector} [name="${name}"]`);
+    if (typeof value === "boolean") await field.setChecked(value);
+    else if (["workerId", "job"].includes(name)) await field.selectOption(value);
+    else await field.fill(value);
+  }
+  await rejectFormSave(page, api, "manual-time", ids.manualTask, draft, /office time saved|file created/i);
+  await click(page, `${selector} button[type="submit"]`);
+  await page.locator(".toast").filter({ hasText: "Office time saved" }).waitFor();
+  await waitUntil("manual time and labor file persisted", () => {
+    const workspace = api.getWorkspaceState();
+    const entry = workspace.timeEntries?.find((item) => item.task === ids.manualTask);
+    const file = workspace.files?.find((item) => item.sourceType === "timeEntry" && item.sourceId === entry?.id);
+    return entry?.entryMethod === "manual" && entry.workerId === workerId && entry.workerEmail === ids.employeeEmail
+      && entry.jobId === jobKey && entry.job === ids.jobId && entry.relatedJob === ids.jobId
+      && ["contractorId", "franchiseId"].every((key) => String(entry[key] || "") === String(job[key] || ""))
+      && entry.hours === "1.50" && entry.breakMinutes === 30 && entry.billable === true
+      && entry.startGps === null && entry.endGps === null
+      && ["jobs", "payments"].every((key) => file?.linkedModuleKeys?.includes(key));
+  });
+  const savedEntry = structuredClone(api.getWorkspaceState().timeEntries.find((item) => item.task === ids.manualTask));
+  const file = api.getWorkspaceState().files.find((item) => item.sourceType === "timeEntry" && item.sourceId === savedEntry.id);
+  await reloadFromServer(page, api);
+  await go(page, "time");
+  const row = page.locator(".data-table tbody tr").filter({ hasText: ids.manualTask });
+  await row.filter({ hasText: "Office entry (no GPS)" }).waitFor();
+  if (await row.locator("td").nth(5).innerText() !== "1.50") throw new Error("Manual net hours changed after reload");
+  await captureResponsiveEvidence(page, "manual-time-saved", row);
+  await inspectTimeMobileLayout(page);
+  for (const key of ["jobs", "payments"]) {
+    await go(page, key);
+    await moduleFileCard(page, key, file.id).filter({ hasText: ids.manualTask }).waitFor();
+    if (key === "jobs") {
+      const summary = page.locator(`[data-job-operations="${ids.jobId}"]`);
+      await summary.filter({ hasText: "1.50 hours" }).filter({ hasText: ids.employeeName }).waitFor();
+      await captureResponsiveEvidence(page, "job-labor-summary", summary);
+    }
+  }
+  const after = api.getWorkspaceState().timeEntries.find((item) => item.id === savedEntry.id);
+  if (JSON.stringify(after) !== JSON.stringify(savedEntry)) throw new Error("Unrelated module navigation mutated manual time");
+  results.workflowChecks.push({ label: "Manual office time", text: "directory employee + existing job; 2 hours less a 30-minute break = 1.50; reload retained data and labor files in jobs/payments" });
+}
+
+async function testPricingUploads(page, api) {
+  if (!api) return;
+  await go(page, "pricing");
+  const upload = async (name, buffer, mimeType = "text/csv") => {
+    await exerciseDataField(page, "xactimate-import", (field) => field.setInputFiles({ name, mimeType, buffer }), `pricing ${name}`);
+  };
+  const result = (name, status) => page.locator(`.import-results [data-import-status="${status}"]`).filter({ hasText: name });
+  const duplicateCode = `DUP-${stamp}`;
+  const csvName = `fractional-duplicates-${stamp}.csv`;
+  await upload(csvName, Buffer.from(`code,description,quantity,unit,unit price\n${duplicateCode},Fractional labor,0.5,HR,120\n${duplicateCode},Fractional labor,1.25,HR,120`));
+  await result(csvName, "saved").waitFor();
+  const imported = api.getWorkspaceState().priceItems.filter((item) => item.sourceFile === csvName);
+  const history = api.getWorkspaceState().xactimateImports.find((item) => item.fileName === csvName);
+  if (imported.length !== 2 || imported.map((item) => item.sourceQuantity).sort((a, b) => a - b).join(",") !== "0.5,1.25"
+    || imported.some((item) => item.code !== duplicateCode || item.rate !== 120) || history?.lineCount !== 2 || history?.total !== 210) {
+    throw new Error("Pricing CSV lost duplicate rows, fractional quantities, or the 210 source total");
+  }
+  const pdfName = `selectable-text-${stamp}.pdf`;
+  const pdfCode = `WTR.PDF${stamp}`;
+  await upload(pdfName, pricingPdfFixture(`${pdfCode} PDF labor 0.5 HR 80.00`), "application/pdf");
+  await result(pdfName, "saved").waitFor({ timeout: 30000 });
+  const pdfItem = api.getWorkspaceState().priceItems.find((item) => item.sourceFile === pdfName);
+  if (pdfItem?.code !== pdfCode || pdfItem?.sourceQuantity !== 0.5 || pdfItem?.rate !== 80
+    || api.getWorkspaceState().xactimateImports.find((item) => item.fileName === pdfName)?.total !== 40) {
+    throw new Error("Real PDF extraction did not produce the expected unit price, quantity and total");
+  }
+  const beforeMalformed = JSON.stringify(api.getWorkspaceState());
+  const writesBeforeMalformed = api.getWorkspaceWriteCount();
+  const invalidName = `malformed-${stamp}.pdf`;
+  await upload(invalidName, Buffer.from("%PDF-1.4\nThis is not a valid PDF document."), "application/pdf");
+  await result(invalidName, "error").waitFor({ timeout: 30000 });
+  if (await result(invalidName, "saved").count() || JSON.stringify(api.getWorkspaceState()) !== beforeMalformed
+    || api.getWorkspaceWriteCount() !== writesBeforeMalformed) throw new Error("Malformed PDF appeared captured or changed shared pricing");
+
+  const partial = (code) => Buffer.from(`code,description,quantity,unit,unit price\n${code},Reviewed labor,0.5,HR,100\nBAD-${code},Unreadable price,1,HR,not-a-price`);
+  const confirmCode = `REVIEW-${stamp}`;
+  const reviewName = `review-required-${stamp}.csv`;
+  const beforeReview = JSON.stringify(api.getWorkspaceState());
+  const writesBeforeReview = api.getWorkspaceWriteCount();
+  await upload(reviewName, partial(confirmCode));
+  await page.locator(".import-review").filter({ hasText: confirmCode }).waitFor();
+  await collectPageCoverage(page, "pricing");
+  if (JSON.stringify(api.getWorkspaceState()) !== beforeReview || api.getWorkspaceWriteCount() !== writesBeforeReview) {
+    throw new Error("Partial pricing import wrote rows before explicit review");
+  }
+  await captureResponsiveEvidence(page, "imports-review", page.locator(".import-review"));
+  const rejectedMessage = `Test backend rejected ${reviewName}`;
+  api.rejectWorkspaceWriteContaining(reviewName, rejectedMessage);
+  expectedWorkspaceFailure = reviewName;
+  await watchToastChanges(page);
+  try {
+    const rejected = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/workspace-state"
+      && response.request().method() === "PUT" && response.status() === 503);
+    await click(page, '[data-action="confirm-pricing-import"]');
+    await rejected;
+    await page.locator(".toast").filter({ hasText: rejectedMessage }).waitFor();
+    await page.locator(".import-review").filter({ hasText: confirmCode }).waitFor();
+    if (JSON.stringify(api.getWorkspaceState()) !== beforeReview || api.getWorkspaceWriteCount() !== writesBeforeReview
+      || await result(reviewName, "saved").count()
+      || await page.locator('[data-action="confirm-pricing-import"]').isDisabled()) {
+      throw new Error("Rejected pricing confirmation lost its review, persisted rows, or claimed success");
+    }
+    await captureResponsiveEvidence(page, "imports-rejected-draft", page.locator(".import-review"));
+    const toasts = await page.evaluate(() => window.__smokeToastChanges);
+    if (toasts.some((text) => /file created|pricing.*saved|import.*saved|import.*captured/i.test(text))) {
+      throw new Error(`Rejected pricing confirmation displayed false success: ${toasts.join(" | ")}`);
+    }
+    results.workflowChecks.push({ label: "Pricing rejected save", text: "503 keeps the reviewed lines available for retry, leaves shared pricing unchanged, and never marks the import saved" });
+  } finally {
+    await page.evaluate(() => window.__smokeToastObserver?.disconnect());
+    expectedWorkspaceFailure = "";
+  }
+  await click(page, '[data-action="confirm-pricing-import"]');
+  await result(reviewName, "saved").waitFor();
+  const reviewed = api.getWorkspaceState().priceItems.filter((item) => item.sourceFile === reviewName);
+  if (reviewed.length !== 1 || reviewed[0].code !== confirmCode
+    || api.getWorkspaceState().xactimateImports.find((item) => item.fileName === reviewName)?.total !== 50) {
+    throw new Error("Reviewed pricing did not save exactly the valid row");
+  }
+  const cancelName = `cancel-review-${stamp}.csv`;
+  const beforeCancel = JSON.stringify(api.getWorkspaceState());
+  const writesBeforeCancel = api.getWorkspaceWriteCount();
+  await upload(cancelName, partial(`CANCEL-${stamp}`));
+  await page.locator(".import-review").filter({ hasText: cancelName }).waitFor();
+  await click(page, '[data-action="cancel-pricing-import"]');
+  await result(cancelName, "discarded").waitFor();
+  if (await page.locator(".import-review").count() || JSON.stringify(api.getWorkspaceState()) !== beforeCancel
+    || api.getWorkspaceWriteCount() !== writesBeforeCancel) throw new Error("Discarding a partial import changed shared pricing");
+  await reloadFromServer(page, api);
+  await go(page, "pricing");
+  if (await page.locator(".import-review").count()) throw new Error("Discarded pricing review returned after reload");
+  for (const code of [duplicateCode, pdfCode, confirmCode]) await page.locator(".price-table").filter({ hasText: code }).waitFor();
+  await captureResponsiveEvidence(page, "imports-saved", page.locator(".price-table"));
+  for (const sourceFile of [csvName, pdfName, reviewName]) {
+    const file = api.getWorkspaceState().files.find((item) => item.sourceType === "xactimateImport" && item.sourceId === sourceFile);
+    if (!file) throw new Error(`Pricing import ${sourceFile} has no durable source file`);
+    for (const key of ["defensibility", "payments", "accounting", "revenueengine"]) {
+      if (!file.linkedModuleKeys?.includes(key)) throw new Error(`Pricing import ${sourceFile} lost its ${key} link`);
+      await go(page, key);
+      await moduleFileCard(page, key, file.id).waitFor();
+    }
+  }
+  results.workflowChecks.push({ label: "Pricing upload and review", text: "real PDF parser; malformed PDF rejected without writes; duplicate fractional CSV rows total 210; partial import stages until confirm; discard writes nothing; reload retains saved imports" });
+}
+
+async function testEquipmentLifecycle(page, api) {
+  await go(page, "equipment");
+  const formSelector = 'form[data-form="equipment-deployment"]';
+  const jobKey = await page.locator(`${formSelector} select[name="jobId"] option`)
+    .evaluateAll((options, jobId) => options.find((option) => option.textContent.startsWith(`${jobId} - `))?.value || "", ids.jobId);
+  if (!jobKey) throw new Error("New job is missing from the scoped equipment job selector");
+  const dates = await page.evaluate(() => {
+    const local = (date) => new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    const returned = new Date(Math.floor(Date.now() / 60000) * 60000 - 60000);
+    return { deployedAt: local(new Date(returned.getTime() - 48 * 60 * 60000)), returnedAt: local(returned) };
+  });
+  const draft = {
+    equipmentName: ids.equipmentName, assetTag: ids.assetTag, jobId: jobKey,
+    deployedAt: dates.deployedAt, room: ids.dryRoom, invoiceNumber: `INV-${stamp}`,
+    address: `123 AI Test Ave ${stamp}`, latitude: "42.45010", longitude: "-73.24540",
+    dailyRate: "95", billable: true, notes: `AI QA equipment placement ${stamp}`
+  };
+  const fillDeployment = async (values = draft) => {
+    for (const [name, value] of Object.entries(values)) {
+      const field = page.locator(`${formSelector} [name="${name}"]`);
+      if (typeof value === "boolean") await field.setChecked(value);
+      else if (name === "jobId") await field.selectOption(value);
+      else await field.fill(value);
+    }
+  };
+  await fillDeployment();
+  await captureResponsiveEvidence(page, "equipment-deployment-form", page.locator(formSelector));
+  await rejectFormSave(page, api, "equipment-deployment", ids.equipmentName, draft, /equipment deployment saved/i);
+  await click(page, `${formSelector} button[type="submit"]`);
+  await page.locator(".toast").filter({ hasText: "Equipment deployment saved" }).waitFor();
+  const deployment = api.getWorkspaceState().equipmentDeployments.find((item) => item.assetTag === ids.assetTag);
+  if (!deployment || deployment.status !== "Deployed" || deployment.rentalDays !== 0 || deployment.invoiceId) {
+    throw new Error("Equipment deployment did not persist as active and uninvoiced");
+  }
+  const support = api.getWorkspaceState().files.find((item) => item.sourceType === "equipmentDeployment" && item.sourceId === deployment.id);
+  if (!support) throw new Error("Equipment deployment has no durable support file");
+  const cardSelector = `.equipment-card[data-deployment-id="${deployment.id}"]`;
+  if (await page.locator(`${cardSelector} [data-action="create-equipment-invoice"]`).count()) {
+    throw new Error("Active equipment can be invoiced before return");
+  }
+  await fillDeployment();
+  const beforeDuplicate = JSON.stringify(api.getWorkspaceState());
+  const duplicateWrites = api.getWorkspaceWriteCount();
+  await click(page, `${formSelector} button[type="submit"]`);
+  await page.locator(".toast").filter({ hasText: "already active" }).waitFor();
+  if (JSON.stringify(api.getWorkspaceState()) !== beforeDuplicate || api.getWorkspaceWriteCount() !== duplicateWrites) {
+    throw new Error("Duplicate active asset changed shared equipment data");
+  }
+  await reloadFromServer(page, api);
+  await go(page, "jobs");
+  await page.locator(`[data-job-operations="${ids.jobId}"]`).filter({ hasText: "1 / 1 records" }).waitFor();
+  await captureResponsiveEvidence(page, "job-equipment-active", page.locator(`[data-job-operations="${ids.jobId}"]`));
+  await go(page, "equipment");
+  await page.locator(`${cardSelector} [name="returnedAt"]`).fill(dates.returnedAt);
+  const returnNotes = `Checked and returned ${stamp}`;
+  await page.locator(`${cardSelector} [name="returnNotes"]`).fill(returnNotes);
+  await rejectFormSave(page, api, "equipment-return", returnNotes, {
+    returnedAt: dates.returnedAt, returnNotes
+  }, /equipment return saved/i, `${cardSelector} form[data-form="equipment-return"]`);
+  await click(page, `${cardSelector} form[data-form="equipment-return"] button[type="submit"]`);
+  await page.locator(".toast").filter({ hasText: "Equipment return saved" }).waitFor();
+  const returned = api.getWorkspaceState().equipmentDeployments.find((item) => item.id === deployment.id);
+  if (returned.status !== "Returned" || returned.rentalDays !== 2 || !returned.returnedAt) {
+    throw new Error(`Equipment return did not compute two rental days: ${JSON.stringify(returned)}`);
+  }
+  await reloadFromServer(page, api);
+  await go(page, "jobs");
+  await page.locator(`[data-job-operations="${ids.jobId}"]`).filter({ hasText: "0 / 1 records" }).waitFor();
+  await go(page, "equipment");
+  await page.locator(`${cardSelector} form[data-form="equipment-billing"] [name="dailyRate"]`).fill("95");
+  const billingInvoiceNumber = `REVIEW-INV-${stamp}`;
+  await page.locator(`${cardSelector} form[data-form="equipment-billing"] [name="invoiceNumber"]`).fill(billingInvoiceNumber);
+  await rejectFormSave(page, api, "equipment-billing", billingInvoiceNumber, {
+    dailyRate: "95", invoiceNumber: billingInvoiceNumber, billable: true
+  }, /equipment billing saved/i, `${cardSelector} form[data-form="equipment-billing"]`);
+  await click(page, `${cardSelector} form[data-form="equipment-billing"] button[type="submit"]`);
+  await page.locator(".toast").filter({ hasText: "Equipment billing saved" }).waitFor();
+  await click(page, `${cardSelector} [data-action="create-equipment-invoice"]`);
+  await waitUntil("equipment invoice persisted", () => api.getWorkspaceState().equipmentDeployments.find((item) => item.id === deployment.id)?.invoiceId);
+  const invoiceId = api.getWorkspaceState().equipmentDeployments.find((item) => item.id === deployment.id).invoiceId;
+  if (api.getWorkspaceState().files.find((item) => item.id === invoiceId)?.amount !== 190) throw new Error("Two rental days at 95 did not invoice 190");
+  const repeatedWrites = api.getWorkspaceWriteCount();
+  await click(page, `${cardSelector} [data-action="create-equipment-invoice"]`);
+  await waitUntil("repeated equipment invoice persisted", () => api.getWorkspaceWriteCount() > repeatedWrites);
+  await page.locator(`${cardSelector} form[data-form="equipment-billing"] [name="dailyRate"]`).fill("100");
+  await click(page, `${cardSelector} form[data-form="equipment-billing"] button[type="submit"]`);
+  await waitUntil("equipment invoice updated in place", () => api.getWorkspaceState().files.find((item) => item.id === invoiceId)?.amount === 200);
+  await captureResponsiveEvidence(page, "equipment-billing-saved", page.locator(cardSelector));
+  const files = api.getWorkspaceState().files;
+  if (files.filter((item) => item.sourceType === "equipmentInvoice" && item.sourceId === deployment.id).length !== 1
+    || files.filter((item) => item.sourceType === "equipmentDeployment" && item.sourceId === deployment.id).length !== 1
+    || !files.some((item) => item.id === support.id)
+    || api.getWorkspaceState().equipmentDeployments.find((item) => item.id === deployment.id).invoiceId !== invoiceId) {
+    throw new Error("Equipment invoice or support file was duplicated instead of updated in place");
+  }
+  await fillDeployment({ ...draft, deployedAt: dates.returnedAt, billable: false });
+  await click(page, `${formSelector} button[type="submit"]`);
+  await waitUntil("returned asset tag reused", () => api.getWorkspaceState().equipmentDeployments.filter((item) => item.assetTag === ids.assetTag).length === 2);
+  const reused = api.getWorkspaceState().equipmentDeployments.find((item) => item.assetTag === ids.assetTag && item.id !== deployment.id);
+  const reusedCard = `.equipment-card[data-deployment-id="${reused.id}"]`;
+  await page.locator(`${reusedCard} [name="returnedAt"]`).fill(dates.returnedAt);
+  await click(page, `${reusedCard} form[data-form="equipment-return"] button[type="submit"]`);
+  await waitUntil("reused equipment returned", () => api.getWorkspaceState().equipmentDeployments.find((item) => item.id === reused.id)?.status === "Returned");
+  await reloadFromServer(page, api);
+  await go(page, "jobs");
+  await page.locator(`[data-job-operations="${ids.jobId}"]`).filter({ hasText: "0 / 2 records" }).waitFor();
+  await captureResponsiveEvidence(page, "job-equipment-returned", page.locator(`[data-job-operations="${ids.jobId}"]`));
+  for (const key of ["payments", "equipment", "jobs", "accounting", "drylogs", "revenueengine"]) {
+    await go(page, key);
+    await moduleFileCard(page, key, invoiceId).waitFor();
+  }
+  results.workflowChecks.push({ label: "Equipment lifecycle", text: "deployed 48 hours, duplicate active tag rejected, returned for two computed days, zero active on job, billing reviewed, invoice/support IDs reused, returned asset tag redeployed and returned, links retained after server reload" });
+}
+
+async function createWorkflowEmployee(page) {
+  await go(page, "team");
+  await fill(page, 'form[data-form="employee-invitation"] input[name="displayName"]', ids.employeeName);
+  await fill(page, 'form[data-form="employee-invitation"] input[name="email"]', ids.employeeEmail);
+  await fill(page, 'form[data-form="employee-invitation"] input[name="phone"]', "555-222-3030");
+  await fill(page, 'form[data-form="employee-invitation"] input[name="jobTitle"]', "Field technician");
+  await select(page, 'form[data-form="employee-invitation"] select[name="employmentType"]', "Employee");
+  await fill(page, 'form[data-form="employee-invitation"] input[name="startDate"]', "2026-07-20");
+  const employeeApplicationGroup = page.locator('form[data-form="employee-invitation"] [data-application-access-group="general-contracting"]');
+  const employeeApplicationToggle = employeeApplicationGroup.locator('[data-application-access="general-contracting"]');
+  const employeeApplicationModules = employeeApplicationGroup.locator('input[name="visibleModuleKeys"]');
+  await employeeApplicationModules.first().uncheck();
+  const partialApplicationState = await employeeApplicationToggle.evaluate((input) => ({
+    checked: input.checked,
+    indeterminate: input.indeterminate,
+    moduleStates: [...input.closest("[data-application-access-group]").querySelectorAll('input[name="visibleModuleKeys"]')]
+      .map((moduleInput) => ({ value: moduleInput.value, checked: moduleInput.checked }))
+  }));
+  if (!partialApplicationState.checked || !partialApplicationState.indeterminate) {
+    throw new Error(`A partial application grant did not display its mixed module-access state: ${JSON.stringify(partialApplicationState)}`);
+  }
+  await employeeApplicationToggle.uncheck();
+  if ((await employeeApplicationModules.evaluateAll((inputs) => inputs.some((input) => input.checked)))) {
+    throw new Error("Removing application access left an employee module selected");
+  }
+  await employeeApplicationToggle.check();
+  if (!(await employeeApplicationModules.evaluateAll((inputs) => inputs.every((input) => input.checked)))) {
+    throw new Error("Granting application access did not select every allowed employee module");
+  }
+  results.workflowChecks.push({ label: "Application access controls", text: "full, partial, and removed module grants stay synchronized" });
+  const employeeInviteSubmit = page.locator('form[data-form="employee-invitation"] button[type="submit"]');
+  await captureResponsiveEvidence(page, "employee-invitation-form", page.locator('form[data-form="employee-invitation"]'));
+  if (await employeeInviteSubmit.isDisabled()) {
+    throw new Error("Employee invitation submit is disabled even though secure storage is available");
+  }
+  const employeeInviteResponse = page.waitForResponse((response) => {
+    return new URL(response.url()).pathname === "/api/employee-invitations"
+      && response.request().method() === "POST";
+  });
+  await click(page, 'form[data-form="employee-invitation"] button[type="submit"]');
+  const inviteResponse = await employeeInviteResponse;
+  const inviteResult = await inviteResponse.json().catch(() => ({}));
+  if (!inviteResponse.ok() || inviteResult.success === false || inviteResult.grant?.email !== ids.employeeEmail) {
+    throw new Error(`Employee invitation API failed: ${inviteResult.message || inviteResponse.status()}`);
+  }
+  await expectBody(page, "pending employee profile created", ids.employeeEmail);
+  await expectBody(page, "pending employee is visible before acceptance", "Invitation pending");
+  const pendingEmployeeCard = page.locator(".team-card").filter({ hasText: ids.employeeEmail });
+  if (await pendingEmployeeCard.locator('[data-action="open-user-manage"], [data-action="reset-user-permissions"], [data-action="toggle-user-disabled"], [data-action="delete-user"]').count()) {
+    throw new Error("Pending employee exposed accepted-user management controls");
+  }
+  await click(page, `.team-card:has-text("${ids.employeeEmail}") button[data-action="open-pending-employee-manage"]`);
+  await fill(page, 'form[data-form="pending-employee-manage"] input[name="jobTitle"]', "Lead field technician");
+  await click(page, 'form[data-form="pending-employee-manage"] button[type="submit"]');
+  await expectBody(page, "pending employee profile updated", "Lead field technician");
+}
+
 async function runWorkflow(page, localSmokeApi) {
+  await createWorkflowEmployee(page);
   await go(page, "jobs");
   await fill(page, 'form[data-form="job-record"] input[name="jobId"]', ids.jobId);
   await fill(page, 'form[data-form="job-record"] input[name="title"]', ids.jobTitle);
@@ -522,8 +1109,14 @@ async function runWorkflow(page, localSmokeApi) {
   await fill(page, 'form[data-form="job-record"] input[name="owner"]', "AI QA");
   await fill(page, 'form[data-form="job-record"] textarea[name="nextAction"]', "Verify cross-module handoffs");
   await fill(page, 'form[data-form="job-record"] textarea[name="blockers"]', "None");
+  await captureResponsiveEvidence(page, "job-record-form", page.locator('form[data-form="job-record"]'));
+  await rejectFormSave(page, localSmokeApi, "job-record", ids.jobTitle, await formDraft(page, "job-record"), /job saved|file created/i);
   await click(page, 'form[data-form="job-record"] button[type="submit"]');
   await expectBody(page, "job created", ids.jobId);
+  await waitForWorkspaceQuiescence(page, localSmokeApi);
+  if (localSmokeApi.getWorkspaceState().jobBoards.filter((job) => job.jobId === ids.jobId).length !== 1) {
+    throw new Error("Job retry did not persist exactly one job");
+  }
 
   await go(page, "sketch");
   const initialSketchRooms = await page.locator(".sketch-room-shape").count();
@@ -602,13 +1195,36 @@ async function runWorkflow(page, localSmokeApi) {
   await expectBody(page, "connected plan linked to jobs", `${ids.jobId} measured floor plan`);
 
   await go(page, "dispatch");
+  await click(page, 'button[data-action="focus-workbench"]');
+  if (!await page.locator('form[data-form="module-workbench"] input[name="subject"]').evaluate((element) => element === document.activeElement)) {
+    throw new Error("The dispatch hero did not focus the dispatch workbench subject");
+  }
   await fill(page, 'form[data-form="module-workbench"] input[name="subject"]', ids.moduleRecord);
   await fill(page, 'form[data-form="module-workbench"] input[name="relatedJob"]', ids.jobId);
   await fill(page, 'form[data-form="module-workbench"] input[name="owner"]', "Dispatch supervisor");
   await select(page, 'form[data-form="module-workbench"] select[name="priority"]', "High");
   await fill(page, 'form[data-form="module-workbench"] input[name="due"]', "2026-07-23");
+  if (localSmokeApi) await rejectFormSave(page, localSmokeApi, "module-workbench", ids.moduleRecord, {
+    subject: ids.moduleRecord, relatedJob: ids.jobId, owner: "Dispatch supervisor", priority: "High", due: "2026-07-23"
+  }, /dispatch item saved|file created/i);
   await click(page, 'form[data-form="module-workbench"] button[type="submit"]');
   await expectBody(page, "typed dispatch record created", ids.moduleRecord);
+  if (localSmokeApi) {
+    await waitUntil("durable dispatch record and linked file", () => {
+      const workspace = localSmokeApi.getWorkspaceState();
+      const record = workspace.moduleRecords?.find((item) => item.subject === ids.moduleRecord && item.moduleKey === "dispatch");
+      const file = workspace.files?.find((item) => item.sourceId === record?.id && item.moduleKey === "dispatch");
+      return record?.relatedJob === ids.jobId && file?.relatedJob === ids.jobId
+        && ["jobs", "time", "routeplanner"].every((key) => record.linkedModuleKeys?.includes(key) && file.linkedModuleKeys?.includes(key));
+    });
+    await reloadFromServer(page, localSmokeApi);
+    for (const key of ["dispatch", "jobs", "time", "routeplanner"]) {
+      await go(page, key);
+      await page.locator(".file-card").filter({ hasText: ids.moduleRecord }).waitFor();
+      if (key === "dispatch") await captureResponsiveEvidence(page, "dispatch-saved", page.locator(".module-record-card").filter({ hasText: ids.moduleRecord }));
+    }
+    results.workflowChecks.push({ label: "Dispatch creation", text: "hero focuses the real form; record and file persist after reload and remain linked to jobs, time, and route planning" });
+  }
   await go(page, "routeplanner");
   await expectBody(page, "typed dispatch record crossed into route planning", ids.moduleRecord);
   await click(page, `.module-record-card:has-text("${ids.moduleRecord}") button[data-action="complete-module-record"]`);
@@ -617,59 +1233,11 @@ async function runWorkflow(page, localSmokeApi) {
   await completedDispatchRecord.filter({ hasText: "Complete" }).waitFor({ state: "visible", timeout: 8000 });
 
   await go(page, "team");
-  await fill(page, 'form[data-form="employee-invitation"] input[name="displayName"]', ids.employeeName);
-  await fill(page, 'form[data-form="employee-invitation"] input[name="email"]', ids.employeeEmail);
-  await fill(page, 'form[data-form="employee-invitation"] input[name="phone"]', "555-222-3030");
-  await fill(page, 'form[data-form="employee-invitation"] input[name="jobTitle"]', "Field technician");
-  await select(page, 'form[data-form="employee-invitation"] select[name="employmentType"]', "Employee");
-  await fill(page, 'form[data-form="employee-invitation"] input[name="startDate"]', "2026-07-20");
-  await fill(page, 'form[data-form="employee-invitation"] input[name="assignedJobIds"]', ids.jobId);
-  const employeeApplicationGroup = page.locator('form[data-form="employee-invitation"] [data-application-access-group="general-contracting"]');
-  const employeeApplicationToggle = employeeApplicationGroup.locator('[data-application-access="general-contracting"]');
-  const employeeApplicationModules = employeeApplicationGroup.locator('input[name="visibleModuleKeys"]');
-  await employeeApplicationModules.first().uncheck();
-  const partialApplicationState = await employeeApplicationToggle.evaluate((input) => ({
-    checked: input.checked,
-    indeterminate: input.indeterminate,
-    moduleStates: [...input.closest("[data-application-access-group]").querySelectorAll('input[name="visibleModuleKeys"]')]
-      .map((moduleInput) => ({ value: moduleInput.value, checked: moduleInput.checked }))
-  }));
-  if (!partialApplicationState.checked || !partialApplicationState.indeterminate) {
-    throw new Error(`A partial application grant did not display its mixed module-access state: ${JSON.stringify(partialApplicationState)}`);
-  }
-  await employeeApplicationToggle.uncheck();
-  if ((await employeeApplicationModules.evaluateAll((inputs) => inputs.some((input) => input.checked)))) {
-    throw new Error("Removing application access left an employee module selected");
-  }
-  await employeeApplicationToggle.check();
-  if (!(await employeeApplicationModules.evaluateAll((inputs) => inputs.every((input) => input.checked)))) {
-    throw new Error("Granting application access did not select every allowed employee module");
-  }
-  results.workflowChecks.push({ label: "Application access controls", text: "full, partial, and removed module grants stay synchronized" });
-  const employeeInviteSubmit = page.locator('form[data-form="employee-invitation"] button[type="submit"]');
-  if (await employeeInviteSubmit.isDisabled()) {
-    throw new Error("Employee invitation submit is disabled even though secure storage is available");
-  }
-  const employeeInviteResponse = page.waitForResponse((response) => {
-    return new URL(response.url()).pathname === "/api/employee-invitations"
-      && response.request().method() === "POST";
-  });
-  await click(page, 'form[data-form="employee-invitation"] button[type="submit"]');
-  const inviteResponse = await employeeInviteResponse;
-  const inviteResult = await inviteResponse.json().catch(() => ({}));
-  if (!inviteResponse.ok() || inviteResult.success === false || inviteResult.grant?.email !== ids.employeeEmail) {
-    throw new Error(`Employee invitation API failed: ${inviteResult.message || inviteResponse.status()}`);
-  }
-  await expectBody(page, "pending employee profile created", ids.employeeEmail);
-  await expectBody(page, "pending employee is visible before acceptance", "Invitation pending");
-  const pendingEmployeeCard = page.locator(".team-card").filter({ hasText: ids.employeeEmail });
-  if (await pendingEmployeeCard.locator('[data-action="open-user-manage"], [data-action="reset-user-permissions"], [data-action="toggle-user-disabled"], [data-action="delete-user"]').count()) {
-    throw new Error("Pending employee exposed accepted-user management controls");
-  }
   await click(page, `.team-card:has-text("${ids.employeeEmail}") button[data-action="open-pending-employee-manage"]`);
-  await fill(page, 'form[data-form="pending-employee-manage"] input[name="jobTitle"]', "Lead field technician");
+  await fill(page, 'form[data-form="pending-employee-manage"] input[name="assignedJobIds"]', ids.jobId);
   await click(page, 'form[data-form="pending-employee-manage"] button[type="submit"]');
-  await expectBody(page, "pending employee profile updated", "Lead field technician");
+  await expectBody(page, "employee assigned to newly created job", `Jobs: ${ids.jobId}`);
+  await waitForWorkspaceQuiescence(page, localSmokeApi);
 
   const moduleOptions = await page.locator('form[data-form="task"] select[name="moduleKey"] option').evaluateAll((options) => {
     return options.map((option) => option.value);
@@ -689,8 +1257,24 @@ async function runWorkflow(page, localSmokeApi) {
   await fill(page, 'form[data-form="task"] input[name="relatedJob"]', ids.jobId);
   await fill(page, 'form[data-form="task"] input[name="due"]', "2026-07-24");
   await select(page, 'form[data-form="task"] select[name="priority"]', "High");
+  const taskDraft = await formDraft(page, "task");
+  if (taskDraft.moduleKey !== "photos" || taskDraft.assigneeId !== assigneeValue) {
+    throw new Error(`Task form changed the chosen module or employee before submission: ${JSON.stringify(taskDraft)}`);
+  }
+  await rejectFormSave(page, localSmokeApi, "task", ids.taskTitle, taskDraft, /task assigned|task saved|file created/i);
   await click(page, 'form[data-form="task"] button[type="submit"]');
   await expectBody(page, "photo task assigned", ids.taskTitle);
+  await waitForWorkspaceQuiescence(page, localSmokeApi);
+  const assignedTasks = localSmokeApi.getWorkspaceState().tasks.filter((task) => task.title === ids.taskTitle);
+  if (assignedTasks.length !== 1 || assignedTasks[0].moduleKey !== "photos"
+    || assignedTasks[0].assigneeId !== assigneeValue || assignedTasks[0].relatedJob !== ids.jobId) {
+    throw new Error(`Task retry did not persist exactly the requested photo assignment: ${JSON.stringify(assignedTasks)}`);
+  }
+
+  await testManualTime(page, localSmokeApi);
+  console.log("[smoke] manual time, failure recovery, and job summary verified");
+  await testPricingUploads(page, localSmokeApi);
+  console.log("[smoke] pricing upload, failure recovery, confirmation, and cancellation verified");
 
   await go(page, "pricing");
   await click(page, 'button[data-action="import-sample-pricing"]');
@@ -771,27 +1355,8 @@ async function runWorkflow(page, localSmokeApi) {
   await expectBody(page, "job note linked to communications", linkedJobNote);
   await go(page, "photos");
 
-  await go(page, "equipment");
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="equipmentName"]', ids.equipmentName);
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="assetTag"]', ids.assetTag);
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="job"]', ids.jobId);
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="room"]', ids.dryRoom);
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="invoiceNumber"]', `INV-${stamp}`);
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="address"]', `123 AI Test Ave ${stamp}`);
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="latitude"]', "42.45010");
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="longitude"]', "-73.24540");
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="rentalDays"]', "3");
-  await fill(page, 'form[data-form="equipment-deployment"] input[name="dailyRate"]', "95");
-  await fill(page, 'form[data-form="equipment-deployment"] textarea[name="notes"]', "AI QA billable equipment record");
-  await click(page, 'form[data-form="equipment-deployment"] button[type="submit"]');
-  await expectBody(page, "equipment saved", ids.assetTag);
-  const equipmentInvoiceButtonId = await page.evaluate((assetTag) => {
-    const card = [...document.querySelectorAll(".equipment-card")].find((node) => node.textContent.includes(assetTag));
-    return card?.querySelector('button[data-action="create-equipment-invoice"]')?.dataset.id || "";
-  }, ids.assetTag);
-  if (!equipmentInvoiceButtonId) throw new Error("Equipment invoice button did not render for the new deployment");
-  await click(page, `button[data-action="create-equipment-invoice"][data-id="${equipmentInvoiceButtonId}"]`);
-  await expectBody(page, "equipment invoice created", ids.equipmentName);
+  await testEquipmentLifecycle(page, localSmokeApi);
+  console.log("[smoke] equipment deployment, return, billing, failure recovery, and reload verified");
 
   await go(page, "time");
   await fill(page, 'form[data-form="clock-in"] input[name="worker"]', ids.employeeName);
@@ -933,6 +1498,7 @@ async function verifyDurableReload(page, localSmokeApi) {
     ids.jobId,
     ids.employeeEmail,
     ids.taskTitle,
+    ids.manualTask,
     ids.moduleRecord,
     ids.sketchRoom,
     ids.sketchSeparateRoom,
@@ -946,8 +1512,7 @@ async function verifyDurableReload(page, localSmokeApi) {
     return requiredValues.every((value) => serialized.includes(value));
   });
 
-  await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForSelector(".app-shell", { timeout: 15000 });
+  await reloadFromServer(page, localSmokeApi);
   await go(page, "jobs");
   await expectBody(page, "reload retained job", ids.jobId);
   await go(page, "dispatch");
@@ -957,6 +1522,8 @@ async function verifyDurableReload(page, localSmokeApi) {
   await go(page, "team");
   await expectBody(page, "reload retained employee", ids.employeeEmail);
   await expectBody(page, "reload retained task", ids.taskTitle);
+  await go(page, "time");
+  await expectBody(page, "reload retained manual office time", ids.manualTask);
   await go(page, "sketch");
   await expectBody(page, "reload retained connected room", ids.sketchRoom);
   await expectBody(page, "reload retained separate room", ids.sketchSeparateRoom);
@@ -1360,14 +1927,7 @@ async function testEmergencyMonitor(page, localSmokeApi) {
   await waitUntil("radio inbox refresh", async () => !await monitor.getByRole("button", { name: "Refresh feed", exact: true }).isDisabled());
   if (!await draft.evaluate((element) => element.isConnected && element.value === "Unsaved incident draft")) throw new Error("Incident refresh discarded a manual draft");
   await monitor.locator("summary").click();
-  await monitor.scrollIntoViewIfNeeded();
-  fs.mkdirSync(new URL("../logs/", import.meta.url), { recursive: true });
-  await page.screenshot({ path: "logs/emergency-desktop.png" });
-  await page.setViewportSize({ width: 390, height: 844 });
-  await monitor.scrollIntoViewIfNeeded();
-  if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 2)) throw new Error("Emergency monitor overflows mobile viewport");
-  await page.screenshot({ path: "logs/emergency-mobile.png" });
-  await page.setViewportSize({ width: 1440, height: 900 });
+  await captureResponsiveEvidence(page, "emergency", monitor);
   results.workflowChecks.push({ label: "Emergency monitor", text: "manual entry, review, dismiss, refresh, dispatch handoff, route planning, reload, fixture audio playback/pause, draft preservation, desktop and mobile layout" });
 }
 
@@ -1753,6 +2313,22 @@ const allOwnerActions = [
 async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
   let workspaceState = {};
   let workspaceWriteCount = 0;
+  let workspaceReadCount = 0;
+  let workspaceRejection = null;
+  const workspaceRequests = new Set();
+  let workspaceRequestVersion = 0;
+  context.on("request", (request) => {
+    const url = new URL(request.url());
+    // Access-context refreshes also replace forms, so finish those before entering a new draft.
+    if (url.origin !== origin || !url.pathname.startsWith("/api/")) return;
+    workspaceRequests.add(request);
+    workspaceRequestVersion += 1;
+  });
+  const finishWorkspaceRequest = (request) => {
+    if (workspaceRequests.delete(request)) workspaceRequestVersion += 1;
+  };
+  context.on("requestfinished", finishWorkspaceRequest);
+  context.on("requestfailed", finishWorkspaceRequest);
   let workspaceRevision = "owner-revision-0";
   let sessionActive = true;
   const emergencyIncidents = [];
@@ -1934,6 +2510,7 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
       return json(200, { success: true });
     }
     if (url.pathname === "/api/workspace-state" && method === "GET") {
+      workspaceReadCount += 1;
       return json(200, {
         success: true,
         durable: true,
@@ -1946,6 +2523,12 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
     }
     if (url.pathname === "/api/workspace-state" && method === "PUT") {
       const payload = request.postDataJSON() || {};
+      if (workspaceRejection && JSON.stringify(payload.workspaceState).includes(workspaceRejection.marker)) {
+        const { message } = workspaceRejection;
+        workspaceRejection = null;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return json(503, { success: false, message });
+      }
       if (payload.baseRevision !== workspaceRevision) {
         return json(409, { success: false, message: "Owner smoke workspace revision conflict." });
       }
@@ -2056,12 +2639,17 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
     }
     if (url.pathname === "/api/employee-invitations" && method === "POST") {
       const payload = request.postDataJSON() || {};
+      const employerKey = owner.email.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+      const contractorId = payload.contractorId || owner.contractorId || `employer-${employerKey}`;
       const grant = {
         id: `employee-grant-${Date.now()}`,
         email: payload.email,
         displayName: payload.displayName,
         roleId: "worker",
-        contractorId: payload.contractorId || `contractor-${stamp}`,
+        companyId: payload.companyId || owner.companyId || "default-company",
+        franchiseIds: payload.franchiseIds || [],
+        contractorId,
+        employerContractorId: contractorId,
         employerUid: owner.uid,
         employerEmail: owner.email,
         onboardingMode: "employee_link",
@@ -2249,14 +2837,18 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
     if (url.pathname.startsWith("/api/rbac/") || url.pathname.startsWith("/api/access/")) {
       return json(200, { success: true, users, posts });
     }
-    return route.continue();
+    return json(501, { success: false, message: `Owner smoke route not configured: ${method} ${url.pathname}` });
   });
 
   return {
-    getWorkspaceState: () => workspaceState,
+    getWorkspaceState: () => structuredClone(workspaceState),
+    getAccessGrants: () => structuredClone(accessGrants),
+    getWorkspaceReadCount: () => workspaceReadCount,
+    rejectWorkspaceWriteContaining: (marker, message) => { workspaceRejection = { marker, message }; },
     getEmergencyIncidents: () => emergencyIncidents,
     enableTestRadio: () => { emergencySources = [{ id: "test-radio", label: "Test dispatch radio", area: "Local fixture only", streamUrl: `${origin}/smoke-radio.wav` }]; },
     getWorkspaceWriteCount: () => workspaceWriteCount,
+    getWorkspaceActivity: () => ({ inFlight: workspaceRequests.size, requestVersion: workspaceRequestVersion, writes: workspaceWriteCount }),
     injectLegacyRecords() {
       const moduleRecord = {
         id: `legacy-browser-${stamp}`,
@@ -2310,34 +2902,35 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
 
 async function launchSmokeBrowser() {
   const options = { headless: true, timeout: 30000 };
-  if (process.platform === "win32") {
-    try {
-      return await chromium.launch({ ...options, channel: "msedge" });
-    } catch (error) {
-      console.warn(`[smoke] Microsoft Edge was unavailable; using isolated Chromium. ${error.message}`);
-    }
+  try { return await chromium.launchServer(options); }
+  catch (error) {
+    if (process.platform !== "win32") throw error;
+    console.warn(`[smoke] Bundled Chromium unavailable; using isolated Microsoft Edge. ${error.message}`);
+    return chromium.launchServer({ ...options, channel: "msedge" });
   }
-  return chromium.launch(options);
 }
 
-const browser = await launchSmokeBrowser();
+let browserServer, browser, page, localSmokeApi;
+const consoleErrors = [];
+const developmentDiagnostics = [];
+const failedResponses = [];
+let failure;
+try {
+browserServer = await launchSmokeBrowser();
+browser = await chromium.connect(browserServer.wsEndpoint());
 const context = await browser.newContext({
   viewport: { width: 1440, height: 900 },
   geolocation: { latitude: 42.45, longitude: -73.245 },
   permissions: ["geolocation"]
 });
 await context.grantPermissions(["geolocation"], { origin });
-const localSmokeApi = ["127.0.0.1", "localhost"].includes(new URL(baseUrl).hostname)
-  ? await installLocalSmokeApi(context)
-  : null;
-const page = await context.newPage();
-page.setDefaultTimeout(8000);
-const consoleErrors = [];
-const developmentDiagnostics = [];
-const failedResponses = [];
+localSmokeApi = await installLocalSmokeApi(context);
+page = await context.newPage();
+page.setDefaultTimeout(20000);
 page.on("console", (message) => {
   if (message.type() !== "error") return;
   const messageText = message.text();
+  if (expectedWorkspaceFailure && /Failed to load resource:.*503/.test(messageText)) return;
   if (messageText.includes("status of 401 (Unauthorized)")) {
     return;
   }
@@ -2354,20 +2947,23 @@ page.on("pageerror", (error) => consoleErrors.push(error.message));
   page.on("response", (response) => {
     if (response.status() >= 400) {
       const pathname = new URL(response.url()).pathname;
+      if (expectedWorkspaceFailure && response.status() === 503 && pathname === "/api/workspace-state"
+        && response.request().method() === "PUT" && response.request().postData()?.includes(expectedWorkspaceFailure)) return;
       if (response.status() === 401 && pathname === "/api/auth/session") return;
       failedResponses.push(`${response.request().method()} ${response.status()} ${response.url()}`);
     }
 });
 
-let smokePassed = false;
-try {
+  await go(page, "daily");
+  await waitUntil("initial durable workspace hydration", async () => localSmokeApi.getWorkspaceReadCount() > 0
+    && localSmokeApi.getWorkspaceWriteCount() > 0 && await page.locator(".workspace-write-lock").count() === 0);
+  await runWorkflow(page, localSmokeApi);
+  console.log("[smoke] linked workflow complete");
   const moduleKeys = await safeModuleSweep(page);
   console.log("[smoke] module sweep complete");
   await testResponsiveInputs(page, localSmokeApi);
   await testEmergencyMonitor(page, localSmokeApi);
   await exerciseDataFieldControls(page);
-  await runWorkflow(page, localSmokeApi);
-  console.log("[smoke] linked workflow complete");
   await verifyGenericModuleConnectivity(page, moduleKeys);
   console.log("[smoke] semantic generic-module verification complete");
   await submitRemainingForms(page);
@@ -2429,26 +3025,32 @@ try {
   if (consoleErrors.length || failedResponses.length) {
     throw new Error(`Browser errors during smoke: ${[...new Set([...consoleErrors, ...failedResponses])].join(" | ")}`);
   }
-  fs.mkdirSync(new URL("../logs/", import.meta.url), { recursive: true });
-  fs.writeFileSync(new URL("../logs/browser-workflow-smoke.json", import.meta.url), JSON.stringify({ ok: true, ...results }, null, 2));
-  await new Promise((resolve) => {
-    process.stdout.write(`${JSON.stringify({ ok: true, ...results }, null, 2)}\n`, resolve);
-  });
-  smokePassed = true;
 } catch (error) {
-  const diagnostics = await page.evaluate(() => ({
+  failure = error;
+  const diagnostics = await page?.evaluate((taskTitle) => ({
     url: location.href,
     heading: document.querySelector("h1")?.textContent?.trim() || "",
-    body: document.body.innerText.slice(0, 1200),
+    body: (document.querySelector("main") || document.body).innerText.slice(-8000),
     forms: [...document.querySelectorAll("form[data-form]")].map((form) => form.dataset.form),
-    toast: document.querySelector(".toast")?.textContent?.trim() || ""
-  })).catch(() => ({}));
+    toast: document.querySelector(".toast")?.textContent?.trim() || "",
+    observedToasts: window.__smokeToastChanges || [],
+    browserTasks: (JSON.parse(localStorage.getItem("brothers-os-workspace-v2") || "{}").tasks || []).filter((task) => task.title === taskTitle)
+  }), ids.taskTitle).catch(() => ({}));
+  results.failureTaskState = {
+    browser: diagnostics?.browserTasks || [],
+    server: localSmokeApi?.getWorkspaceState().tasks?.filter((task) => task.title === ids.taskTitle) || []
+  };
   console.error(JSON.stringify({ diagnostics, consoleErrors, failedResponses, developmentDiagnostics }, null, 2));
-  throw error;
+  if (page && !page.isClosed()) {
+    fs.mkdirSync(new URL("../logs/", import.meta.url), { recursive: true });
+    await page.screenshot({ path: fileURLToPath(new URL("../logs/browser-workflow-failure.png", import.meta.url)), timeout: 5000 }).catch(() => {});
+  }
 } finally {
-  await Promise.race([
-    browser.close(),
-    new Promise((resolve) => setTimeout(resolve, 5000))
-  ]);
-  if (smokePassed) process.exit(0);
+  try { await closeOwnedBrowser(browser, browserServer); }
+  catch (error) { failure = failure ? new AggregateError([failure, error], "Workflow and browser cleanup failed") : error; }
 }
+const report = { ok: !failure, ...results, error: failure?.stack, causes: failure?.errors?.map((error) => error.stack), consoleErrors, failedResponses, developmentDiagnostics };
+fs.mkdirSync(new URL("../logs/", import.meta.url), { recursive: true });
+fs.writeFileSync(new URL("../logs/browser-workflow-smoke.json", import.meta.url), JSON.stringify(report, null, 2));
+console.log(JSON.stringify(report, null, 2));
+if (failure) throw failure;

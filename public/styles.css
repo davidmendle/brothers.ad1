@@ -1341,6 +1341,17 @@ dd {
   gap: 16px;
 }
 
+.time-layout > .panel,
+.time-layout form,
+.time-layout label {
+  min-width: 0;
+}
+
+.time-layout select {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .access-code {
   margin-top: 12px;
   display: inline-flex;
@@ -4382,6 +4393,32 @@ details.sketch-tool-panel[open] > summary {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
 }
+
+.job-operations {
+  border-block: 1px solid var(--line);
+  padding-block: 10px;
+  margin-block: 12px;
+}
+
+.job-operations dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(115px, 1fr));
+  gap: 10px;
+}
+
+.job-operations dl > div {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  border: 0;
+  padding: 0;
+}
+
+.job-operations dt { font-size: 12px; color: var(--muted); }
+.job-operations dd { margin: 4px 0 0; font-weight: 600; }
+.job-operations p { margin: 8px 0 0; overflow-wrap: anywhere; }
+.import-results, .import-review { min-width: 0; overflow-wrap: anywhere; }
+.import-results [data-import-status="error"] { color: #a31e30; }
+.import-review .price-table-wrap { max-height: 320px; overflow: auto; }
 
 .activity-list {
   display: grid;

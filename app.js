@@ -9,6 +9,14 @@ import {
 import { normalizeSectionButtonUrl } from "./ui-security.js";
 import { requestJson } from "./request-json.js";
 import { createEmergencyMonitor } from "./emergency-monitor.js";
+import { parsePricingImport } from "./pricing-import.js";
+import { extractPricingDocuments } from "./import-files.js";
+import { normalizeManualTimeEntry } from "./manual-time.js";
+import {
+  canManageEquipmentBilling, equipmentRecordScope, sameEquipmentScope,
+  isEquipmentActive, normalizeEquipmentDeployment, returnEquipmentDeployment,
+  normalizeEquipmentBilling, equipmentMatchesJob, equipmentJobGate
+} from "./equipment-lifecycle.js";
 
 const modules = Array.isArray(window.BROTHERS_MODULES) ? window.BROTHERS_MODULES : [];
 const applications = Array.isArray(window.BROTHERS_APPLICATIONS) ? window.BROTHERS_APPLICATIONS : [];
@@ -17,6 +25,10 @@ const storageKey = "brothers-os-workspace-v2";
 const viewStorageKey = `${storageKey}-view`;
 let viewSaveTimer;
 let moduleSearchFrame;
+let pricingImportBusy = false;
+let pricingImportResults = [];
+let pricingImportReview = null;
+let pricingImportIdentity = "";
 const remoteWorkspaceFields = [
   "files", "moduleRecords", "queue", "activity", "standardsOutputs", "learnedJargon",
   "equipmentDeployments", "dryLogs", "jobBoards", "contacts", "branches",
@@ -42,7 +54,7 @@ const durableMutationActions = new Set([
   "create-equipment-invoice", "generate-rebuttal", "run-live-source-check", "toggle-job-gate",
   "create-job-packet", "create-drylog-packet", "log-contact-touch", "create-contact-file",
   "toggle-branch-module", "create-branch-file", "create-estimate-invoice", "remove-estimate-line",
-  "import-sample-pricing", "connect-quickbooks", "create-payment-rail", "complete-task",
+  "import-sample-pricing", "confirm-pricing-import", "connect-quickbooks", "create-payment-rail", "complete-task",
   "professionalize-sketch", "save-sketch-file", "undo-sketch", "delete-sketch-wall",
   "ai-copilot-ask", "ai-copilot-prompt", "save-standards-output", "complete-queue", "seed-queue",
   "clock-out", "reset-user-permissions", "toggle-user-disabled", "delete-user",
@@ -1551,6 +1563,8 @@ function scheduleWorkspaceSync() {
 }
 
 async function syncWorkspaceState({ force = false } = {}) {
+  window.clearTimeout(workspaceSyncTimer);
+  workspaceSyncTimer = null;
   if (!workspaceWritesReady()) return null;
   if (workspaceSyncPromise) {
     workspaceSyncQueued = true;
@@ -1580,6 +1594,7 @@ async function syncWorkspaceState({ force = false } = {}) {
           baseUpdatedAt: state.workspacePersistence.lastSavedAt || ""
         })
       });
+      if (!result.durable && !isOfflineSmokePreview()) throw new Error("The server could not confirm shared storage. Your changes are not saved.");
       lastWorkspacePayload = serialized;
       state.workspacePersistence = {
         durable: Boolean(result.durable),
@@ -1827,7 +1842,31 @@ function workspaceWritesReady() {
 
 function blockUnavailableWorkspaceWrite() {
   setToast("Secure shared storage is unavailable; no changes were made");
-  render();
+}
+
+async function submitDurableForm(form, operation) {
+  if (form.dataset.saving === "true") return;
+  const draft = new FormData(form);
+  const type = form.dataset.form;
+  form.dataset.saving = "true";
+  const buttons = [...form.querySelectorAll('button[type="submit"]')];
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    await operation();
+  } catch (error) {
+    if (state.workspacePersistence.status === "error") await recoverRejectedWorkspaceState(error);
+    const currentForm = [...document.querySelectorAll("form[data-form]")].find((candidate) => candidate.dataset.form === type);
+    if (currentForm && currentForm !== form) {
+      for (const field of currentForm.elements) {
+        if (field.type === "checkbox") field.checked = draft.has(field.name);
+        else if (field.type !== "file" && draft.has(field.name)) field.value = draft.get(field.name);
+      }
+    }
+    setToast(error.message || "The record was not saved. Please retry.");
+  } finally {
+    delete form.dataset.saving;
+    buttons.forEach((button) => { button.disabled = false; });
+  }
 }
 
 function renderWorkspaceDurabilityNotice() {
@@ -2835,7 +2874,7 @@ function ensureWorkflowTasks(tasks) {
   return tasks.map(ensureWorkflowTask).filter(Boolean);
 }
 
-function createFile(data) {
+function createFile(data, { announce = true } = {}) {
   const module = moduleByKey(data.moduleKey || state.activeKey) || activeModule();
   const now = new Date().toISOString();
   const linkedModuleKeys = normalizeModuleKeyList(data.linkedModuleKeys || data.linkedModules || [], module.key);
@@ -2859,6 +2898,7 @@ function createFile(data) {
     status: data.status || "Open",
     priority: data.priority || "Medium",
     due: data.due || "",
+    jobId: String(data.jobId || "").trim(),
     relatedJob: data.relatedJob?.trim() || "",
     taskId: String(data.taskId || "").trim(),
     workerId: String(data.workerId || "").trim(),
@@ -2870,13 +2910,15 @@ function createFile(data) {
     updatedAt: now,
     history: [`Created in ${module.label}`, ...(linkedLabels.length ? [`Visible in ${linkedLabels.join(", ")}`] : [])]
   };
-  Object.assign(file, applicationScopeForModules(module.key, linkedModuleKeys));
+  Object.assign(file, equipmentRecordScope(data), applicationScopeForModules(module.key, linkedModuleKeys));
   state.files = [file, ...state.files];
   state.selectedFileId = file.id;
   addActivity(`Created ${file.title} in ${module.label}.`);
   persist();
-  setToast("File created");
-  closeModal();
+  if (announce) {
+    setToast("File created");
+    closeModal();
+  }
   return file;
 }
 
@@ -2967,6 +3009,10 @@ function updateFileStatus(fileId, status) {
   if (!file) {
     setToast("That file is no longer available.");
     return render();
+  }
+  if (file.sourceType === "equipmentDeployment") {
+    setToast("Record the equipment return in its deployment card.");
+    return routeToModule("equipment");
   }
   if (!canEditFileRecord(file)) {
     setToast("Complete the assigned ticket with GPS instead");
@@ -3070,6 +3116,7 @@ function invoiceFileOptions() {
 }
 
 function equipmentCharge(deployment) {
+  if (!deployment.billable) return 0;
   const days = Number(deployment.rentalDays || 0);
   const rate = Number(deployment.dailyRate || 0);
   return Math.max(0, days * rate);
@@ -3768,6 +3815,14 @@ function toggleJobGate(jobId, gateId) {
 }
 
 function addJobRecord(formData) {
+  const branchId = String(formData.get("branchId") || state.branches[0]?.id || "");
+  const branch = state.branches.find((item) => item.id === branchId);
+  const contractorId = String(formData.get("contractorId") || currentEmployerContractorId()).trim();
+  const authorizedEmployers = new Set([currentEmployerContractorId(), ...employeeEmployerOptions().map((employer) => employer.contractorId)]);
+  if (!contractorId || !authorizedEmployers.has(contractorId)) {
+    setToast("Select an existing employer profile for this job.");
+    return;
+  }
   const gates = ["authorization", "deposit", "photos", "time", "equipment", "drylogs", "invoice"].map((id) => ({
     id,
     label:
@@ -3786,7 +3841,9 @@ function addJobRecord(formData) {
     id: createId("JOB"),
     jobId: String(formData.get("jobId") || createId("J")).trim(),
     title: String(formData.get("title") || "New job").trim(),
-    branchId: String(formData.get("branchId") || state.branches[0]?.id || ""),
+    branchId,
+    ...(branch?.franchiseId ? { franchiseId: branch.franchiseId } : {}),
+    contractorId,
     customer: String(formData.get("customer") || "").trim(),
     property: String(formData.get("property") || "").trim(),
     stage: String(formData.get("stage") || "Intake"),
@@ -3800,6 +3857,8 @@ function addJobRecord(formData) {
   };
   state.jobBoards = [job, ...state.jobBoards];
   createFile({
+    ...equipmentRecordScope(job),
+    jobId: job.id,
     moduleKey: "jobs",
     linkedModuleKeys: job.linkedModules,
     sourceType: "job",
@@ -3813,7 +3872,7 @@ function addJobRecord(formData) {
     due: job.end,
     relatedJob: job.jobId,
     notes: `Stage: ${job.stage}\nCustomer: ${job.customer}\nProperty: ${job.property}\nNext action: ${job.nextAction}\nBlockers: ${job.blockers || "None"}`
-  });
+  }, { announce: false });
   ensureWorkflowTasks([
     {
       title: `Collect required photos for ${job.jobId}`,
@@ -3860,10 +3919,10 @@ function addJobRecord(formData) {
       sourceType: "job",
       sourceId: job.id
     }
-  ]);
+  ].map((task) => ({ ...task, ...equipmentRecordScope(job), jobId: job.id })));
   addActivity(`Added job tracker record for ${job.jobId}.`);
   persist();
-  render();
+  return job;
 }
 
 function currentRoleId() {
@@ -4004,6 +4063,13 @@ function isContractorScopedRole() {
 
 function currentContractorId() {
   return state.authSession?.contractorId || currentSessionUser()?.contractorId || "";
+}
+
+function currentEmployerContractorId() {
+  if (currentContractorId()) return currentContractorId();
+  const emailKey = String(state.authSession?.email || currentSessionUser()?.email || "")
+    .trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return emailKey ? `employer-${emailKey}` : "";
 }
 
 function employeeEmployerOptions() {
@@ -5680,124 +5746,21 @@ function splitCsvLine(line) {
   return cells;
 }
 
-function parsePriceCsv(text) {
-  const rows = String(text || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map(splitCsvLine);
-  if (!rows.length) return [];
-  const headers = rows[0].map((header) => header.toLowerCase().replace(/[^a-z0-9]/g, ""));
-  const hasHeader = headers.some((header) => ["code", "name", "item", "rate", "price", "unit", "cost"].includes(header));
-  const body = hasHeader ? rows.slice(1) : rows;
-  const headerAliases = {
-    code: ["code", "selector", "catselector", "catsel", "lineitemcode", "act", "activity"],
-    name: ["name", "item", "description", "desc", "lineitemdescription"],
-    category: ["category", "cat", "trade", "group"],
-    unit: ["unit", "uom", "unitofmeasure", "measure"],
-    rate: ["rate", "price", "unitprice", "unitcost", "rcv", "amount", "total"],
-    cost: ["cost", "laborcost", "materialcost"],
-    branch: ["branch", "location", "market"],
-    justification: ["justification", "notes", "note", "scope"],
-    qty: ["qty", "quantity", "count"]
-  };
-  return body
-    .map((row) => {
-      const value = (name, fallbackIndex) => {
-        const names = headerAliases[name] || [name];
-        const index = names.map((alias) => headers.indexOf(alias)).find((aliasIndex) => aliasIndex >= 0);
-        return row[index >= 0 ? index : fallbackIndex] || "";
-      };
-      return {
-        id: createId("PB"),
-        code: String(value("code", 0) || createId("ITEM")).trim().toUpperCase(),
-        name: String(value("name", 1) || value("item", 1) || "Imported item").trim(),
-        category: String(value("category", 2) || "Imported").trim(),
-        unit: String(value("unit", 3) || "each").trim(),
-        rate: parseAmount(value("rate", 4) || value("price", 4)),
-        cost: parseAmount(value("cost", 5)),
-        branch: String(value("branch", 6) || "All branches").trim(),
-        justification: String(value("justification", 7) || value("notes", 7) || "").trim(),
-        qty: Math.max(1, parseAmount(value("qty", 8)) || 1)
-      };
-    })
-    .filter((item) => item.name);
-}
-
-function parseXactimateLines(text, fileName = "xactimate import") {
-  const parsedItems = [];
-  const textValue = String(text || "");
-  const csvItems = parsePriceCsv(textValue)
-    .filter((item) => item.rate || /xact|xm8|estimate|line/i.test(`${item.category} ${item.code} ${fileName}`))
-    .map((item) => ({
-      code: item.code,
-      name: item.name,
-      unit: item.unit,
-      qty: item.qty || 1,
-      rate: item.rate,
-      source: fileName
-    }));
-  parsedItems.push(...csvItems);
-  try {
-    const xml = new DOMParser().parseFromString(textValue, "text/xml");
-    const nodes = [...xml.querySelectorAll("lineItem, LineItem, item, Item, estimateItem, EstimateItem, rec, Rec, estimateLine, EstimateLine")];
-    nodes.forEach((node) => {
-      const attr = (name) => node.getAttribute(name) || node.querySelector(name)?.textContent || node.querySelector(name.toLowerCase())?.textContent || "";
-      const code = attr("code") || attr("selector") || attr("catSel") || attr("lineItemCode") || attr("act") || attr("activity");
-      const name = attr("description") || attr("desc") || attr("name") || attr("lineItemDescription") || node.textContent.trim().slice(0, 80);
-      const unit = attr("unit") || attr("unitOfMeasure") || attr("uom") || "each";
-      const qty = parseAmount(attr("quantity") || attr("qty") || "1") || 1;
-      const rate = parseAmount(attr("unitPrice") || attr("price") || attr("rate") || attr("rcv") || attr("amount") || attr("unitcost"));
-      if (name && (code || rate)) {
-        parsedItems.push({ code: code || createId("XM8"), name, unit, qty, rate, source: fileName });
-      }
-    });
-  } catch {
-    // Fall through to text parsing.
+function validatedPricingLines(text, sourceName, format = "auto") {
+  const result = parsePricingImport(text, { fileName: sourceName, format, maxRows: 2500 });
+  if (result.status !== "ready" || !result.lines.length) {
+    const details = result.issues.slice(0, 3).map((issue) => issue.message).join(" ");
+    throw new Error(details || "No unambiguous unit-price lines found. Export a line-item CSV with Description, Quantity, Unit, and Unit Price.");
   }
-  if (!parsedItems.length) {
-    textValue.split(/\r?\n/).forEach((line) => {
-      const match = line.match(/^\s*([A-Z]{2,5}[.\-\s]?[A-Z0-9]{2,})\s+(.{8,}?)\s+(\d+(?:\.\d+)?)\s+(EA|SF|LF|HR|DAY|DAYS|SQ|YD|CY|ITEM|EACH)\s+\$?(\d+(?:\.\d{1,2})?)/i);
-      if (match) {
-        parsedItems.push({
-          code: match[1].replace(/\s+/g, ".").toUpperCase(),
-          name: match[2].trim(),
-          qty: parseAmount(match[3]) || 1,
-          unit: match[4].toLowerCase(),
-          rate: parseAmount(match[5]),
-          source: fileName
-        });
-      }
-    });
-  }
-  const seen = new Set();
-  return parsedItems.filter((item) => {
-    const key = `${item.code}|${item.name}|${item.unit}|${item.rate}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return item.name && Number.isFinite(Number(item.rate));
-  });
+  return result.lines;
 }
 
 function pricingImportTotal(lines) {
-  return lines.reduce((sum, line) => sum + Number(line.qty || 1) * Number(line.rate || 0), 0);
+  return lines.reduce((sum, line) => sum + Number(line.qty ?? 1) * Number(line.rate ?? 0), 0);
 }
 
 function parsePastedPricingImport(text, sourceName = "pasted pricing import") {
-  const textValue = String(text || "").trim();
-  if (!textValue) return [];
-  const firstLines = textValue.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 3);
-  if (firstLines.some((line) => line.includes(","))) {
-    const csvLines = parsePriceCsv(textValue)
-      .filter((item) => Number(item.rate || 0) > 0)
-      .map((item) => ({
-        ...item,
-        qty: item.qty || 1,
-        source: sourceName
-      }));
-    if (csvLines.length) return csvLines;
-  }
-  return parseXactimateLines(textValue, sourceName);
+  return validatedPricingLines(text, sourceName);
 }
 
 function importPricingLines(lines, sourceName, options = {}) {
@@ -5810,9 +5773,12 @@ function importPricingLines(lines, sourceName, options = {}) {
       unit: String(line.unit || "each").trim(),
       rate: parseAmount(line.rate),
       cost: parseAmount(line.cost),
-      qty: Math.max(1, parseAmount(line.qty) || 1)
+      qty: Number(line.qty ?? 1)
     }))
-    .filter((line) => line.name && Number(line.rate || 0) > 0);
+    .filter((line) => line.name && Number.isFinite(line.rate) && Number.isFinite(line.qty));
+  if (state.priceItems.length + normalizedLines.length > 2500) {
+    throw new Error("Price history is limited to 2,500 rows. Import a smaller export; no rows were added.");
+  }
   if (!normalizedLines.length) {
     return { items: [], total: 0 };
   }
@@ -5829,6 +5795,8 @@ function importPricingLines(lines, sourceName, options = {}) {
     unit: line.unit,
     rate: line.rate,
     cost: line.cost,
+    sourceQuantity: line.qty,
+    sourceDocument: line.source || sourceName,
     branch: line.branch || branch,
     sourceFile: sourceName,
     importedAt: now,
@@ -5869,12 +5837,12 @@ function importPricingLines(lines, sourceName, options = {}) {
       importNotes,
       "Linked modules: pricing, defensibility, payments, accounting, and revenue engine."
     ].join("\n")
-  });
+  }, { announce: false });
   addActivity(`${options.activityPrefix || "Imported"} ${items.length} pricing line items from ${sourceName}.`);
   return { items, total };
 }
 
-function importPastedPricing(formData) {
+async function importPastedPricing(formData) {
   const sourceName = String(formData.get("sourceName") || `Pasted pricing ${today.toISOString().slice(0, 10)}`).trim();
   const lines = parsePastedPricingImport(formData.get("importText"), sourceName);
   if (!lines.length) {
@@ -5889,11 +5857,12 @@ function importPastedPricing(formData) {
     activityPrefix: "Imported pasted"
   });
   persist();
-  setToast(`${result.items.length} pasted pricing lines imported`);
+  await syncWorkspaceState({ force: true });
+  setToast(`${result.items.length} pasted pricing lines saved`);
   routeToModule("pricing");
 }
 
-function importSamplePricing() {
+async function importSamplePricing() {
   const sourceName = `Sample pricing ${today.toISOString().slice(0, 10)}`;
   const sampleText = [
     "WTR.LAB Water mitigation technician labor 4 HR 85.00",
@@ -5908,150 +5877,115 @@ function importSamplePricing() {
     activityPrefix: "Loaded sample"
   });
   persist();
-  setToast(`${result.items.length} sample pricing lines loaded`);
+  await syncWorkspaceState({ force: true });
+  setToast(`${result.items.length} sample pricing lines saved`);
   routeToModule("pricing");
-}
-
-async function processXactimateFile(file) {
-  try {
-    const arrayBuffer = await readFileAsArrayBuffer(file);
-    const extracted = await extractImportText(file, arrayBuffer);
-    const lines = parseXactimateLines(extracted.text, file.name);
-    if (!lines.length) {
-      state.xactimateImports = [
-        {
-          id: createId("XI"),
-          fileName: file.name,
-          importedAt: new Date().toISOString(),
-          lineCount: 0,
-          total: 0,
-          status: extracted.packageDetected ? "Captured package - needs line export" : "Needs review",
-          notes: extracted.packageDetected
-            ? `Captured ${extracted.entries.length || 1} ESX/PDF package entries. This file appears proprietary or image/compressed; upload a Xactimate line-item PDF/text/CSV/XML export for automatic line extraction.`
-            : "No line items were detected. For PDFs, export a text, CSV, or ESX/XML line-item report when possible."
-        },
-        ...state.xactimateImports
-      ];
-      createFile({
-        moduleKey: "pricing",
-        linkedModuleKeys: ["defensibility", "payments", "accounting", "revenueengine"],
-        sourceType: "xactimateImport",
-        sourceId: file.name,
-        title: `${file.name} import review`,
-        type: "Xactimate import",
-        owner: "Estimator",
-        status: "Needs review",
-        priority: "High",
-        notes: `${file.name} was captured but no readable line items were found.\nDetected entries: ${extracted.entries.join(", ") || "none"}\nNext step: upload a line-item PDF/text/CSV/XML export or process this ESX through a backend extractor.`
-      });
-      return { fileName: file.name, imported: 0, captured: true };
-    }
-    const result = importPricingLines(lines, file.name, {
-      sourceType: "xactimateImport",
-      title: `${file.name} Xactimate pricing import`,
-      type: "Xactimate import",
-      branch: "Xactimate import",
-      notes: "Imported into Price Book under Xactimate pricing.",
-      activityPrefix: "Imported"
-    });
-    return { fileName: file.name, imported: result.items.length, captured: false };
-  } catch {
-    return { fileName: file.name, imported: 0, captured: false, failed: true };
-  }
 }
 
 async function handleXactimateImport(input) {
   const files = [...(input.files || [])];
-  if (!files.length) return;
-  const results = [];
-  for (const file of files) {
-    results.push(await processXactimateFile(file));
-  }
-  applyHighestPricingPolicy();
-  persist();
-  const imported = results.reduce((sum, result) => sum + Number(result.imported || 0), 0);
-  const captured = results.filter((result) => result.captured).length;
-  const failed = results.filter((result) => result.failed).length;
-  const summary = `${imported} lines imported${captured ? `, ${captured} captured for review` : ""}${failed ? `, ${failed} failed` : ""}`;
-  addActivity(`Batch Xactimate import: ${summary}.`);
-  setToast(summary);
-  routeToModule("pricing");
-}
-
-function textFromBytes(bytes) {
-  const utf8 = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-  const latin = new TextDecoder("iso-8859-1", { fatal: false }).decode(bytes);
-  return utf8.replace(/\u0000/g, " ").length >= latin.replace(/\u0000/g, " ").length ? utf8 : latin;
-}
-
-function looksLikeZip(bytes) {
-  return bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
-}
-
-async function parseZipEntries(arrayBuffer) {
-  const bytes = new Uint8Array(arrayBuffer);
-  const view = new DataView(arrayBuffer);
-  const entries = [];
-  let offset = 0;
-  while (offset + 30 < bytes.length) {
-    if (view.getUint32(offset, true) !== 0x04034b50) break;
-    const method = view.getUint16(offset + 8, true);
-    const compressedSize = view.getUint32(offset + 18, true);
-    const uncompressedSize = view.getUint32(offset + 22, true);
-    const nameLength = view.getUint16(offset + 26, true);
-    const extraLength = view.getUint16(offset + 28, true);
-    const nameStart = offset + 30;
-    const dataStart = nameStart + nameLength + extraLength;
-    const dataEnd = dataStart + compressedSize;
-    if (dataEnd > bytes.length) break;
-    const name = new TextDecoder().decode(bytes.slice(nameStart, nameStart + nameLength));
-    let data = bytes.slice(dataStart, dataEnd);
-    if (method === 8 && "DecompressionStream" in window) {
-      const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-      data = new Uint8Array(await new Response(stream).arrayBuffer());
-    }
-    if (method === 0 || method === 8) {
-      entries.push({ name, method, compressedSize, uncompressedSize, bytes: data, text: textFromBytes(data) });
-    } else {
-      entries.push({ name, method, compressedSize, uncompressedSize, bytes: new Uint8Array(), text: "" });
-    }
-    offset = dataEnd;
-  }
-  return entries;
-}
-
-function extractPdfLikeText(bytes) {
-  const raw = textFromBytes(bytes);
-  const literalStrings = [...raw.matchAll(/\(([^()]{3,180})\)/g)].map((match) => match[1].replace(/\\([()\\])/g, "$1"));
-  const asciiRuns = [...raw.matchAll(/[A-Za-z0-9 .,$:/#()\-]{8,}/g)].map((match) => match[0]);
-  return [...literalStrings, ...asciiRuns].join("\n");
-}
-
-async function extractImportText(file, arrayBuffer) {
-  const bytes = new Uint8Array(arrayBuffer);
-  const entries = [];
-  const parts = [];
-  let packageDetected = false;
-  if (looksLikeZip(bytes)) {
-    packageDetected = true;
-    const zipEntries = await parseZipEntries(arrayBuffer);
-    for (const entry of zipEntries) {
-      entries.push(entry.name);
-      parts.push(`\n--- ${entry.name} ---\n${entry.text}`);
-      if (looksLikeZip(entry.bytes)) {
-        const nested = await parseZipEntries(entry.bytes.buffer.slice(entry.bytes.byteOffset, entry.bytes.byteOffset + entry.bytes.byteLength));
-        nested.forEach((nestedEntry) => {
-          entries.push(`${entry.name}/${nestedEntry.name}`);
-          parts.push(`\n--- ${entry.name}/${nestedEntry.name} ---\n${nestedEntry.text}`);
-        });
+  if (!files.length || pricingImportBusy) return;
+  if (pricingImportReview?.identity !== JSON.stringify(currentWorkspaceIdentity())) pricingImportReview = null;
+  if (pricingImportReview) { setToast("Review or discard the pending import before selecting more files."); input.value = ""; return; }
+  if (!workspaceWritesReady()) return blockUnavailableWorkspaceWrite();
+  const identity = JSON.stringify(currentWorkspaceIdentity());
+  pricingImportIdentity = identity;
+  pricingImportBusy = true;
+  pricingImportResults = files.map((file) => ({ name: file.name, message: "Reading...", status: "pending" }));
+  render();
+  const parsed = [];
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      try {
+        const documents = await extractPricingDocuments(file);
+        if (identity !== JSON.stringify(currentWorkspaceIdentity())) throw new Error("Your account changed. Select the files again.");
+        const reports = documents.map((document) => parsePricingImport(document.text, { fileName: document.name, format: document.format, maxRows: 2500 }));
+        const lines = reports.flatMap((report) => report.lines);
+        const issues = reports.flatMap((report) => report.issues);
+        if (!lines.length) throw new Error("No readable pricing lines were found.");
+        if (issues.length) {
+          pricingImportReview ||= { identity, items: [] };
+          pricingImportReview.items.push({ index, fileName: file.name, lines, issues });
+          pricingImportResults[index] = { name: file.name, message: `${lines.length} readable lines; ${issues.length} parsing notices require review. Nothing from this file is saved yet.`, status: "review" };
+          continue;
+        }
+        parsed.push({ index, file, lines });
+        pricingImportResults[index] = { name: file.name, message: `${lines.length} lines validated; waiting to save`, status: "pending" };
+      } catch (error) {
+        pricingImportResults[index] = { name: file.name, message: error.message || "Unable to read this export.", status: "error" };
       }
+      if (identity !== JSON.stringify(currentWorkspaceIdentity())) {
+        pricingImportReview = null;
+        pricingImportResults = [];
+        throw new Error("Your account changed. Select the files again.");
+      }
+      render();
     }
-  } else {
-    const isPdf = file.name.toLowerCase().endsWith(".pdf") || bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
-    parts.push(isPdf ? extractPdfLikeText(bytes) : textFromBytes(bytes));
-    packageDetected = isPdf;
+    if (identity !== JSON.stringify(currentWorkspaceIdentity()) || !workspaceWritesReady()) throw new Error("Your workspace changed or storage became unavailable. Sign in and retry the import.");
+    const count = parsed.reduce((sum, item) => sum + item.lines.length, 0);
+    if (state.priceItems.length + count > 2500) throw new Error("This import exceeds the 2,500-row price history limit. No new rows were saved. Use a smaller export.");
+    for (const { file, lines } of parsed) {
+      importPricingLines(lines, file.name, { sourceType: "xactimateImport", type: "Xactimate import" });
+    }
+    if (parsed.length) {
+      persist();
+      const saved = await syncWorkspaceState({ force: true });
+      if (!saved?.durable && !isOfflineSmokePreview()) throw new Error("The server did not confirm durable storage.");
+      for (const { index, file, lines } of parsed) pricingImportResults[index] = { name: file.name, message: `${lines.length} lines saved to the shared price book`, status: "saved" };
+      setToast(`${count} pricing lines saved`);
+    } else setToast("No pricing rows imported. Review the file results.");
+  } catch (error) {
+    for (const result of pricingImportResults) if (result.status === "pending") { result.status = "error"; result.message = error.message; }
+    if (identity === JSON.stringify(currentWorkspaceIdentity()) && state.workspacePersistence.status === "error") await recoverRejectedWorkspaceState(error);
+    setToast(error.message || "Pricing import was not saved.");
+  } finally {
+    pricingImportBusy = false;
+    input.value = "";
+    render();
   }
-  return { text: parts.join("\n"), packageDetected, entries };
+}
+
+async function confirmPricingImport() {
+  const review = pricingImportReview;
+  if (!review || pricingImportBusy) return;
+  if (review.identity !== JSON.stringify(currentWorkspaceIdentity())) {
+    pricingImportReview = null;
+    pricingImportResults = [];
+    setToast("The account changed. Select the pricing files again.");
+    return render();
+  }
+  pricingImportBusy = true;
+  render();
+  try {
+    const count = review.items.reduce((sum, item) => sum + item.lines.length, 0);
+    if (state.priceItems.length + count > 2500) throw new Error("This import exceeds the 2,500-row price history limit. No rows were added.");
+    for (const item of review.items) importPricingLines(item.lines, item.fileName, {
+      sourceType: "xactimateImport", status: "Partial import reviewed",
+      notes: `${item.issues.length} parsing notices reviewed by ${state.authSession?.email || "administrator"}. Only readable lines were imported.`
+    });
+    persist();
+    await syncWorkspaceState({ force: true });
+    for (const item of review.items) pricingImportResults[item.index] = { name: item.fileName, message: `${item.lines.length} reviewed lines saved`, status: "saved" };
+    pricingImportReview = null;
+    setToast(`${count} reviewed pricing lines saved`);
+  } catch (error) {
+    if (state.workspacePersistence.status === "error") await recoverRejectedWorkspaceState(error);
+    setToast(error.message);
+  } finally { pricingImportBusy = false; render(); }
+}
+
+function renderPricingImportReview() {
+  const review = pricingImportReview;
+  if (!review || review.identity !== JSON.stringify(currentWorkspaceIdentity())) return "";
+  return `<section class="import-review"><h3>Review incomplete extraction</h3>
+    <p>Some rows could not be imported. No rows from these files have been saved.</p>
+    ${review.items.map((item) => `<h4>${escapeHtml(item.fileName)}</h4>
+      <ul>${item.issues.slice(0, 20).map((issue) => `<li>${issue.row ? `Row ${issue.row}: ` : ""}${escapeHtml(issue.message)}</li>`).join("")}</ul>
+      <p>${item.lines.length} readable lines, ${item.issues.length} notices. Preview: first ${Math.min(100, item.lines.length)} lines.</p>
+      <div class="price-table-wrap"><table class="data-table"><thead><tr><th>Code</th><th>Description</th><th>Quantity</th><th>Unit</th><th>Unit price</th></tr></thead><tbody>${item.lines.slice(0, 100).map((line) => `<tr><td>${escapeHtml(line.code)}</td><td>${escapeHtml(line.name)}</td><td>${escapeHtml(line.qty)}</td><td>${escapeHtml(line.unit)}</td><td>${escapeHtml(formatMoney(line.rate))}</td></tr>`).join("")}</tbody></table></div>`).join("")}
+    <div class="button-row"><button type="button" data-action="confirm-pricing-import" ${pricingImportBusy ? "disabled" : ""}>Import readable lines only</button><button type="button" data-action="cancel-pricing-import" ${pricingImportBusy ? "disabled" : ""}>Discard pending import</button></div>
+  </section>`;
 }
 
 function readFile(file, asDataUrl = false) {
@@ -6074,26 +6008,7 @@ function readFileAsArrayBuffer(file) {
 }
 
 async function handlePriceCsvUpload(input) {
-  const file = input.files?.[0];
-  if (!file) return;
-  try {
-    const text = await readFile(file);
-    const items = parsePriceCsv(text);
-    const result = importPricingLines(items, file.name, {
-      sourceType: "priceCsvImport",
-      category: "Imported pricing",
-      branch: "CSV import",
-      title: `${file.name} CSV price book import`,
-      notes: "Imported from CSV into the active price book and linked to billing workflows.",
-      activityPrefix: "Imported"
-    });
-    persist();
-    setToast(`${result.items.length} price items imported`);
-    render();
-  } catch {
-    setToast("Pricing upload failed");
-    render();
-  }
+  return handleXactimateImport(input);
 }
 
 async function handleLogoUpload(input) {
@@ -6647,7 +6562,7 @@ async function addTask(formData) {
       `Module: ${moduleByKey(task.moduleKey)?.label || task.moduleKey}`,
       `Related job: ${task.relatedJob || "None"}`
     ].join("\n")
-  });
+  }, { announce: false });
   addActivity(`Assigned task: ${task.title}.`);
   persist();
   try {
@@ -7598,7 +7513,7 @@ function createWorkbenchRecord(formData, options = {}) {
     due: String(formData.get("due") || ""),
     relatedJob: String(formData.get("relatedJob") || ""),
     notes
-  });
+  }, { announce: false });
   record.fileId = file.id;
   persist();
   return record;
@@ -7674,119 +7589,274 @@ async function captureEquipmentGps() {
   form.elements.gpsLabel.value = gps.label;
   const status = form.querySelector(".gps-capture-status");
   if (status) status.textContent = `Captured ${gps.label}`;
-  addActivity(`Captured equipment GPS: ${gps.label}.`);
-  persist();
+}
+
+let equipmentMutationBusy = false;
+
+function equipmentActor() {
+  return state.authSession || (isOfflineSmokePreview() ? { roleId: "business_owner", uid: "offline-preview" } : {});
+}
+
+function equipmentRecordKey(record) {
+  return encodeURIComponent(JSON.stringify([record.id, ...["companyId", "franchiseId", "branchId", "contractorId"].map((key) => record[key] || "")]));
+}
+
+function findEquipmentRecord(records, key) {
+  const matches = records.filter((record) => equipmentRecordKey(record) === key || record.id === key);
+  if (matches.length !== 1) throw new Error("Select the exact equipment or job record in this workspace.");
+  return matches[0];
+}
+
+function equipmentLocalDateTime(value = new Date()) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+
+function equipmentFormTimestamp(value) {
+  const text = String(value || "");
+  const date = new Date(text);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(text) || !Number.isFinite(date.getTime())
+    || equipmentLocalDateTime(date) !== text) throw new Error("Enter a valid local date and time.");
+  return date.toISOString();
+}
+
+async function saveEquipmentMutation(operation, successMessage) {
+  if (!workspaceWritesReady()) throw new Error("Secure shared storage is unavailable; no changes were made.");
+  if (equipmentMutationBusy) throw new Error("An equipment change is still saving. Please wait.");
+  const identity = JSON.stringify(currentWorkspaceIdentity());
+  const snapshot = Object.fromEntries(["equipmentDeployments", "files", "jobBoards", "tasks", "activity"].map((key) => [key, state[key]]));
+  equipmentMutationBusy = true;
+  let saving = false;
+  try {
+    operation();
+    saving = true;
+    persist();
+    const result = await syncWorkspaceState({ force: true });
+    if (identity !== JSON.stringify(currentWorkspaceIdentity())) throw new Error("Your workspace changed. Reload equipment before continuing.");
+    if ((!result?.durable && !isOfflineSmokePreview()) || Number(result?.ignoredRecords || 0) > 0) {
+      throw new Error("The server did not confirm all equipment changes. Reload and try again.");
+    }
+    setToast(isOfflineSmokePreview() ? `${successMessage} (offline preview)` : successMessage);
+    render();
+  } catch (error) {
+    if (identity === JSON.stringify(currentWorkspaceIdentity())) {
+      if (saving) await recoverRejectedWorkspaceState(error);
+      else Object.assign(state, snapshot);
+    }
+    throw error;
+  } finally {
+    equipmentMutationBusy = false;
+  }
+}
+
+async function submitEquipmentForm(form, operation) {
+  if (form.dataset.saving === "true") return;
+  const draft = new FormData(form);
+  const key = String(draft.get("deploymentId") || "");
+  const type = form.dataset.form;
+  const buttons = [...form.querySelectorAll('button[type="submit"]')];
+  form.dataset.saving = "true";
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    await operation();
+  } catch (error) {
+    const currentForm = [...document.querySelectorAll("form[data-form]")].find((candidate) => candidate.dataset.form === type
+      && String(new FormData(candidate).get("deploymentId") || "") === key);
+    if (currentForm && currentForm !== form) {
+      for (const field of currentForm.elements) {
+        if (field.type === "checkbox") field.checked = draft.has(field.name);
+        else if (field.type !== "file" && draft.has(field.name)) field.value = draft.get(field.name);
+      }
+    }
+    setToast(error.message || "Equipment was not saved. Please retry.");
+  } finally {
+    delete form.dataset.saving;
+    buttons.forEach((button) => { button.disabled = false; });
+  }
+}
+
+function equipmentSupportNotes(deployment) {
+  return [
+    `Asset tag: ${deployment.assetTag || "Not entered"}`,
+    `Room/address: ${deployment.room || deployment.address || "Not specified"}`,
+    `GPS: ${deployment.gpsLabel || "Not captured"}`,
+    `Deployed: ${deployment.deployedAt || deployment.createdAt}`,
+    `Returned: ${deployment.returnedAt || "Awaiting return"}`,
+    `Duration: ${deployment.rentalDays || 0} billable days (started 24-hour periods, minimum one on return)`,
+    `Invoice: ${deployment.invoiceNumber || "Office review pending"}`,
+    deployment.notes,
+    deployment.returnNotes ? `Return notes: ${deployment.returnNotes}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function upsertEquipmentSupportFile(deployment) {
+  const existing = state.files.find((file) => file.sourceType === "equipmentDeployment"
+    && file.sourceId === deployment.id && sameEquipmentScope(file, deployment));
+  const linkedModuleKeys = ["jobs", "drylogs", "payments", "photos", "time"];
+  const file = {
+    ...(existing || {}),
+    ...equipmentRecordScope(deployment),
+    ...(existing ? {} : applicationScopeForModules("equipment", linkedModuleKeys)),
+    id: existing?.id || createId("F"),
+    moduleKey: "equipment",
+    linkedModuleKeys: existing?.linkedModuleKeys || linkedModuleKeys,
+    sourceType: "equipmentDeployment",
+    sourceId: deployment.id,
+    amount: canManageEquipmentBilling(equipmentActor().roleId) ? equipmentCharge(deployment) : (existing?.amount || 0),
+    title: existing?.title || `${deployment.equipmentName} deployment - ${deployment.job}`,
+    type: "Equipment deployment",
+    owner: existing?.owner || state.worker?.name || "Field operations",
+    status: isEquipmentActive(deployment) ? deployment.status : "Complete",
+    priority: deployment.billable ? "High" : "Medium",
+    jobId: deployment.jobId || deployment.job,
+    relatedJob: deployment.job,
+    workerId: existing?.workerId || deployment.deployedByUid,
+    notes: equipmentSupportNotes(deployment),
+    createdAt: existing?.createdAt || deployment.createdAt,
+    updatedAt: deployment.updatedAt,
+    history: [`Equipment ${deployment.status.toLowerCase()}`, ...(existing?.history || [])]
+  };
+  state.files = existing ? state.files.map((item) => item === existing ? file : item) : [file, ...state.files];
+  return file;
+}
+
+function updateEquipmentJobGate(deployment) {
+  state.jobBoards = state.jobBoards.map((job) => {
+    if (!equipmentMatchesJob(deployment, job)) return job;
+    // Field users may see only some assets on a job, so only the server/office closes its gate.
+    if (!canManageEquipmentBilling(equipmentActor().roleId) && !isEquipmentActive(deployment)) return job;
+    return equipmentJobGate(job, state.equipmentDeployments);
+  });
 }
 
 async function addEquipmentDeployment(formData) {
-  let gps = {
-    latitude: Number(formData.get("latitude")),
-    longitude: Number(formData.get("longitude")),
-    label: String(formData.get("gpsLabel") || "").trim()
-  };
-  if (!Number.isFinite(gps.latitude) || !Number.isFinite(gps.longitude)) {
-    gps = await requestGps();
-  }
-  const invoiceId = String(formData.get("invoiceId") || "");
-  const invoice = state.files.find((file) => file.id === invoiceId);
-  const dailyRate = Number(formData.get("dailyRate") || 0);
-  const rentalDays = Number(formData.get("rentalDays") || 0);
-  const deployment = {
-    id: createId("EQ"),
-    equipmentName: String(formData.get("equipmentName") || "Equipment").trim(),
-    assetTag: String(formData.get("assetTag") || "").trim(),
-    job: String(formData.get("job") || "").trim(),
-    room: String(formData.get("room") || "").trim(),
-    status: String(formData.get("status") || "Deployed"),
-    invoiceId,
-    invoiceNumber: String(formData.get("invoiceNumber") || invoice?.title || "").trim(),
-    dailyRate: Number.isFinite(dailyRate) ? dailyRate : 0,
-    rentalDays: Number.isFinite(rentalDays) ? rentalDays : 0,
-    billable: formData.get("billable") === "on",
-    latitude: Number.isFinite(gps.latitude) ? gps.latitude : null,
-    longitude: Number.isFinite(gps.longitude) ? gps.longitude : null,
-    gpsLabel: gps.label || "Manual location",
-    address: String(formData.get("address") || "").trim(),
-    notes: String(formData.get("notes") || "").trim(),
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-  state.equipmentDeployments = [deployment, ...state.equipmentDeployments];
-  createFile({
-    moduleKey: "equipment",
-    linkedModuleKeys: ["jobs", "drylogs", "payments", "photos", "time"],
-    sourceType: "equipmentDeployment",
-    sourceId: deployment.id,
-    amount: equipmentCharge(deployment),
-    title: `${deployment.equipmentName} deployment - ${deployment.job || deployment.room || deployment.assetTag || "unassigned"}`,
-    type: "Equipment deployment",
-    owner: state.worker?.name || "Field operations",
-    status: deployment.status,
-    priority: deployment.billable ? "High" : "Medium",
-    due: today.toISOString().slice(0, 10),
-    relatedJob: deployment.job,
-    notes: [
-      `Asset tag: ${deployment.assetTag || "Not entered"}`,
-      `Room/address: ${deployment.room || deployment.address || "Not specified"}`,
-      `GPS: ${deployment.gpsLabel || "Not captured"}`,
-      `Billable: ${deployment.billable ? "Yes" : "No"}`,
-      `Rental support: ${deployment.rentalDays} days x ${formatMoney(deployment.dailyRate)} = ${formatMoney(equipmentCharge(deployment))}`,
-      `Invoice: ${deployment.invoiceNumber || "Not attached"}`,
-      deployment.notes
-    ].filter(Boolean).join("\n")
-  });
-  if (deployment.billable) {
-    ensureWorkflowTask({
-      title: `Create equipment invoice for ${deployment.equipmentName}`,
-      moduleKey: "payments",
-      relatedJob: deployment.job,
-      due: today.toISOString().slice(0, 10),
-      priority: "High",
-      sourceType: "equipmentDeployment",
-      sourceId: deployment.id
-    });
-  }
-  addActivity(`${deployment.equipmentName} added to equipment GPS map and tied to ${deployment.invoiceNumber || "invoice draft"}.`);
-  persist();
-  setToast("Equipment location added");
-  render();
+  return saveEquipmentMutation(() => {
+    const job = findEquipmentRecord(state.jobBoards, String(formData.get("jobId") || ""));
+    const deployment = normalizeEquipmentDeployment({
+      ...Object.fromEntries(formData),
+      ...equipmentRecordScope(job),
+      id: createId("EQ"),
+      jobId: job.id,
+      job: job.jobId || job.id,
+      deployedAt: equipmentFormTimestamp(formData.get("deployedAt")),
+      billable: formData.get("billable") === "on",
+      dailyRate: formData.get("dailyRate") || 0
+    }, equipmentActor(), state.equipmentDeployments);
+    state.equipmentDeployments = [deployment, ...state.equipmentDeployments];
+    upsertEquipmentSupportFile(deployment);
+    updateEquipmentJobGate(deployment);
+    if (canManageEquipmentBilling(equipmentActor().roleId) && deployment.billable) {
+      const task = ensureWorkflowTask({
+        title: `Review equipment return and billing for ${deployment.equipmentName}`,
+        moduleKey: "payments", relatedJob: deployment.job,
+        sourceType: "equipmentDeployment", sourceId: deployment.id, priority: "High"
+      });
+      if (task) Object.assign(task, equipmentRecordScope(deployment), { jobId: deployment.jobId });
+    }
+    addActivity(`${deployment.equipmentName} deployed on ${deployment.job}.`);
+  }, "Equipment deployment saved");
 }
 
-function createEquipmentInvoice(deploymentId) {
-  const deployment = state.equipmentDeployments.find((item) => item.id === deploymentId);
-  if (!deployment) return;
-  const amount = equipmentCharge(deployment);
-  const title = `${deployment.invoiceNumber || "INV-EQUIPMENT"} ${deployment.equipmentName}`;
-  const file = createFile({
+async function recordEquipmentReturn(formData) {
+  return saveEquipmentMutation(() => {
+    const stored = findEquipmentRecord(state.equipmentDeployments, String(formData.get("deploymentId") || ""));
+    const deployment = returnEquipmentDeployment(stored, {
+      returnedAt: equipmentFormTimestamp(formData.get("returnedAt")),
+      returnNotes: formData.get("returnNotes")
+    }, equipmentActor());
+    state.equipmentDeployments = state.equipmentDeployments.map((item) => item === stored ? deployment : item);
+    const invoice = equipmentInvoiceFor(deployment);
+    if (invoice && canManageEquipmentBilling(equipmentActor().roleId)
+      && invoice.sourceType === "equipmentInvoice" && invoice.sourceId === deployment.id
+      && ["Drafting", "Draft", "Open"].includes(invoice.status)
+      && !invoice.paymentUrl && !invoice.paymentProviderId && !invoice.paymentStatus) {
+      upsertEquipmentInvoiceFile(deployment, invoice);
+    }
+    upsertEquipmentSupportFile(deployment);
+    updateEquipmentJobGate(deployment);
+    addActivity(`${deployment.equipmentName} returned; ${deployment.rentalDays} rental day(s) recorded.`);
+  }, "Equipment return saved");
+}
+
+function equipmentInvoiceFor(deployment) {
+  return state.files.find((file) => sameEquipmentScope(file, deployment)
+    && ((deployment.invoiceId && file.id === deployment.invoiceId)
+      || (file.sourceType === "equipmentInvoice" && file.sourceId === deployment.id)));
+}
+
+function assertEquipmentInvoiceEditable(invoice, deployment) {
+  if (!invoice) return;
+  if (invoice.sourceType !== "equipmentInvoice" || invoice.sourceId !== deployment.id
+    || !["Drafting", "Draft", "Open"].includes(invoice.status)
+    || invoice.paymentUrl || invoice.paymentProviderId || invoice.paymentStatus) {
+    throw new Error("This invoice is not an editable equipment-only draft. Review it in Payments.");
+  }
+}
+
+async function saveEquipmentBilling(formData) {
+  return saveEquipmentMutation(() => {
+    const stored = findEquipmentRecord(state.equipmentDeployments, String(formData.get("deploymentId") || ""));
+    const invoice = equipmentInvoiceFor(stored);
+    assertEquipmentInvoiceEditable(invoice, stored);
+    const deployment = normalizeEquipmentBilling(stored, {
+      billable: formData.get("billable") === "on", dailyRate: formData.get("dailyRate"), invoiceNumber: formData.get("invoiceNumber")
+    }, equipmentActor());
+    if (invoice && !deployment.billable) throw new Error("Resolve the linked invoice in Payments before marking this deployment nonbillable.");
+    state.equipmentDeployments = state.equipmentDeployments.map((item) => item === stored ? deployment : item);
+    if (invoice) upsertEquipmentInvoiceFile(deployment, invoice);
+    upsertEquipmentSupportFile(deployment);
+    addActivity(`Equipment billing reviewed for ${deployment.assetTag}.`);
+  }, "Equipment billing saved");
+}
+
+function upsertEquipmentInvoiceFile(deployment, existing) {
+  const linkedModuleKeys = ["equipment", "jobs", "accounting", "drylogs", "revenueengine"];
+  const file = {
+    ...(existing || {}),
+    ...equipmentRecordScope(deployment),
+    ...(existing ? {} : applicationScopeForModules("payments", linkedModuleKeys)),
+    id: existing?.id || createId("F"),
     moduleKey: "payments",
-    linkedModuleKeys: ["equipment", "jobs", "accounting", "drylogs", "revenueengine"],
+    linkedModuleKeys: existing?.linkedModuleKeys || linkedModuleKeys,
     sourceType: "equipmentInvoice",
     sourceId: deployment.id,
-    amount,
-    title,
+    amount: equipmentCharge(deployment),
+    title: existing?.title || `${deployment.invoiceNumber || `INV-${deployment.id}`} ${deployment.equipmentName}`,
     type: "Invoice",
-    owner: "Bookkeeping",
-    status: "Drafting",
-    priority: deployment.billable ? "High" : "Medium",
-    due: today.toISOString().slice(0, 10),
+    owner: existing?.owner || "Bookkeeping",
+    status: existing?.status || "Drafting",
+    priority: "High",
+    due: existing?.due || new Date().toISOString().slice(0, 10),
+    jobId: deployment.jobId || deployment.job,
     relatedJob: deployment.job,
-    notes: [
-      `Equipment: ${deployment.equipmentName} (${deployment.assetTag || "no asset tag"})`,
-      `Location: ${deployment.room || deployment.address || "Not specified"}`,
-      `GPS: ${deployment.gpsLabel || "Not captured"}`,
-      `Rental support: ${deployment.rentalDays} days x ${formatMoney(deployment.dailyRate)} = ${formatMoney(amount)}`,
-      `Map link: ${deployment.latitude && deployment.longitude ? `https://www.google.com/maps/search/?api=1&query=${deployment.latitude},${deployment.longitude}` : "No GPS link"}`,
-      deployment.notes
-    ].filter(Boolean).join("\n")
-  });
-  if (file) {
-    deployment.invoiceId = file.id;
-    deployment.invoiceNumber = file.title;
-    deployment.updatedAt = new Date().toISOString();
-    persist();
-    setToast("Invoice file created and attached");
-    render();
-  }
+    notes: `${equipmentSupportNotes(deployment)}\nRental charge: ${deployment.rentalDays} days x ${formatMoney(deployment.dailyRate)} = ${formatMoney(equipmentCharge(deployment))}`,
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    history: [existing ? "Equipment invoice updated" : "Equipment invoice created", ...(existing?.history || [])]
+  };
+  state.files = existing ? state.files.map((item) => item === existing ? file : item) : [file, ...state.files];
+  return file;
+}
+
+async function createEquipmentInvoice(deploymentId) {
+  return saveEquipmentMutation(() => {
+    if (!canManageEquipmentBilling(equipmentActor().roleId)) throw new Error("Only office administrators can create equipment invoices.");
+    const stored = findEquipmentRecord(state.equipmentDeployments, deploymentId);
+    if (isEquipmentActive(stored) || !stored.returnedAt) throw new Error("Record the equipment return before creating its invoice.");
+    if (!stored.billable || !stored.billingReviewedAt) throw new Error("Review and save equipment billing before creating an invoice.");
+    const existing = equipmentInvoiceFor(stored);
+    if (stored.invoiceId && !existing) throw new Error("The linked invoice is not available in this workspace. Reload before billing.");
+    assertEquipmentInvoiceEditable(existing, stored);
+    const file = upsertEquipmentInvoiceFile(stored, existing);
+    const deployment = { ...stored, invoiceId: file.id, invoiceNumber: stored.invoiceNumber || `INV-${stored.id}`, updatedAt: file.updatedAt };
+    state.equipmentDeployments = state.equipmentDeployments.map((item) => item === stored ? deployment : item);
+    upsertEquipmentSupportFile(deployment);
+    updateEquipmentJobGate(deployment);
+    state.tasks = state.tasks.map((task) => task.sourceType === "equipmentDeployment" && task.sourceId === deployment.id
+      && task.moduleKey === "payments" && sameEquipmentScope(task, deployment) ? { ...task, status: "Complete" } : task);
+    addActivity(`Equipment invoice saved for ${deployment.assetTag}.`);
+  }, "Equipment invoice saved");
 }
 
 async function clockIn(formData) {
@@ -8417,7 +8487,7 @@ function renderScreen(module) {
         <h2>${escapeHtml(module.label)} workflow</h2>
         <p>${escapeHtml(module.purpose)}</p>
         <div class="hero-actions">
-          <button type="button" data-action="open-create-file" data-key="${module.key}">Create ${escapeHtml(suggestedFileType(module))}</button>
+          ${module.key === "dispatch" ? `<button type="button" data-action="focus-workbench">Create dispatch item</button>` : `<button type="button" data-action="open-create-file" data-key="${module.key}">Create ${escapeHtml(suggestedFileType(module))}</button>`}
           <button type="button" data-action="quick-note" data-key="${module.key}">Add quick note</button>
           <a href="#module/reports" data-action="set-active" data-key="reports">View reports</a>
         </div>
@@ -8429,9 +8499,9 @@ function renderScreen(module) {
       </div>
     </section>
     ${module.key === "daily" ? renderDashboardSummary() : ""}
-    ${module.key === "dispatch" && ["super_admin", "business_owner"].includes(currentRoleId()) ? '<section class="emergency-monitor" data-emergency-monitor></section>' : ""}
     ${usesStandardsAI(module) ? renderStandardsAI(module) : ""}
     ${module.key === "daily" ? "" : renderModuleWorkbench(module)}
+    ${module.key === "dispatch" && ["super_admin", "business_owner"].includes(currentRoleId()) ? '<section class="emergency-monitor" data-emergency-monitor></section>' : ""}
     ${renderQueue(module.key)}
     ${renderModuleFiles(module)}
     ${renderFileDetail(module)}
@@ -9191,7 +9261,7 @@ function linkedModuleKeys(module) {
     branch: ["branches", "team", "moduletoggles", "licensing"],
     compliance: ["nationalcodes", "safetyintel", "justification", "reports"],
     core: ["universalintake", "properties", "jobs", "reports"],
-    dispatch: ["dispatch", "routeplanner", "time", "equipment"],
+    dispatch: ["dispatch", "jobs", "routeplanner", "time", "equipment"],
     documents: ["forms", "contracts", "evidencechain", "closeout"],
     field: ["fieldmobile", "photos", "time", "drylogs", "equipment"],
     finance: ["accounting", "payments", "pricing", "reports"],
@@ -9448,6 +9518,9 @@ function moduleWorkbenchConfig(module) {
 
 function renderWorkbenchField(field) {
   const required = field.required ? " required" : "";
+  if (field.name === "relatedJob") {
+    return `<label><span>${escapeHtml(field.label)}</span><input name="relatedJob" list="workbench-job-options" placeholder="${escapeHtml(field.placeholder || "")}" /><datalist id="workbench-job-options">${visibleJobBoards().map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}</datalist></label>`;
+  }
   if (field.kind === "textarea") {
     return `<label><span>${escapeHtml(field.label)}</span><textarea name="${escapeHtml(field.name)}" rows="3"${required} placeholder="${escapeHtml(field.placeholder || "")}"></textarea></label>`;
   }
@@ -9770,6 +9843,25 @@ function renderJobTimeline() {
   `;
 }
 
+function renderJobOperationalSummary(job) {
+  const references = new Set([job.id, job.jobId].filter(Boolean).map(String));
+  const belongs = (record, keys) => keys.some((key) => references.has(String(record[key] || "")))
+    && ["contractorId", "franchiseId"].every((key) => String(record[key] || "") === String(job[key] || ""));
+  const tasks = visibleTasks().filter((task) => belongs(task, ["relatedJob", "jobId"]));
+  const entries = visibleTimeEntries().filter((entry) => belongs(entry, ["job", "jobId", "relatedJob"]));
+  const equipment = state.equipmentDeployments.filter((item) => belongs(item, ["job", "jobId", "relatedJob"]));
+  const hours = entries.reduce((sum, entry) => sum + (Number(entry.hours) || 0), 0);
+  const people = [...new Set(tasks.map((task) => task.assigneeName || task.assigneeEmail).filter(Boolean))];
+  return `<div class="job-operations" data-job-operations="${escapeHtml(job.jobId)}">
+    <dl>
+      <div><dt>Assigned work</dt><dd>${tasks.length} tasks</dd></div>
+      <div><dt>Recorded time</dt><dd>${hours.toFixed(2)} hours</dd></div>
+      <div><dt>Equipment out</dt><dd>${equipment.filter(isEquipmentActive).length} / ${equipment.length} records</dd></div>
+    </dl>
+    ${people.length ? `<p>Crew: ${people.map(escapeHtml).join(", ")}</p>` : ""}
+  </div>`;
+}
+
 function renderJobGateCard(job) {
   const branch = branchById(job.branchId);
   const drySummary = dryLogSummaryForJob(job);
@@ -9787,6 +9879,7 @@ function renderJobGateCard(job) {
         <div><dt>Dry log</dt><dd>${escapeHtml(drySummary.logs.length ? `${drySummary.status} - ${drySummary.latest.moisture}%/${drySummary.latest.targetMoisture}%` : "No readings")}</dd></div>
         <div><dt>Next</dt><dd>${escapeHtml(job.nextAction || "None")}</dd></div>
       </dl>
+      ${renderJobOperationalSummary(job)}
       <div class="gate-grid">
         ${(job.gates || [])
           .map(
@@ -9815,6 +9908,10 @@ function renderJobForm() {
         <label><span>Property</span><input name="property" placeholder="Address, unit, building" /></label>
         <label><span>Stage</span><select name="stage"><option>Intake</option><option>Inspection</option><option>Dry-out</option><option>Repair</option><option>Invoice support</option><option>Closeout</option></select></label>
         <label><span>Branch</span><select name="branchId">${state.branches.map((branch) => `<option value="${branch.id}">${escapeHtml(branch.name)}</option>`).join("")}</select></label>
+        <label><span>Employer profile</span><select name="contractorId" required>
+          <option value="${escapeHtml(currentEmployerContractorId())}">My employer profile</option>
+          ${employeeEmployerOptions().filter((employer) => employer.contractorId !== currentEmployerContractorId()).map((employer) => `<option value="${escapeHtml(employer.contractorId)}">${escapeHtml(employer.label)} - ${escapeHtml(employer.contractorId)}</option>`).join("")}
+        </select></label>
         <label><span>Owner</span><input name="owner" placeholder="PM, estimator, office" /></label>
         <label><span>Start</span><input name="start" type="date" value="${today.toISOString().slice(0, 10)}" /></label>
         <label><span>End</span><input name="end" type="date" value="${today.toISOString().slice(0, 10)}" /></label>
@@ -10340,13 +10437,15 @@ function renderXactimateImportWorkstation() {
       <div>
         <span>Primary upload area</span>
         <h2>Upload Xactimate invoice / estimate pricing</h2>
-        <p>Drop in one file or a batch of ESX packages, PDF invoices, XML, CSV, or text line-item exports. Readable line items are added to the price book under <strong>Xactimate pricing</strong>.</p>
+        <p>CSV, XML, text-based PDF, and readable ESX exports. Scanned PDFs and proprietary ESX data require a line-item export. Maximum 25 MB per file.</p>
       </div>
       <label class="xactimate-dropzone">
-        <input type="file" accept=".esx,.xml,.pdf,.txt,.csv" data-field="xactimate-import" multiple />
+        <input type="file" accept=".esx,.xml,.pdf,.txt,.csv" data-field="xactimate-import" multiple ${pricingImportBusy ? "disabled" : ""} />
         <strong>Choose ESX / PDF / invoice files</strong>
         <span>Use this for one estimate or a whole folder selection of ESX, PDF, XML, CSV, or text exports.</span>
       </label>
+      ${pricingImportIdentity === JSON.stringify(currentWorkspaceIdentity()) && pricingImportResults.length ? `<div class="import-results" role="status" aria-live="polite"><h3>${pricingImportBusy ? "Processing pricing files" : "Import results"}</h3>${pricingImportResults.map((result) => `<p data-import-status="${result.status}"><strong>${escapeHtml(result.name)}</strong>: ${escapeHtml(result.message)}</p>`).join("")}</div>` : ""}
+      ${renderPricingImportReview()}
       <div class="pricing-policy">
         <strong>Pricing rule</strong>
         <span>For matching line items, Brothers OS uses the highest known rate. If rates tie, the latest pricing date/import wins. Older lower estimates stay in history and cannot lower the active price.</span>
@@ -12133,45 +12232,45 @@ function renderCustomerDirectory(customers) {
 
 function renderEquipmentModule(module) {
   const deployments = state.equipmentDeployments;
+  const office = canManageEquipmentBilling(equipmentActor().roleId);
+  const active = deployments.filter(isEquipmentActive);
   const totalBillable = deployments.reduce((sum, deployment) => sum + (deployment.billable ? equipmentCharge(deployment) : 0), 0);
   return `
     <section class="hero-band equipment-hero">
       <div>
-        <p>${escapeHtml(module.purpose)}</p>
+        <h2>Equipment</h2>
         <div class="hero-actions">
           <button type="button" data-action="capture-equipment-gps">Capture GPS</button>
-          <a href="#module/payments" data-action="set-active" data-key="payments">Open invoices</a>
-          <button type="button" data-action="open-create-file" data-key="equipment">Manual file</button>
+          ${office ? `<a href="#module/payments" data-action="set-active" data-key="payments">Open invoices</a>` : ""}
         </div>
       </div>
       <div class="metric-strip">
-        <div><strong>${deployments.length}</strong><span>Located</span></div>
-        <div><strong>${deployments.filter((item) => item.billable).length}</strong><span>Billable</span></div>
-        <div><strong>${escapeHtml(formatMoney(totalBillable))}</strong><span>Invoice support</span></div>
+        <div><strong>${active.length}</strong><span>Active</span></div>
+        <div><strong>${deployments.filter((item) => !isEquipmentActive(item)).length}</strong><span>Returned / closed</span></div>
+        ${office ? `<div><strong>${escapeHtml(formatMoney(totalBillable))}</strong><span>Invoice support</span></div>` : ""}
       </div>
     </section>
     <section class="equipment-layout">
       <div class="panel">
         <div class="panel-head">
-          <div><h2>Equipment GPS map</h2><p>Visual map of equipment locations tied to invoices and jobs.</p></div>
+          <div><h2>Active equipment locations</h2></div>
           <button type="button" data-action="capture-equipment-gps">Use current GPS</button>
         </div>
-        ${renderEquipmentMap(deployments)}
+        ${renderEquipmentMap(active)}
       </div>
       <div class="panel">
         <div class="panel-head">
-          <div><h2>Equipment generator</h2><p>Add a location, attach an invoice, and create invoice-ready support.</p></div>
+          <div><h2>Deploy equipment</h2></div>
         </div>
         ${renderEquipmentForm()}
       </div>
     </section>
     <section class="panel">
       <div class="panel-head">
-        <div><h2>Equipment invoice support</h2><p>Each deployment keeps GPS, room, invoice, rental days, and billable amount together.</p></div>
-        <button type="button" data-action="open-create-file" data-key="equipment">New equipment file</button>
+        <div><h2>Deployments and returns</h2></div>
       </div>
       <div class="equipment-deployment-grid">
-        ${deployments.map(renderEquipmentDeploymentCard).join("")}
+        ${deployments.map(renderEquipmentDeploymentCard).join("") || `<div class="empty-state"><strong>No equipment deployments</strong></div>`}
       </div>
     </section>
     ${renderModuleFiles(module)}
@@ -12180,9 +12279,11 @@ function renderEquipmentModule(module) {
 }
 
 function renderEquipmentMap(deployments) {
+  deployments = deployments.filter((item) => item.latitude != null && item.longitude != null
+    && Number.isFinite(Number(item.latitude)) && Number.isFinite(Number(item.longitude)));
   const bounds = equipmentMapBounds(deployments);
   if (!deployments.length) {
-    return `<div class="equipment-map empty-map"><strong>No GPS locations yet</strong><span>Add equipment below or capture current GPS.</span></div>`;
+    return `<div class="equipment-map empty-map"><strong>No active GPS locations</strong></div>`;
   }
   return `
     <div class="equipment-map" aria-label="Equipment GPS map">
@@ -12191,7 +12292,7 @@ function renderEquipmentMap(deployments) {
         .map((deployment, index) => {
           const position = pinPosition(deployment, bounds);
           return `
-            <a class="equipment-pin" style="left:${position.x}%; top:${position.y}%;" href="${deployment.latitude && deployment.longitude ? `https://www.google.com/maps/search/?api=1&query=${deployment.latitude},${deployment.longitude}` : "#module/equipment"}" target="_blank" rel="noreferrer" title="${escapeHtml(deployment.equipmentName)}">
+            <a class="equipment-pin" style="left:${position.x}%; top:${position.y}%;" href="https://www.google.com/maps/search/?api=1&query=${Number(deployment.latitude)},${Number(deployment.longitude)}" target="_blank" rel="noreferrer" title="${escapeHtml(deployment.equipmentName)}">
               <span>${index + 1}</span>
             </a>
           `;
@@ -12208,72 +12309,75 @@ function renderEquipmentMap(deployments) {
 }
 
 function renderEquipmentForm() {
-  const invoices = invoiceFileOptions();
-  const defaultInvoice = invoices[0];
-  const defaultInvoiceNumber = defaultInvoice?.title?.match(/INV-[A-Za-z0-9-]+/)?.[0] || defaultInvoice?.title || "";
+  const office = canManageEquipmentBilling(equipmentActor().roleId);
   return `
     <form class="stack-form equipment-form" data-form="equipment-deployment">
       <div class="form-grid">
         <label><span>Equipment</span><input name="equipmentName" required placeholder="Dehumidifier, air scrubber, fan, generator" /></label>
-        <label><span>Asset tag</span><input name="assetTag" placeholder="DEHU-014" /></label>
-        <label><span>Job / property</span><input name="job" required placeholder="J-2039 Oak Avenue" /></label>
+        <label><span>Asset tag</span><input name="assetTag" required placeholder="DEHU-014" /></label>
+        <label><span>Assigned job</span><select name="jobId" required><option value="">Select job</option>${state.jobBoards.map((job) => `<option value="${escapeHtml(equipmentRecordKey(job))}">${escapeHtml(`${job.jobId || job.id} - ${job.title || job.customer || "Job"}`)}</option>`).join("")}</select></label>
+        <label><span>Deployed at</span><input name="deployedAt" type="datetime-local" required value="${equipmentLocalDateTime()}" max="${equipmentLocalDateTime()}" /></label>
         <label><span>Room / placement</span><input name="room" placeholder="Unit 2B living room" /></label>
-        <label>
-          <span>Status</span>
-          <select name="status">
-            <option>Deployed</option>
-            <option>Picked up</option>
-            <option>Needs pickup</option>
-            <option>In repair</option>
-            <option>Lost / review</option>
-          </select>
-        </label>
-        <label>
-          <span>Attach invoice</span>
-          <select name="invoiceId">
-            ${invoices.map((file) => `<option value="${file.id}">${escapeHtml(file.title)}</option>`).join("")}
-            <option value="">Create or attach later</option>
-          </select>
-        </label>
-        <label><span>Invoice number</span><input name="invoiceNumber" value="${escapeHtml(defaultInvoiceNumber)}" placeholder="INV-2039" /></label>
+        ${office ? `<label><span>Invoice number</span><input name="invoiceNumber" placeholder="Assigned on invoicing" /></label>` : ""}
         <label><span>Address / site note</span><input name="address" placeholder="Street, unit, yard, roof, mechanical room" /></label>
         <label><span>Latitude</span><input name="latitude" inputmode="decimal" placeholder="42.45010" /></label>
         <label><span>Longitude</span><input name="longitude" inputmode="decimal" placeholder="-73.24540" /></label>
-        <label><span>Rental days</span><input name="rentalDays" type="number" min="0" step="0.25" value="1" /></label>
-        <label><span>Daily rate</span><input name="dailyRate" type="number" min="0" step="0.01" value="95" /></label>
+        ${office ? `<label><span>Daily rate</span><input name="dailyRate" type="number" min="0" max="1000000" step="0.01" value="95" required /></label>` : ""}
       </div>
       <input name="gpsLabel" type="hidden" />
-      <label class="check-row"><input name="billable" type="checkbox" checked /><span>Billable and should flow to invoice support</span></label>
+      ${office ? `<label class="check-row"><input name="billable" type="checkbox" checked /><span>Billable</span></label>` : ""}
       <label><span>Notes</span><textarea name="notes" rows="3" placeholder="Photo evidence, equipment condition, placement reason, pickup note, or invoice line details"></textarea></label>
-      <div class="gps-capture-status">Use current GPS or enter coordinates manually.</div>
+      <div class="gps-capture-status" role="status"></div>
       <div class="modal-actions">
         <button type="button" data-action="capture-equipment-gps">Capture GPS</button>
-        <button type="submit">Add equipment location</button>
+        <button type="submit" ${state.jobBoards.length ? "" : "disabled"}>Deploy equipment</button>
       </div>
     </form>
   `;
 }
 
 function renderEquipmentDeploymentCard(deployment) {
-  const invoice = state.files.find((file) => file.id === deployment.invoiceId);
-  const mapUrl = deployment.latitude && deployment.longitude ? `https://www.google.com/maps/search/?api=1&query=${deployment.latitude},${deployment.longitude}` : "";
+  const invoice = equipmentInvoiceFor(deployment);
+  const office = canManageEquipmentBilling(equipmentActor().roleId);
+  const active = isEquipmentActive(deployment);
+  const recordKey = escapeHtml(equipmentRecordKey(deployment));
+  const mapUrl = deployment.latitude != null && deployment.longitude != null
+    && Number.isFinite(Number(deployment.latitude)) && Number.isFinite(Number(deployment.longitude))
+    ? `https://www.google.com/maps/search/?api=1&query=${Number(deployment.latitude)},${Number(deployment.longitude)}` : "";
   return `
-    <article class="equipment-card">
+    <article class="equipment-card" data-deployment-id="${escapeHtml(deployment.id)}">
       <div class="file-card-head">
         <span>${escapeHtml(deployment.status)}</span>
-        <strong>${escapeHtml(formatMoney(equipmentCharge(deployment)))}</strong>
+        ${office ? `<strong>${active ? "Awaiting return" : escapeHtml(formatMoney(equipmentCharge(deployment)))}</strong>` : ""}
       </div>
       <h3>${escapeHtml(deployment.equipmentName)}</h3>
       <p>${escapeHtml(deployment.assetTag || "No asset tag")} - ${escapeHtml(deployment.job || "No job")}</p>
       <dl>
         <div><dt>Location</dt><dd>${escapeHtml(deployment.room || deployment.address || "Not specified")}</dd></div>
         <div><dt>GPS</dt><dd>${escapeHtml(deployment.gpsLabel || "Not captured")}</dd></div>
-        <div><dt>Invoice</dt><dd>${escapeHtml(invoice?.title || deployment.invoiceNumber || "Not attached")}</dd></div>
-        <div><dt>Rate</dt><dd>${escapeHtml(`${deployment.rentalDays} days x ${formatMoney(deployment.dailyRate)}`)}</dd></div>
+        <div><dt>Deployed</dt><dd>${escapeHtml(formatTime(deployment.deployedAt || deployment.createdAt))}</dd></div>
+        <div><dt>Returned</dt><dd>${deployment.returnedAt ? escapeHtml(formatTime(deployment.returnedAt)) : "Not recorded"}</dd></div>
+        <div><dt>Rental days</dt><dd>${active ? "Pending return" : escapeHtml(String(deployment.rentalDays || 0))}</dd></div>
+        ${office ? `<div><dt>Invoice</dt><dd>${escapeHtml(invoice?.title || deployment.invoiceNumber || "Not attached")}</dd></div>
+        <div><dt>Daily rate</dt><dd>${escapeHtml(formatMoney(deployment.dailyRate))}</dd></div>` : ""}
       </dl>
+      ${active ? `<form class="stack-form" data-form="equipment-return">
+        <input type="hidden" name="deploymentId" value="${recordKey}" />
+        <label><span>Returned at</span><input name="returnedAt" type="datetime-local" required min="${equipmentLocalDateTime(deployment.deployedAt || deployment.createdAt)}" max="${equipmentLocalDateTime()}" value="${equipmentLocalDateTime()}" /></label>
+        <label><span>Return notes / condition</span><textarea name="returnNotes" rows="2"></textarea></label>
+        <button type="submit">Record return</button>
+      </form>` : ""}
+      ${office && !active && deployment.returnedAt ? `<form class="stack-form" data-form="equipment-billing">
+        <input type="hidden" name="deploymentId" value="${recordKey}" />
+        <label><span>Billable days (24h rounded up)</span><output>${escapeHtml(String(deployment.rentalDays))}</output></label>
+        <label><span>Daily rate</span><input name="dailyRate" type="number" min="0" max="1000000" step="0.01" required value="${escapeHtml(String(deployment.dailyRate || 0))}" /></label>
+        <label><span>Invoice number</span><input name="invoiceNumber" value="${escapeHtml(deployment.invoiceNumber || "")}" /></label>
+        <label class="check-row"><input name="billable" type="checkbox" ${deployment.billable ? "checked" : ""} /><span>Billable</span></label>
+        <button type="submit">Save billing</button>
+      </form>` : ""}
       <div class="card-actions">
         ${mapUrl ? `<a href="${mapUrl}" target="_blank" rel="noreferrer">Open map</a>` : ""}
-        <button type="button" data-action="create-equipment-invoice" data-id="${deployment.id}">${invoice ? "Update invoice file" : "Create invoice file"}</button>
+        ${office && !active && deployment.returnedAt && deployment.billable && deployment.billingReviewedAt ? `<button type="button" data-action="create-equipment-invoice" data-id="${recordKey}">${invoice ? "Update invoice file" : "Create invoice file"}</button>` : ""}
       </div>
     </article>
   `;
@@ -12360,12 +12464,13 @@ function renderTimeModule(module) {
       </div>
       <div class="panel">
         <div class="panel-head">
-          <div><h2>Time log</h2><p>GPS-backed entries saved to this workspace.</p></div>
+          <div><h2>Time log</h2><p>GPS shifts and audited office entries.</p></div>
           <button type="button" data-action="open-export">Export</button>
         </div>
         ${renderTimeEntries(timeEntries)}
       </div>
     </section>
+    ${canEditModuleWorkflowRecords() ? renderManualTimeForm() : ""}
     ${authenticatedWorker ? renderEmployeeTicketPanel(taskOptions) : `
       <section class="panel">
         <div class="panel-head"><div><h2>Employee ticket sign-offs</h2><p>Employer-visible task completion records with verified worker identity and GPS evidence.</p></div></div>
@@ -12421,6 +12526,64 @@ function renderClockInForm(taskOptions = []) {
   `;
 }
 
+function renderManualTimeForm() {
+  const employees = assignableTeamMembers().filter((member) => !member.disabled);
+  return `<section class="panel">
+    <div class="panel-head"><h2>Enter completed time</h2><a href="#module/team" data-action="set-active" data-key="team">Team directory</a></div>
+    <form class="form-grid" data-form="manual-time">
+      <label><span>Employee</span><select name="workerId" required><option value="">Select employee</option>${employees.map((member) => `<option value="${escapeHtml(member.id)}">${escapeHtml(member.name || member.email)}</option>`).join("")}</select></label>
+      <label><span>Job</span><select name="job" required><option value="">Select job</option>${visibleJobBoards().map((job) => `<option value="${escapeHtml(job.id || job.jobId)}">${escapeHtml(job.jobId)} - ${escapeHtml(job.title)}</option>`).join("")}</select></label>
+      <label><span>Work performed</span><input name="task" maxlength="300" required /></label>
+      <label><span>Start (local time)</span><input name="start" type="datetime-local" required /></label>
+      <label><span>End (local time)</span><input name="end" type="datetime-local" required /></label>
+      <label><span>Unpaid break (minutes)</span><input name="breakMinutes" type="number" min="0" step="1" value="0" required /></label>
+      <label><span>Reason for manual entry</span><textarea name="notes" maxlength="2000" required></textarea></label>
+      <label class="check-row"><input name="billable" type="checkbox" checked /><span>Billable</span></label>
+      <button type="submit">Save office time entry</button>
+    </form>
+  </section>`;
+}
+
+async function addManualTime(formData) {
+  const member = assignableTeamMembers().find((candidate) => candidate.id === formData.get("workerId"));
+  const jobs = visibleJobBoards().filter((candidate) => (candidate.id || candidate.jobId) === formData.get("job"));
+  const job = jobs.length === 1 ? jobs[0] : null;
+  if (!member || !job) throw new Error("Select an existing employee and job before entering time.");
+  if (String(member.contractorId || "") !== String(job.contractorId || "")) {
+    throw new Error("The employee and job must belong to the same contractor.");
+  }
+  const start = new Date(String(formData.get("start") || ""));
+  const end = new Date(String(formData.get("end") || ""));
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) throw new Error("Enter valid start and end times.");
+  const entry = normalizeManualTimeEntry({
+    id: createId("TIME"), entryMethod: "manual",
+    workerId: member.id, workerEmail: member.email || "", worker: member.name || member.email,
+    job: job.jobId || job.id, jobId: job.id || job.jobId, relatedJob: job.jobId || job.id,
+    ...equipmentRecordScope(job),
+    contractorId: job.contractorId || "", franchiseId: job.franchiseId || "",
+    task: String(formData.get("task") || ""), start: start.toISOString(), end: end.toISOString(),
+    breakMinutes: formData.get("breakMinutes"), notes: String(formData.get("notes") || ""),
+    billable: formData.get("billable") === "on"
+  }, { ...state.authSession, roleId: currentRoleId() });
+  state.timeEntries = [entry, ...state.timeEntries];
+  const file = createFile({
+    moduleKey: "time", linkedModuleKeys: ["jobs", "payments", "reports", "closeout"],
+    sourceType: "timeEntry", sourceId: entry.id,
+    title: `${entry.worker} labor time - ${entry.job}`, type: "Labor time",
+    owner: entry.worker, status: entry.billable ? "Billable" : "Complete",
+    priority: "Medium", relatedJob: entry.job, workerId: entry.workerId,
+    workerEmail: entry.workerEmail, contractorId: entry.contractorId,
+    notes: `Office entry (no GPS).\nWork: ${entry.task}\nHours: ${entry.hours}\nBreak: ${entry.breakMinutes} minutes\nReason: ${entry.notes}\nEntered by: ${entry.enteredByEmail}`
+  }, { announce: false });
+  Object.assign(file, equipmentRecordScope(job), { jobId: entry.jobId });
+  addActivity(`Office time entered for ${entry.worker} on ${entry.job}.`);
+  persist();
+  await syncWorkspaceState({ force: true });
+  await hydrateWorkspaceState({ migrateIfEmpty: false });
+  setToast("Office time saved and linked to the job and billing records");
+  render();
+}
+
 function renderClockSession() {
   const session = state.clockSession;
   return `
@@ -12445,7 +12608,7 @@ function renderTimeEntries(entries = state.timeEntries) {
   return `
     <table class="data-table">
       <thead>
-        <tr><th>Worker</th><th>Job</th><th>Task</th><th>Start</th><th>End</th><th>Hours</th><th>GPS</th></tr>
+        <tr><th>Worker</th><th>Job</th><th>Task</th><th>Start</th><th>End</th><th>Hours</th><th>Evidence</th></tr>
       </thead>
       <tbody>
         ${entries
@@ -12458,7 +12621,7 @@ function renderTimeEntries(entries = state.timeEntries) {
                 <td>${escapeHtml(formatTime(entry.start))}</td>
                 <td>${escapeHtml(formatTime(entry.end))}</td>
                 <td>${escapeHtml(entry.hours)}</td>
-                <td>${escapeHtml(entry.startGps?.label || "Saved")}</td>
+                <td>${escapeHtml(entry.entryMethod === "manual" ? `Office entry (no GPS). Entered by ${entry.enteredByEmail || "administrator"}` : entry.startGps?.label || "GPS unavailable")}</td>
               </tr>
             `
           )
@@ -12975,6 +13138,12 @@ document.addEventListener("click", (event) => {
     rememberModalTrigger(actionElement);
     return openCreateFile(key || state.activeKey);
   }
+  if (action === "focus-workbench") {
+    const input = document.querySelector('[data-form="module-workbench"] [name="subject"]');
+    if (input) { input.scrollIntoView({ block: "center", behavior: "smooth" }); input.focus({ preventScroll: true }); }
+    else setToast("Structured workflow records require office access.");
+    return;
+  }
   if (action === "open-activity") {
     rememberModalTrigger(actionElement);
     state.modal = { type: "activity" };
@@ -13103,7 +13272,9 @@ document.addEventListener("click", (event) => {
     });
   }
   if (action === "capture-equipment-gps") return captureEquipmentGps();
-  if (action === "create-equipment-invoice") return createEquipmentInvoice(id);
+  if (action === "create-equipment-invoice") return createEquipmentInvoice(id).catch((error) => {
+    setToast(error.message || "Equipment invoice was not saved.");
+  });
   if (action === "generate-rebuttal") return generateStandardsFromButton(actionElement, "rebuttal", "Rebuttal generated");
   if (action === "run-live-source-check") return generateStandardsFromButton(actionElement, "code-search", "Source-check file prepared");
   if (action === "toggle-job-gate") return toggleJobGate(id, actionElement.dataset.gate);
@@ -13117,7 +13288,13 @@ document.addEventListener("click", (event) => {
   if (action === "download-estimate") return downloadEstimate();
   if (action === "create-estimate-invoice") return createEstimateInvoice();
   if (action === "remove-estimate-line") return removeEstimateLine(id);
-  if (action === "import-sample-pricing") return importSamplePricing();
+  if (action === "import-sample-pricing") return importSamplePricing().catch((error) => { setToast(error.message); });
+  if (action === "confirm-pricing-import") return confirmPricingImport();
+  if (action === "cancel-pricing-import") {
+    pricingImportReview = null;
+    pricingImportResults = pricingImportResults.map((result) => result.status === "review" ? { ...result, status: "discarded", message: "Discarded without saving." } : result);
+    return render();
+  }
   if (action === "connect-quickbooks") {
     return connectQuickBooks().catch((error) => {
       setToast(error.message || "Unable to start QuickBooks");
@@ -13221,6 +13398,7 @@ document.addEventListener("submit", (event) => {
   if (type !== "access-request" && !workspaceWritesReady()) {
     return blockUnavailableWorkspaceWrite();
   }
+  if (type === "manual-time") return submitDurableForm(form, () => addManualTime(formData));
   if (type === "create-file") {
     createFile(Object.fromEntries(formData.entries()));
   }
@@ -13239,10 +13417,18 @@ document.addEventListener("submit", (event) => {
     saveGeneratedStandardsOutput(output);
   }
   if (type === "equipment-deployment") {
-    addEquipmentDeployment(formData);
+    return submitEquipmentForm(form, () => addEquipmentDeployment(formData));
   }
+  if (type === "equipment-return") return submitEquipmentForm(form, () => recordEquipmentReturn(formData));
+  if (type === "equipment-billing") return submitEquipmentForm(form, () => saveEquipmentBilling(formData));
   if (type === "job-record") {
-    addJobRecord(formData);
+    return submitDurableForm(form, async () => {
+      const job = addJobRecord(formData);
+      if (!job) return;
+      await syncWorkspaceState({ force: true });
+      setToast("Job saved and linked to its employer profile");
+      render();
+    });
   }
   if (type === "dry-log") {
     addDryLogRecord(formData);
@@ -13263,7 +13449,7 @@ document.addEventListener("submit", (event) => {
     addPriceItem(formData);
   }
   if (type === "pasted-pricing-import") {
-    importPastedPricing(formData);
+    return submitDurableForm(form, () => importPastedPricing(formData));
   }
   if (type === "estimate-settings") {
     applyEstimateSettings(formData);
@@ -13287,10 +13473,7 @@ document.addEventListener("submit", (event) => {
     });
   }
   if (type === "task") {
-    return addTask(formData).catch((error) => {
-      setToast(error.message || "Unable to assign task");
-      render();
-    });
+    return submitDurableForm(form, () => addTask(formData));
   }
   if (type === "sketch-room") {
     addSketchRoom(formData);
@@ -13320,7 +13503,13 @@ document.addEventListener("submit", (event) => {
     saveActionDashboard(formData);
   }
   if (type === "module-workbench") {
-    createWorkbenchRecord(formData);
+    return submitDurableForm(form, async () => {
+      const record = createWorkbenchRecord(formData);
+      if (!record) return;
+      await syncWorkspaceState({ force: true });
+      setToast(`${record.recordType} saved`);
+      render();
+    });
   }
   if (type === "access-request") {
     return requestTrialAccess(formData);
