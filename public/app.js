@@ -1232,16 +1232,27 @@ function defaultModuleAccessForRole(roleId = "worker") {
 }
 
 function visibleModuleKeysForMember(member = {}) {
-  const explicit = moduleKeysFromList(member.visiblePageIds?.length ? member.visiblePageIds : member.visibleTabIds);
-  if (explicit.length) return explicit;
-  const permissions = moduleKeysFromList(member.permissions || []);
-  if (permissions.length) return permissions;
-  return defaultModuleAccessForRole(member.roleId || member.accountType || member.role || "worker");
+  const pageOverride = member.permissionsOverride?.pages;
+  let keys;
+  if (Array.isArray(member.applicationAccess)) {
+    keys = moduleKeysFromList(member.applicationAccess.flatMap((entry) => entry.allowedModuleKeys || []));
+  } else {
+    const explicit = moduleKeysFromList(member.visiblePageIds?.length ? member.visiblePageIds : member.visibleTabIds);
+    const permissions = moduleKeysFromList(member.permissions || []);
+    keys = explicit.length ? explicit
+      : pageOverride?.mode === "allow" ? moduleKeysFromList(pageOverride.allowed || [])
+        : pageOverride?.mode === "all" ? modules.map((module) => module.key)
+          : permissions.length ? permissions
+            : defaultModuleAccessForRole(member.roleId || member.accountType || member.role || "worker");
+  }
+  if (pageOverride?.mode === "allow") keys = keys.filter((key) => (pageOverride.allowed || []).includes(key));
+  return keys.filter((key) => !(pageOverride?.hidden || []).includes(key));
 }
 
 function moduleVisibilityPayload(formData) {
   if (!formData.has("visibilityConfigured")) return {};
   const selectedKeys = moduleKeysFromList(formData.getAll("visibleModuleKeys"));
+  if (!selectedKeys.length) throw new Error("Select at least one module, or disable the account to remove access.");
   return {
     visibleTabIds: selectedKeys,
     visiblePageIds: selectedKeys,
@@ -1290,14 +1301,15 @@ function normalizeTeamMember(member) {
     : /contractor/i.test(`${accountType} ${member.role} ${member.access}`)
       ? defaultContractorModuleKeys
       : employeeAllowedModuleKeys;
-  const visibleTabIds = moduleKeysFromList(member.visibleTabIds || member.visibleTabs || permissions);
-  const visiblePageIds = moduleKeysFromList(member.visiblePageIds || member.visiblePages || visibleTabIds);
+  const effectivePermissions = Array.isArray(member.permissions) || permissions.length ? permissions : defaultPermissions;
+  const visibleTabIds = moduleKeysFromList(member.visibleTabIds ?? member.visibleTabs ?? effectivePermissions);
+  const visiblePageIds = moduleKeysFromList(member.visiblePageIds ?? member.visiblePages ?? visibleTabIds);
   return {
     ...member,
     accountType,
-    permissions: permissions.length ? permissions : defaultPermissions,
-    visibleTabIds: visibleTabIds.length ? visibleTabIds : defaultPermissions,
-    visiblePageIds: visiblePageIds.length ? visiblePageIds : visibleTabIds.length ? visibleTabIds : defaultPermissions,
+    permissions: effectivePermissions,
+    visibleTabIds,
+    visiblePageIds,
     accessCode: String(member.accessCode || "").trim().toUpperCase(),
     assignedJobIds: normalizeListValue(member.assignedJobIds || member.assignedJobs || ""),
     assignedTaskIds: normalizeListValue(member.assignedTaskIds || member.tasks || ""),
@@ -1850,6 +1862,7 @@ async function submitDurableForm(form, operation) {
   const type = form.dataset.form;
   form.dataset.saving = "true";
   const buttons = [...form.querySelectorAll('button[type="submit"]')];
+  const buttonStates = buttons.map((button) => button.disabled);
   buttons.forEach((button) => { button.disabled = true; });
   try {
     await operation();
@@ -1858,14 +1871,17 @@ async function submitDurableForm(form, operation) {
     const currentForm = [...document.querySelectorAll("form[data-form]")].find((candidate) => candidate.dataset.form === type);
     if (currentForm && currentForm !== form) {
       for (const field of currentForm.elements) {
-        if (field.type === "checkbox") field.checked = draft.has(field.name);
-        else if (field.type !== "file" && draft.has(field.name)) field.value = draft.get(field.name);
+        if (field.type === "checkbox" || field.type === "radio") field.checked = draft.getAll(field.name).includes(field.value);
+        else if (field.type === "select-multiple") {
+          const selectedValues = draft.getAll(field.name);
+          for (const option of field.options) option.selected = selectedValues.includes(option.value);
+        } else if (field.type !== "file" && draft.has(field.name)) field.value = draft.get(field.name);
       }
     }
     setToast(error.message || "The record was not saved. Please retry.");
   } finally {
     delete form.dataset.saving;
-    buttons.forEach((button) => { button.disabled = false; });
+    buttons.forEach((button, index) => { button.disabled = buttonStates[index]; });
   }
 }
 
@@ -4115,8 +4131,8 @@ function mapEmployeeGrantToTeamMember(grant = {}) {
     accountType: "worker",
     access: "employee portal",
     permissions: grant.visiblePageIds || grant.visibleTabIds || employeeAllowedModuleKeys,
-    visibleTabIds: grant.visibleTabIds || [],
-    visiblePageIds: grant.visiblePageIds || [],
+    visibleTabIds: grant.visibleTabIds ?? grant.visiblePageIds ?? employeeAllowedModuleKeys,
+    visiblePageIds: grant.visiblePageIds ?? grant.visibleTabIds ?? employeeAllowedModuleKeys,
     assignedJobIds: grant.assignedJobIds || [],
     assignedTaskIds: grant.assignedTaskIds || [],
     status,
@@ -4133,7 +4149,9 @@ function mapEmployeeGrantToTeamMember(grant = {}) {
     employmentType: grant.employmentType || "Employee",
     startDate: grant.startDate || "",
     accessExpiresAt: grant.expiresAt || "",
-    accessScope: grant.accessScope || "employee_portal"
+    accessScope: grant.accessScope || "employee_portal",
+    permissionsOverride: grant.permissionsOverride || {},
+    applicationAccess: grant.applicationAccess
   });
 }
 
@@ -4145,12 +4163,14 @@ function employeeDirectoryMembers() {
     const key = identityKey(normalized);
     if (key) members.set(key, normalized);
   };
-  (state.accessContext?.accessGrants || [])
+  const grants = state.accessContext?.accessGrants || [];
+  const invitationIds = new Set(grants.map((grant) => String(grant.id || grant.grantId || "")));
+  (state.teamMembers || []).filter((member) => !member.pendingGrantId || !invitationIds.has(member.pendingGrantId)).forEach(put);
+  grants
     .filter((grant) => grant.onboardingMode === "employee_link" && !["superseded", "revoked"].includes(String(grant.status || "").toLowerCase()))
     .slice()
     .reverse()
     .forEach((grant) => put(mapEmployeeGrantToTeamMember(grant)));
-  (state.teamMembers || []).forEach(put);
   (state.accessContext?.users || []).map(mapUserToTeamMember).forEach(put);
   return Array.from(members.values()).sort((left, right) => {
     const leftPending = left.pendingGrantId ? 0 : 1;
@@ -4160,7 +4180,9 @@ function employeeDirectoryMembers() {
 }
 
 function assignableTeamMembers() {
-  return employeeDirectoryMembers();
+  return employeeDirectoryMembers().filter((member) => !member.disabled
+    && !/disabled|revoked|expired|superseded|inactive/i.test(String(member.status || ""))
+    && (!member.pendingGrantId || !member.accessExpiresAt || new Date(member.accessExpiresAt).getTime() > Date.now()));
 }
 
 function mergeSessionTeamMembers(users = []) {
@@ -4783,8 +4805,34 @@ async function createAccessGrant(formData) {
     emailDelivery: result.emailDelivery || result.grant?.emailDelivery || null
   };
   upsertAccessGrant(result.grant);
-  setToast(state.lastAccessGrant.emailDelivery?.status === "sent" ? "Invite email sent with access code" : "Access grant issued; send the link and code manually");
-  await refreshAccessContext();
+  await refreshTeamAfterSave(state.lastAccessGrant.emailDelivery?.status === "sent" ? "Invite email sent with access code" : "Access grant issued; send the link and code manually");
+}
+
+async function refreshTeamAfterSave(message) {
+  try {
+    await refreshAccessContext();
+  } catch {
+    message += "; directory refresh failed. Reload before making another change.";
+  }
+  setToast(message);
+  render();
+}
+
+async function runTeamAction(button, operation) {
+  const key = `${button.dataset.action}:${button.dataset.id}`;
+  const pending = runTeamAction.pending || (runTeamAction.pending = new Set());
+  if (pending.has(key)) return;
+  pending.add(key);
+  const disabled = button.disabled;
+  button.disabled = true;
+  try {
+    await operation();
+  } catch (error) {
+    setToast(error.message || "The team change was not saved. Please retry.");
+  } finally {
+    pending.delete(key);
+    button.disabled = disabled;
+  }
 }
 
 async function createEmployeeInvitation(formData) {
@@ -4816,31 +4864,35 @@ async function createEmployeeInvitation(formData) {
     emailDelivery: result.emailDelivery || result.grant?.emailDelivery || null
   };
   upsertAccessGrant(result.grant);
-  setToast(state.lastEmployeeInvitation.emailDelivery?.status === "sent"
+  await refreshTeamAfterSave(state.lastEmployeeInvitation.emailDelivery?.status === "sent"
     ? "Employee invitation emailed"
     : "Employee link created for manual delivery");
-  await refreshAccessContext();
-  render();
 }
 
 async function updateEmployeeAssignments(uid, assignedJobIds, assignedTaskIds) {
-  if (!state.firebase.enabled || !state.authSession || !canDo("inviteWorkers") || !uid) return null;
+  if (!state.firebase.enabled || !state.authSession || !canDo("inviteWorkers") || !uid) {
+    throw new Error("Employee assignments were not saved. Sign in with employee-management access and retry.");
+  }
   const result = await apiRequest(`/api/employees/${encodeURIComponent(uid)}/assignments`, {
     method: "PATCH",
     body: JSON.stringify({ assignedJobIds, assignedTaskIds })
   });
-  if (result.user) upsertManagedUser(result.user);
-  return result.user || null;
+  if (!result.user) throw new Error("The server did not confirm the employee assignment update.");
+  upsertManagedUser({ ...result.user, uid });
+  return result.user;
 }
 
 async function updatePendingEmployeeInvitation(grantId, updates = {}) {
-  if (!state.firebase.enabled || !state.authSession || !canDo("inviteWorkers") || !grantId) return null;
+  if (!state.firebase.enabled || !state.authSession || !canDo("inviteWorkers") || !grantId) {
+    throw new Error("The invitation was not updated. Sign in with employee-management access and retry.");
+  }
   const result = await apiRequest(`/api/employee-invitations/${encodeURIComponent(grantId)}`, {
     method: "PATCH",
     body: JSON.stringify(updates)
   });
-  if (result.grant) upsertAccessGrant(result.grant);
-  return result.grant || null;
+  if (!result.grant) throw new Error("The server did not confirm the invitation update.");
+  upsertAccessGrant(result.grant);
+  return result.grant;
 }
 
 async function savePendingEmployeeInvitation(formData) {
@@ -4858,20 +4910,20 @@ async function savePendingEmployeeInvitation(formData) {
     visibleApplicationIds: applicationIdsForModuleKeys(visibleModuleKeys)
   });
   state.modal = null;
-  setToast("Pending employee profile updated");
-  await refreshAccessContext();
-  render();
+  await refreshTeamAfterSave("Pending employee profile updated");
 }
 
 async function revokePendingEmployeeInvitation(grantId) {
-  if (!state.firebase.enabled || !state.authSession || !canDo("inviteWorkers") || !grantId) return null;
+  if (!state.firebase.enabled || !state.authSession || !canDo("inviteWorkers") || !grantId) {
+    throw new Error("The invitation was not revoked. Sign in with employee-management access and retry.");
+  }
   const result = await apiRequest(`/api/employee-invitations/${encodeURIComponent(grantId)}`, { method: "DELETE" });
-  if (result.grant) upsertAccessGrant(result.grant);
+  if (result.grant?.status !== "revoked") throw new Error("The server did not confirm invitation revocation.");
+  upsertAccessGrant(result.grant);
+  if (state.lastEmployeeInvitation?.email === result.grant.email) state.lastEmployeeInvitation = null;
   state.modal = null;
-  setToast("Employee invitation revoked");
-  await refreshAccessContext();
-  render();
-  return result.grant || null;
+  await refreshTeamAfterSave("Employee invitation revoked");
+  return result.grant;
 }
 
 async function createCommunityPost(formData) {
@@ -4965,8 +5017,7 @@ async function createSecureUser(formData) {
     expiresAt: result.grant?.expiresAt || result.user?.accessExpiresAt || "",
     emailDelivery: result.emailDelivery || null
   };
-  setToast(result.emailDelivery?.status === "sent" ? "Google invite emailed and user added" : "Google invite created; send the link and code manually");
-  await refreshAccessContext();
+  await refreshTeamAfterSave(result.emailDelivery?.status === "sent" ? "Google invite emailed and user added" : "Google invite created; send the link and code manually");
 }
 
 async function saveRolePermissions(formData) {
@@ -4995,8 +5046,7 @@ async function saveRolePermissions(formData) {
     method: "PATCH",
     body: JSON.stringify(payload)
   });
-  setToast("Role permissions updated");
-  await refreshAccessContext();
+  await refreshTeamAfterSave("Role permissions updated");
 }
 
 async function saveTabConfig(formData) {
@@ -5068,7 +5118,7 @@ async function saveCompanyBrand(formData) {
 
 function mapUserToTeamMember(member) {
   const roleId = member.roleId || member.role || "worker";
-  const visibleKeys = moduleKeysFromList(member.visiblePageIds?.length ? member.visiblePageIds : member.visibleTabIds);
+  const visibleKeys = visibleModuleKeysForMember({ ...member, roleId });
   return {
     id: member.uid || member.id,
     name: member.displayName || member.name || member.email || "User",
@@ -5076,13 +5126,16 @@ function mapUserToTeamMember(member) {
     role: roleId.replace(/_/g, " "),
     accountType: roleId,
     access: roleId,
-    permissions: visibleKeys.length ? visibleKeys : defaultModuleAccessForRole(roleId),
-    visibleTabIds: moduleKeysFromList(member.visibleTabIds),
-    visiblePageIds: moduleKeysFromList(member.visiblePageIds),
+    permissions: visibleKeys,
+    visibleTabIds: visibleKeys,
+    visiblePageIds: visibleKeys,
+    permissionsOverride: member.permissionsOverride || {},
+    applicationAccess: member.applicationAccess,
     accessCode: member.accessCode || "",
     assignedJobIds: Array.isArray(member.assignedJobIds) ? member.assignedJobIds : [],
     assignedTaskIds: Array.isArray(member.assignedTaskIds) ? member.assignedTaskIds : [],
     status: member.disabled ? "Disabled" : (member.status || "Active"),
+    disabled: Boolean(member.disabled),
     companyId: member.companyId || "",
     franchiseIds: Array.isArray(member.franchiseIds) ? member.franchiseIds : [],
     contractorId: member.contractorId || "",
@@ -5102,13 +5155,16 @@ function mapUserToTeamMember(member) {
 
 async function updateSecureUser(payload) {
   if (!payload.uid) throw new Error("User id is required.");
+  if (["visibleTabIds", "visiblePageIds"].some((key) => Array.isArray(payload[key]) && !payload[key].length)) {
+    throw new Error("Select at least one module, or disable the account to remove access.");
+  }
   const result = await apiRequest(`/api/rbac/users/${encodeURIComponent(payload.uid)}`, {
     method: "PATCH",
     body: JSON.stringify(payload)
   });
-  upsertManagedUser(result.user || payload);
-  setToast("User updated");
-  await refreshAccessContext().catch(() => render());
+  if (!result.user) throw new Error("The server did not confirm the user update.");
+  upsertManagedUser({ ...result.user, uid: payload.uid });
+  await refreshTeamAfterSave("User updated");
 }
 
 async function resetSecureUserPermissions(uid) {
@@ -5116,8 +5172,7 @@ async function resetSecureUserPermissions(uid) {
     method: "POST",
     body: JSON.stringify({})
   });
-  setToast("User permissions reset");
-  await refreshAccessContext();
+  await refreshTeamAfterSave("User permissions reset");
 }
 
 async function deleteSecureUser(uid) {
@@ -5126,8 +5181,7 @@ async function deleteSecureUser(uid) {
     body: JSON.stringify({})
   });
   removeManagedUser(uid);
-  setToast("User removed");
-  await refreshAccessContext().catch(() => render());
+  await refreshTeamAfterSave("User removed");
 }
 
 async function uploadAdminAssetFile(file) {
@@ -6421,6 +6475,9 @@ async function connectQuickBooks() {
 async function addTeamMember(formData) {
   const accountType = String(formData.get("accountType") || "Contractor portal");
   const permissions = formData.getAll("visibleModuleKeys").map(String);
+  if (formData.has("visibilityConfigured") && !permissions.length) {
+    throw new Error("Select at least one module for the restricted login.");
+  }
   const assignedJobIds = csvValues(formData.get("assignedJobIds"));
   const roleId = {
     "Contractor portal": "contractor",
@@ -6494,6 +6551,10 @@ async function addTeamMember(formData) {
     priority: assignedJobIds.length ? "Medium" : "High",
     due: today.toISOString().slice(0, 10),
     relatedJob: assignedJobIds[0] || "",
+    workerId: member.id,
+    workerEmail: member.email,
+    contractorId: member.contractorId,
+    employerUid: member.employerUid,
     notes: [
       `Email: ${member.email}`,
       `Role: ${member.role}`,
@@ -6501,91 +6562,182 @@ async function addTeamMember(formData) {
       `Modules: ${(member.permissions || []).join(", ")}`,
       `Assigned jobs: ${assignedJobIds.join(", ") || "None yet"}`
     ].join("\n")
-  });
+  }, { announce: false });
   addActivity(`Created a Google-bound 48-hour invitation for ${member.name}.`);
   persist();
-  setToast(result.emailDelivery?.status === "sent" ? "Team invite emailed" : "Team invite created; send the link and code manually");
-  await refreshAccessContext();
-  render();
+  let message = result.emailDelivery?.status === "sent" ? "Team invite emailed" : "Team invite created; send the link and code manually";
+  const issuedGrant = state.lastAccessGrant;
+  try {
+    await confirmTeamWorkspaceSave();
+  } catch (error) {
+    await recoverRejectedWorkspaceState(error);
+    upsertManagedUser(result.user);
+    state.lastAccessGrant = issuedGrant;
+    message += "; the linked workspace profile was not saved. Do not recreate the invitation.";
+  }
+  await refreshTeamAfterSave(message);
+}
+
+async function confirmTeamWorkspaceSave() {
+  const result = await syncWorkspaceState({ force: true });
+  if ((!result?.durable && !isOfflineSmokePreview()) || Number(result?.ignoredRecords || 0) > 0) {
+    throw new Error("The server did not confirm all team changes. Reload and retry.");
+  }
+  return result;
 }
 
 async function addTask(formData) {
-  const assigneeId = String(formData.get("assigneeId") || assignableTeamMembers()[0]?.id || "");
-  const assignee = assignableTeamMembers().find((member) => member.id === assigneeId);
+  const taskId = String(formData.get("taskId") || createId("TASK"));
+  const existingTask = state.tasks.find((item) => item.id === taskId);
+  const requestedAssigneeId = String(formData.get("assigneeId") || assignableTeamMembers()[0]?.id || "");
+  const members = assignableTeamMembers();
+  let assignee = members.find((member) => member.id === requestedAssigneeId);
+  let acceptedIdentityTransition = false;
+  if (!assignee && existingTask?.assignmentSyncPending && existingTask.assigneeId === requestedAssigneeId) {
+    const email = String(existingTask.assigneeEmail || "").trim().toLowerCase();
+    const companyId = String(existingTask.companyId || "").trim();
+    const contractorId = String(existingTask.contractorId || "").trim();
+    const sameScope = (record) => email && companyId && contractorId
+      && String(record.email || "").trim().toLowerCase() === email
+      && String(record.companyId || "").trim() === companyId
+      && String(record.employerContractorId || record.contractorId || "").trim() === contractorId
+      && (!existingTask.employerUid || String(record.employerUid || "").trim() === String(existingTask.employerUid).trim());
+    const grants = (state.accessContext?.accessGrants || []).filter((grant) =>
+      `invite-${grant.id || grant.grantId}` === requestedAssigneeId
+      && grant.onboardingMode === "employee_link" && grant.status === "active"
+      && grant.firebaseUid && sameScope(grant));
+    if (grants.length === 1) {
+      const uid = grants[0].firebaseUid;
+      const user = (state.accessContext?.users || []).find((record) => (record.uid || record.id) === uid
+        && record.roleId === "worker" && !record.disabled && record.status === "active" && sameScope(record));
+      assignee = user ? members.find((member) => member.id === uid && sameScope(member)) : null;
+      acceptedIdentityTransition = Boolean(assignee);
+    }
+  }
+  if (!assignee) throw new Error("Select an active team member before assigning a task.");
+  const assigneeId = assignee.id;
   const relatedJob = String(formData.get("relatedJob") || "").trim();
-  const relatedJobRecord = jobByJobId(relatedJob);
+  const matchingJobs = visibleJobBoards().filter((job) => [job.id, job.jobId, job.title]
+    .some((value) => relatedJob && String(value || "").toLowerCase() === relatedJob.toLowerCase()));
+  const exactJob = matchingJobs.find((job) => job.id === relatedJob);
+  if (!exactJob && matchingJobs.length > 1) throw new Error("This job reference is ambiguous. Select the job's unique record ID.");
+  const relatedJobRecord = exactJob || matchingJobs[0];
   const moduleKey = String(formData.get("moduleKey") || "jobs");
+  const employerContractorId = String(assignee.employerContractorId || assignee.contractorId || "").trim();
+  if (relatedJobRecord?.contractorId && employerContractorId && relatedJobRecord.contractorId !== employerContractorId) {
+    throw new Error("The assignee and job must belong to the same employer.");
+  }
   if (assignee && !visibleModuleKeysForMember(assignee).includes(moduleKey)) {
     throw new Error(`Enable ${moduleByKey(moduleKey)?.label || moduleKey} in this employee's profile before assigning the ticket.`);
   }
   const task = {
-    id: createId("TASK"),
+    id: taskId,
     title: String(formData.get("title") || "Task").trim(),
     assigneeId,
     assigneeName: assignee?.name || "",
     assigneeEmail: assignee?.email || "",
     moduleKey,
     relatedJob,
+    jobId: relatedJobRecord?.id || "",
+    companyId: relatedJobRecord?.companyId || assignee.companyId || state.authSession?.companyId || "",
     franchiseId: String(relatedJobRecord?.franchiseId || "").trim(),
     branchId: String(relatedJobRecord?.branchId || "").trim(),
     contractorId: String(assignee?.employerContractorId || assignee?.contractorId || relatedJobRecord?.contractorId || "").trim(),
+    employerUid: assignee.employerUid || "",
     due: String(formData.get("due") || ""),
     status: "Open",
     priority: String(formData.get("priority") || "Medium")
   };
   const nextAssignedTaskIds = [...new Set([task.id, ...normalizeListValue(assignee?.assignedTaskIds)])];
-  const nextAssignedJobIds = [...new Set([...(relatedJob ? [relatedJob] : []), ...normalizeListValue(assignee?.assignedJobIds)])];
+  const nextAssignedJobIds = [...new Set([...(relatedJob ? [relatedJobRecord?.id || relatedJob] : []), ...normalizeListValue(assignee?.assignedJobIds)])];
   const secureEmployee = (state.accessContext?.users || []).some((user) => (user.uid || user.id) === assigneeId && user.roleId === "worker");
-  state.tasks = [task, ...state.tasks];
-  createFile({
-    moduleKey: "team",
-    linkedModuleKeys: ["jobs", task.moduleKey, "time", "photos"],
-    sourceType: "taskAssignment",
-    sourceId: task.id,
-    taskModuleKey: task.moduleKey,
-    title: `${assignee?.name || "Unassigned"} task - ${task.title}`,
-    type: "Task assignment",
-    owner: assignee?.name || "Dispatcher",
-    status: task.status,
-    priority: task.priority,
-    due: task.due,
-    relatedJob: task.relatedJob,
-    taskId: task.id,
-    workerId: assignee?.id || "",
-    workerEmail: assignee?.email || "",
-    franchiseId: task.franchiseId,
-    branchId: task.branchId,
-    contractorId: task.contractorId,
-    notes: [
-      `Task: ${task.title}`,
-      `Assignee: ${assignee?.name || "Unassigned"} ${assignee?.email || ""}`.trim(),
-      `Module: ${moduleByKey(task.moduleKey)?.label || task.moduleKey}`,
-      `Related job: ${task.relatedJob || "None"}`
-    ].join("\n")
-  }, { announce: false });
-  addActivity(`Assigned task: ${task.title}.`);
+  if (existingTask && ["title", "assigneeId", "moduleKey", "relatedJob", "due", "priority"].some((key) =>
+    existingTask[key] !== task[key] && !(key === "assigneeId" && acceptedIdentityTransition))) {
+    throw new Error(`Task ${taskId} is already saved. Restore its original fields to retry the assignment, or reload to create another task.`);
+  }
+  if (existingTask?.status === "Complete") throw new Error("This task is already complete. Reload before assigning more work.");
+  task.assignmentSyncPending = Boolean(assignee.pendingGrantId || secureEmployee);
+  if (!existingTask) {
+    state.tasks = [task, ...state.tasks];
+    createFile({
+      moduleKey: "team",
+      linkedModuleKeys: ["jobs", task.moduleKey, "time", "photos"],
+      sourceType: "taskAssignment",
+      sourceId: task.id,
+      taskModuleKey: task.moduleKey,
+      title: `${assignee.name} task - ${task.title}`,
+      type: "Task assignment",
+      owner: assignee.name || "Dispatcher",
+      status: task.status,
+      priority: task.priority,
+      due: task.due,
+      relatedJob: task.relatedJob,
+      jobId: task.jobId,
+      companyId: task.companyId,
+      taskId: task.id,
+      workerId: assignee.id,
+      workerEmail: assignee.email || "",
+      franchiseId: task.franchiseId,
+      branchId: task.branchId,
+      contractorId: task.contractorId,
+      employerUid: task.employerUid,
+      notes: [
+        `Task: ${task.title}`,
+        `Assignee: ${assignee.name} ${assignee.email || ""}`.trim(),
+        `Module: ${moduleByKey(task.moduleKey)?.label || task.moduleKey}`,
+        `Related job: ${task.relatedJob || "None"}`
+      ].join("\n")
+    }, { announce: false });
+    addActivity(`Assigned task: ${task.title}.`);
+  } else if (acceptedIdentityTransition) {
+    existingTask.assigneeId = assigneeId;
+    state.files.filter((file) => file.sourceType === "taskAssignment" && file.sourceId === taskId
+      && file.workerId === requestedAssigneeId).forEach((file) => { file.workerId = assigneeId; });
+  }
   persist();
   try {
-    await syncWorkspaceState({ force: true });
+    await confirmTeamWorkspaceSave();
   } catch (error) {
     await recoverRejectedWorkspaceState(error);
     throw error;
   }
-  if (assignee?.pendingGrantId) {
-    await updatePendingEmployeeInvitation(assignee.pendingGrantId, {
-      assignedJobIds: nextAssignedJobIds,
-      assignedTaskIds: nextAssignedTaskIds
-    });
-  } else if (secureEmployee) {
-    await updateEmployeeAssignments(assigneeId, nextAssignedJobIds, nextAssignedTaskIds);
+  try {
+    if (assignee.pendingGrantId) {
+      await updatePendingEmployeeInvitation(assignee.pendingGrantId, {
+        assignedJobIds: nextAssignedJobIds,
+        assignedTaskIds: nextAssignedTaskIds
+      });
+    } else if (secureEmployee) {
+      await updateEmployeeAssignments(assigneeId, nextAssignedJobIds, nextAssignedTaskIds);
+    }
+  } catch (error) {
+    throw new Error(`Task ${task.id} was saved, but its employee assignment was not updated. Retry this task to finish the same assignment. ${error.message}`);
   }
+  const savedTask = state.tasks.find((item) => item.id === task.id);
+  savedTask.assignmentSyncPending = false;
   state.teamMembers = (state.teamMembers || []).map((member) => {
     if (member.id !== assigneeId) return member;
     return normalizeTeamMember({ ...member, assignedTaskIds: nextAssignedTaskIds, assignedJobIds: nextAssignedJobIds });
   });
   persist();
+  try {
+    await confirmTeamWorkspaceSave();
+  } catch (error) {
+    await recoverRejectedWorkspaceState(error);
+    throw error;
+  }
   setToast("Task assigned");
   render();
+}
+
+async function retryTaskAssignment(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task) throw new Error("Task not found. Reload the latest assignments.");
+  if (task.status === "Complete") return completeTask(taskId);
+  const formData = new FormData();
+  for (const key of ["title", "assigneeId", "moduleKey", "relatedJob", "due", "priority"]) formData.set(key, task[key] || "");
+  formData.set("taskId", task.id);
+  return addTask(formData);
 }
 
 function fieldSessionForMember(member) {
@@ -6621,11 +6773,11 @@ async function completeTask(taskId) {
     setToast("Sign the assigned ticket with GPS to complete it");
     return render();
   }
-  if (task.status === "Complete") {
+  if (task.status === "Complete" && !task.assignmentSyncPending) {
     setToast("Task is already complete");
     return render();
   }
-  const assignee = assignableTeamMembers().find((member) => member.id === task.assigneeId
+  const assignee = employeeDirectoryMembers().find((member) => member.id === task.assigneeId
     || (task.assigneeEmail && String(member.email || "").toLowerCase() === String(task.assigneeEmail).toLowerCase()));
   const remainingAssignedTaskIds = normalizeListValue(assignee?.assignedTaskIds).filter((id) => id !== taskId);
   const assignedJobIds = normalizeListValue(assignee?.assignedJobIds);
@@ -6633,31 +6785,34 @@ async function completeTask(taskId) {
     return (user.uid || user.id) === assignee?.id && user.roleId === "worker";
   });
   const now = new Date().toISOString();
-  task.status = "Complete";
-  task.completedAt = now;
-  task.completedByEmail = state.authSession?.email || state.worker?.email || "";
-  const assignmentFile = state.files.find((file) => file.sourceType === "taskAssignment" && file.sourceId === taskId);
-  if (assignmentFile) {
-    assignmentFile.status = "Complete";
-    assignmentFile.updatedAt = now;
-    assignmentFile.history = [`Task completed ${formatTime(now)}`, ...(assignmentFile.history || [])];
-    assignmentFile.notes = `${assignmentFile.notes || ""}\nCompleted: ${formatTime(now)}`.trim();
+  if (task.status !== "Complete") {
+    task.status = "Complete";
+    task.assignmentSyncPending = Boolean(assignee?.pendingGrantId || secureEmployee);
+    task.completedAt = now;
+    task.completedByEmail = state.authSession?.email || state.worker?.email || "";
+    const assignmentFile = state.files.find((file) => file.sourceType === "taskAssignment" && file.sourceId === taskId);
+    if (assignmentFile) {
+      assignmentFile.status = "Complete";
+      assignmentFile.updatedAt = now;
+      assignmentFile.history = [`Task completed ${formatTime(now)}`, ...(assignmentFile.history || [])];
+      assignmentFile.notes = `${assignmentFile.notes || ""}\nCompleted: ${formatTime(now)}`.trim();
+    }
+    addActivity(`Completed task: ${task.title}.`);
   }
-  addActivity(`Completed task: ${task.title}.`);
   persist();
   try {
-    await syncWorkspaceState({ force: true });
+    await confirmTeamWorkspaceSave();
   } catch (error) {
     await recoverRejectedWorkspaceState(error);
     throw error;
   }
   try {
-    if (assignee?.pendingGrantId && canDo("inviteWorkers")) {
+    if (assignee?.pendingGrantId) {
       await updatePendingEmployeeInvitation(assignee.pendingGrantId, {
         assignedJobIds,
         assignedTaskIds: remainingAssignedTaskIds
       });
-    } else if (secureEmployee && canDo("inviteWorkers")) {
+    } else if (secureEmployee) {
       await updateEmployeeAssignments(assignee.id, assignedJobIds, remainingAssignedTaskIds);
     }
   } catch (error) {
@@ -6665,13 +6820,20 @@ async function completeTask(taskId) {
     return render();
   }
   state.teamMembers = (state.teamMembers || []).map((member) => {
-    if (member.id !== task.assigneeId && String(member.email || "").toLowerCase() !== String(task.assigneeEmail || "").toLowerCase()) return member;
+    if (member.id !== task.assigneeId && !(task.assigneeEmail && String(member.email || "").toLowerCase() === String(task.assigneeEmail).toLowerCase())) return member;
     return normalizeTeamMember({ ...member, assignedTaskIds: normalizeListValue(member.assignedTaskIds).filter((id) => id !== taskId) });
   });
-  if (state.worker && (state.worker.id === task.assigneeId || String(state.worker.email || "").toLowerCase() === String(task.assigneeEmail || "").toLowerCase())) {
+  if (state.worker && (state.worker.id === task.assigneeId || (task.assigneeEmail && String(state.worker.email || "").toLowerCase() === String(task.assigneeEmail).toLowerCase()))) {
     state.worker.assignedTaskIds = normalizeListValue(state.worker.assignedTaskIds).filter((id) => id !== taskId);
   }
+  task.assignmentSyncPending = false;
   persist();
+  try {
+    await confirmTeamWorkspaceSave();
+  } catch (error) {
+    await recoverRejectedWorkspaceState(error);
+    throw error;
+  }
   setToast("Task complete");
   render();
 }
@@ -7975,14 +8137,12 @@ async function saveEmployeeProfile(formData) {
       jobTitle: String(formData.get("jobTitle") || "").trim()
     })
   });
-  if (result.user) {
-    const member = normalizeTeamMember(mapUserToTeamMember(result.user));
-    state.worker = fieldSessionForMember(member);
-    upsertManagedUser(result.user);
-  }
-  setToast("Employee profile saved");
-  await refreshAccessContext();
-  render();
+  if (!result.user) throw new Error("The server did not confirm the employee profile update.");
+  const member = normalizeTeamMember(mapUserToTeamMember(result.user));
+  state.worker = fieldSessionForMember(member);
+  upsertManagedUser(result.user);
+  state.accessContext.user = result.user;
+  await refreshTeamAfterSave("Employee profile saved");
 }
 
 async function submitTicketSignoff(formData) {
@@ -10676,7 +10836,7 @@ function renderEmployeeInvitationPanel() {
           <input type="hidden" name="franchiseIds" value="${escapeHtml(currentUserFranchiseIds().join(","))}" />
         </div>
         <datalist id="employee-job-options">
-          ${state.jobBoards.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}
+          ${visibleJobBoards().map((job) => `<option value="${escapeHtml(job.id)}">${escapeHtml(job.jobId)} - ${escapeHtml(job.title)}</option>`).join("")}
         </datalist>
         ${renderModuleAccessPicker({ selectedKeys: employeeAllowedModuleKeys, allowedKeys: employeeAllowedModuleKeys, legend: "Employee modules" })}
         <label class="source-check"><input name="sendEmail" type="checkbox" checked /><span><strong>Email the one-time link</strong><small>The link expires after 48 hours and accepts only the invited verified Google email.</small></span></label>
@@ -11850,7 +12010,7 @@ function renderTeamForm() {
         <label><span>Assigned job IDs</span><input name="assignedJobIds" list="team-job-options" placeholder="J-2039,J-2050" /></label>
       </div>
       <datalist id="team-job-options">
-        ${state.jobBoards.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}
+        ${visibleJobBoards().map((job) => `<option value="${escapeHtml(job.id)}">${escapeHtml(job.jobId)} - ${escapeHtml(job.title)}</option>`).join("")}
       </datalist>
       ${renderModuleAccessPicker({ selectedKeys: defaultContractorModuleKeys, legend: "Application and module access" })}
       <button type="submit">Create restricted login invite</button>
@@ -11863,6 +12023,7 @@ function renderTaskForm(teamMemberOptions = null) {
   const taskModules = taskAssignableModules();
   return `
     <form class="stack-form inline-section" data-form="task">
+      <input type="hidden" name="taskId" value="" />
       <h3>Assign task</h3>
       <label><span>Task</span><input name="title" required placeholder="What needs to be done" /></label>
       <div class="form-grid">
@@ -11873,7 +12034,7 @@ function renderTaskForm(teamMemberOptions = null) {
         <label><span>Priority</span><select name="priority"><option>High</option><option>Medium</option><option>Low</option></select></label>
       </div>
       <datalist id="task-job-options">
-        ${state.jobBoards.map((job) => `<option value="${escapeHtml(job.jobId)}">${escapeHtml(job.title)}</option>`).join("")}
+        ${visibleJobBoards().map((job) => `<option value="${escapeHtml(job.id)}">${escapeHtml(job.jobId)} - ${escapeHtml(job.title)}</option>`).join("")}
       </datalist>
       <button type="submit">Assign task</button>
     </form>
@@ -11945,7 +12106,9 @@ function renderTaskItem(task) {
       </div>
       <div class="row-actions">
         <a href="#module/${escapeHtml(task.moduleKey)}" data-action="set-active" data-key="${escapeHtml(task.moduleKey)}">Open</a>
-        ${currentRoleId() === "worker" && task.status !== "Complete"
+        ${task.assignmentSyncPending && currentRoleId() !== "worker"
+          ? `<button type="button" data-action="retry-task-assignment" data-id="${escapeHtml(task.id)}">Retry assignment sync</button>`
+          : currentRoleId() === "worker" && task.status !== "Complete"
           ? `<a href="#module/time" data-action="set-active" data-key="time">Sign with GPS</a>`
           : `<button type="button" data-action="complete-task" data-id="${escapeHtml(task.id)}" ${task.status === "Complete" ? "disabled" : ""}>${task.status === "Complete" ? "Complete" : "Mark complete"}</button>`}
       </div>
@@ -13220,10 +13383,7 @@ document.addEventListener("click", (event) => {
   }
   if (action === "revoke-employee-invitation") {
     if (!window.confirm("Revoke this employee invitation? The link will stop working immediately.")) return;
-    return revokePendingEmployeeInvitation(id).catch((error) => {
-      setToast(error.message || "Unable to revoke employee invitation");
-      render();
-    });
+    return runTeamAction(actionElement, () => revokePendingEmployeeInvitation(id));
   }
   if (action === "firebase-logout") return signOutFirebaseAuth();
   if (action === "toggle-admin-edit") {
@@ -13237,25 +13397,16 @@ document.addEventListener("click", (event) => {
     return render();
   }
   if (action === "reset-user-permissions") {
-    return resetSecureUserPermissions(id).catch((error) => {
-      setToast(error.message || "Unable to reset user permissions");
-      render();
-    });
+    return runTeamAction(actionElement, () => resetSecureUserPermissions(id));
   }
   if (action === "toggle-user-disabled") {
-    return updateSecureUser({
+    return runTeamAction(actionElement, () => updateSecureUser({
       uid: id,
       disabled: String(actionElement.dataset.disabled || "false") !== "true"
-    }).catch((error) => {
-      setToast(error.message || "Unable to update user status");
-      render();
-    });
+    }));
   }
   if (action === "delete-user") {
-    return deleteSecureUser(id).catch((error) => {
-      setToast(error.message || "Unable to delete user");
-      render();
-    });
+    return runTeamAction(actionElement, () => deleteSecureUser(id));
   }
   if (action === "close-modal" || action === "close-activity" || action === "close-export") return closeModal();
   if (action === "clear-activity") {
@@ -13327,10 +13478,11 @@ document.addEventListener("click", (event) => {
   if (action === "prepare-payment-request") return preparePaymentRequest(actionElement.dataset.method || "Card");
   if (action === "create-payment-rail") return createPaymentRailSetup(actionElement.dataset.method || "Payment", actionElement.dataset.route || "gateway-ready", actionElement.dataset.detail || "Payment rail setup");
   if (action === "complete-task") {
-    return completeTask(id).catch((error) => {
-      setToast(error.message || "Unable to complete task");
-      render();
-    });
+    return runTeamAction(actionElement, () => completeTask(id));
+  }
+  if (action === "retry-task-assignment") {
+    if (!workspaceWritesReady()) return blockUnavailableWorkspaceWrite();
+    return runTeamAction(actionElement, () => retryTaskAssignment(id));
   }
   if (action === "professionalize-sketch") return professionalizeSketch();
   if (action === "save-sketch-file") return saveSketchWorkspaceFile();
@@ -13490,12 +13642,12 @@ document.addEventListener("submit", (event) => {
     addContractorInvoice(formData);
   }
   if (type === "team-member") {
-    return addTeamMember(formData).catch((error) => {
-      setToast(error.message || "Unable to create team login");
-      render();
-    });
+    return submitDurableForm(form, () => addTeamMember(formData));
   }
   if (type === "task") {
+    const taskIdField = form.elements.namedItem("taskId");
+    if (!taskIdField.value) taskIdField.value = createId("TASK");
+    formData.set("taskId", taskIdField.value);
     return submitDurableForm(form, () => addTask(formData));
   }
   if (type === "sketch-room") {
@@ -13538,34 +13690,19 @@ document.addEventListener("submit", (event) => {
     return requestTrialAccess(formData);
   }
   if (type === "rbac-user") {
-    return createSecureUser(formData).catch((error) => {
-      setToast(error.message || "Unable to create Google-bound user");
-      render();
-    });
+    return submitDurableForm(form, () => createSecureUser(formData));
   }
   if (type === "access-grant") {
-    return createAccessGrant(formData).catch((error) => {
-      setToast(error.message || "Unable to issue access grant");
-      render();
-    });
+    return submitDurableForm(form, () => createAccessGrant(formData));
   }
   if (type === "employee-invitation") {
-    return createEmployeeInvitation(formData).catch((error) => {
-      setToast(error.message || "Unable to send employee invitation");
-      render();
-    });
+    return submitDurableForm(form, () => createEmployeeInvitation(formData));
   }
   if (type === "employee-profile") {
-    return saveEmployeeProfile(formData).catch((error) => {
-      setToast(error.message || "Unable to save employee profile");
-      render();
-    });
+    return submitDurableForm(form, () => saveEmployeeProfile(formData));
   }
   if (type === "ticket-signoff") {
-    return submitTicketSignoff(formData).catch((error) => {
-      setToast(error.message || "Unable to sign off ticket");
-      render();
-    });
+    return submitDurableForm(form, () => submitTicketSignoff(formData));
   }
   if (type === "community-post") {
     return createCommunityPost(formData).catch((error) => {
@@ -13580,37 +13717,29 @@ document.addEventListener("submit", (event) => {
     });
   }
   if (type === "pending-employee-manage") {
-    return savePendingEmployeeInvitation(formData).catch((error) => {
-      setToast(error.message || "Unable to update pending employee");
-      render();
-    });
+    return submitDurableForm(form, () => savePendingEmployeeInvitation(formData));
   }
   if (type === "user-manage") {
-    return updateSecureUser({
-      uid: String(formData.get("uid") || "").trim(),
-      displayName: String(formData.get("displayName") || "").trim(),
-      roleId: String(formData.get("roleId") || "worker").trim(),
-      companyId: String(formData.get("companyId") || "").trim(),
-      franchiseIds: csvValues(formData.get("franchiseIds")),
-      contractorId: String(formData.get("contractorId") || "").trim(),
-      accessExpiresAt: String(formData.get("accessExpiresAt") || "").trim(),
-      accessCode: String(formData.get("accessCode") || "").trim(),
-      assignedJobIds: csvValues(formData.get("assignedJobIds")),
-      assignedTaskIds: csvValues(formData.get("assignedTaskIds")),
-      disabled: String(formData.get("disabled") || "false") === "true",
-      ...moduleVisibilityPayload(formData)
-    }).then(() => {
+    return submitDurableForm(form, async () => {
+      await updateSecureUser({
+        uid: String(formData.get("uid") || "").trim(),
+        displayName: String(formData.get("displayName") || "").trim(),
+        roleId: String(formData.get("roleId") || "worker").trim(),
+        companyId: String(formData.get("companyId") || "").trim(),
+        franchiseIds: csvValues(formData.get("franchiseIds")),
+        contractorId: String(formData.get("contractorId") || "").trim(),
+        accessExpiresAt: String(formData.get("accessExpiresAt") || "").trim(),
+        accessCode: String(formData.get("accessCode") || "").trim(),
+        assignedJobIds: csvValues(formData.get("assignedJobIds")),
+        assignedTaskIds: csvValues(formData.get("assignedTaskIds")),
+        disabled: String(formData.get("disabled") || "false") === "true",
+        ...moduleVisibilityPayload(formData)
+      });
       closeModal();
-    }).catch((error) => {
-      setToast(error.message || "Unable to save user");
-      render();
     });
   }
   if (type === "role-permissions") {
-    return saveRolePermissions(formData).catch((error) => {
-      setToast(error.message || "Unable to save role permissions");
-      render();
-    });
+    return submitDurableForm(form, () => saveRolePermissions(formData));
   }
   if (type === "tab-config") {
     return saveTabConfig(formData).catch((error) => {

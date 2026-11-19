@@ -42,4 +42,14 @@ jobs:
             fi
             sleep 1
           done
-          BROTHERS_OS_BASE_URL=http://127.0.0.1:4198 node scripts/browser-workflow-smoke.mjs
+          BROTHERS_OS_BASE_URL=http://127.0.0.1:4198 BROTHERS_OS_FRESH_SERVER_CONFIRMED=1 node scripts/browser-workflow-smoke.mjs
+      - name: Preserve browser verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-verification
+          path: |
+            logs/browser-workflow*.json
+            logs/*.png
+          if-no-files-found: ignore
+          retention-days: 14

@@ -3,8 +3,10 @@ import fs from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 const baseUrl = process.env.BROTHERS_OS_BASE_URL || "http://127.0.0.1:4198";
+const lateJourneysOnly = process.argv.includes("--late-journeys-only");
 const origin = new URL(baseUrl).origin;
 if (!["127.0.0.1", "localhost"].includes(new URL(baseUrl).hostname)) {
   throw new Error("Workflow smoke requires a local server and mocked APIs; live mutations are not permitted.");
@@ -16,7 +18,7 @@ const smokeModuleDefinitions = JSON.parse(moduleDataSource.slice(moduleDataSourc
 const staticActionTypes = [...new Set([...appSource.matchAll(/data-action="([^"]+)"/g)].map((match) => match[1]))].sort();
 const staticFormTypes = [...new Set([...appSource.matchAll(/data-form="([^"]+)"/g)].map((match) => match[1]))].sort();
 const staticFieldTypes = [...new Set([...appSource.matchAll(/data-field="([^"]+)"/g)].map((match) => match[1]))].sort();
-const stamp = String(Date.now()).slice(-6);
+const stamp = "261119";
 const ids = {
   jobId: `J-AI-${stamp}`,
   jobTitle: `AI workflow water loss ${stamp}`,
@@ -40,7 +42,13 @@ const ids = {
 
 const results = {
   baseUrl,
+  runScope: lateJourneysOnly ? "late journeys only; not a full coverage sweep" : "full workflow and coverage sweep",
   verificationBoundary: "Local production UI with intercepted fixture APIs; no production Firestore, email, payment, or deployment verification",
+  coverageBoundaries: {
+    browser: "Real Chromium/Edge UI, local assets, intercepted fixture APIs",
+    uiContracts: "Mock-backed acknowledgments, state transitions, reloads, and responsive evidence",
+    server: { status: "not exercised", reason: "All API calls intercepted; authorization, durable storage, email, payments and OAuth require separate server tests" }
+  },
   ids,
   modulesChecked: 0,
   buttonsRendered: 0,
@@ -65,7 +73,75 @@ const actionCoverage = {
 };
 const semanticModuleRecords = [];
 let expectedWorkspaceFailure = "";
+const expectedApiFailures = new Set();
+const browserDiagnostics = [];
 const smokePng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+
+async function verifyFreshLocalAssets() {
+  if (process.env.BROTHERS_OS_FRESH_SERVER_CONFIRMED !== "1") {
+    throw new Error("Wait for main's fresh-server confirmation, then set BROTHERS_OS_FRESH_SERVER_CONFIRMED=1. Do not reuse an unconfirmed build.");
+  }
+  results.assetFingerprints = {};
+  for (const name of ["app.js", "module-data.js", "styles.css", "equipment-lifecycle.js", "manual-time.js"]) {
+    const response = await fetch(`${origin}/${name}`, { signal: AbortSignal.timeout(10000), redirect: "error" });
+    if (!response.ok) throw new Error(`Fresh-server asset check failed: ${name} HTTP ${response.status}`);
+    const served = await response.text();
+    const local = fs.readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
+    const digest = (value) => createHash("sha256").update(value).digest("hex");
+    results.assetFingerprints[name] = { local: digest(local), served: digest(served) };
+    if (served !== local) throw new Error(`Stale server asset ${name}: served content differs from the working tree. Ask main for a fresh server.`);
+  }
+}
+
+async function acknowledgedMutation(page, method, path, trigger, validate = () => true) {
+  const responsePromise = page.waitForResponse((response) => new URL(response.url()).pathname === path
+    && response.request().method() === method);
+  // Keep the waiter handled if the UI action fails before sending a request.
+  responsePromise.catch(() => {});
+  await trigger();
+  const response = await responsePromise;
+  const body = await response.json();
+  if (!response.ok() || body.success !== true || !validate(body)) {
+    throw new Error(`${method} ${path} acknowledgment failed: ${JSON.stringify(body)}`);
+  }
+  return body;
+}
+
+async function smokeContext(browser, options = {}, label = "owner") {
+  const context = await browser.newContext({ serviceWorkers: "block", ...options });
+  context.on("page", (page) => {
+    page.on("console", (message) => {
+      if (message.type() !== "error") return;
+      const messageText = message.text();
+      browserDiagnostics.push({ label, type: "console", message: messageText, location: message.location() });
+      if ((expectedWorkspaceFailure || expectedApiFailures.size) && /Failed to load resource:.*503/.test(messageText)) return;
+      if ([...expectedApiFailures].some((key) => key.startsWith("400 ")) && /Failed to load resource:.*400/.test(messageText)) return;
+      if (messageText.includes("status of 401 (Unauthorized)")) return;
+      if (messageText.includes("React requires eval() in development mode") && messageText.includes("React will never use eval() in production mode")) {
+        developmentDiagnostics.push(messageText);
+        return;
+      }
+      consoleErrors.push(`${label}: ${messageText}`);
+    });
+    page.on("pageerror", (error) => {
+      browserDiagnostics.push({ label, type: "pageerror", message: error.message, stack: error.stack, url: page.url() });
+      consoleErrors.push(`${label}: ${error.message}`);
+    });
+    page.on("response", (response) => {
+      if (response.status() < 400) return;
+      const pathname = new URL(response.url()).pathname;
+      const method = response.request().method();
+      const expected = (response.status() === 401 && pathname === "/api/auth/session")
+        || (response.status() === 503 && expectedApiFailures.has(`${method} ${pathname}`))
+        || expectedApiFailures.has(`${response.status()} ${method} ${pathname}`)
+        || (expectedWorkspaceFailure && response.status() === 503 && pathname === "/api/workspace-state"
+          && method === "PUT" && response.request().postData()?.includes(expectedWorkspaceFailure));
+      browserDiagnostics.push({ label, type: "response", method, status: response.status(), url: response.url(), expected: Boolean(expected) });
+      if (!expected) failedResponses.push(`${label}: ${method} ${response.status()} ${response.url()}`);
+    });
+  });
+  return context;
+}
 
 async function cleanupDeadline(operation, label, timeout = 10000) {
   let timer;
@@ -230,7 +306,15 @@ async function waitForWorkspaceQuiescence(page, api) {
     }
     previous = current;
     return Date.now() - stableSince >= 750;
-  }, 20000);
+  }, 20000).catch(async (error) => {
+    results.quiescenceFailure = {
+      url: page.url(), activity: api.getWorkspaceActivity(),
+      requestDiagnostics: api.getWorkspaceRequestDiagnostics?.(),
+      locks: await page.locator(".workspace-write-lock").allTextContents(),
+      toast: await page.locator(".toast").allTextContents()
+    };
+    throw error;
+  });
 }
 
 async function formDraft(page, type) {
@@ -263,6 +347,12 @@ async function rejectFormSave(page, api, formType, marker, expectedDraft, succes
     await page.locator(".toast").filter({ hasText: message }).waitFor();
     await waitForWorkspaceQuiescence(page, api);
     const form = page.locator(selector);
+    if (formType === "task" && expectedDraft.taskId === "") {
+      // Task IDs are allocated on first submit; that allocated retry identity must then stay stable.
+      const allocatedId = await form.locator('[name="taskId"]').inputValue();
+      if (!allocatedId) throw new Error("Rejected task save lost its allocated retry identity");
+      expectedDraft.taskId = allocatedId;
+    }
     for (const [name, value] of Object.entries(expectedDraft)) {
       const control = form.locator(`[name="${name}"]`);
       const actual = typeof value === "boolean" ? await control.isChecked() : await control.inputValue();
@@ -792,6 +882,7 @@ async function testManualTime(page, api) {
     const workspace = api.getWorkspaceState();
     const entry = workspace.timeEntries?.find((item) => item.task === ids.manualTask);
     const file = workspace.files?.find((item) => item.sourceType === "timeEntry" && item.sourceId === entry?.id);
+    results.manualTimePersistence = { entry, file, expected: { workerId, workerEmail: ids.employeeEmail, jobKey, relatedJob: ids.jobId } };
     return entry?.entryMethod === "manual" && entry.workerId === workerId && entry.workerEmail === ids.employeeEmail
       && entry.jobId === jobKey && entry.job === ids.jobId && entry.relatedJob === ids.jobId
       && ["contractorId", "franchiseId"].every((key) => String(entry[key] || "") === String(job[key] || ""))
@@ -1339,14 +1430,45 @@ async function runWorkflow(page, localSmokeApi) {
     throw new Error(`Task form changed the chosen module or employee before submission: ${JSON.stringify(taskDraft)}`);
   }
   await rejectFormSave(page, localSmokeApi, "task", ids.taskTitle, taskDraft, /task assigned|task saved|file created/i);
-  await click(page, 'form[data-form="task"] button[type="submit"]');
+  const pendingGrant = localSmokeApi.getAccessGrants().find((grant) => grant.email === ids.employeeEmail);
+  const assignmentPath = `/api/employee-invitations/${pendingGrant.id}`;
+  localSmokeApi.rejectNextApiMutation("PATCH", assignmentPath, "Fixture employee assignment update unavailable");
+  expectedApiFailures.add(`PATCH ${assignmentPath}`);
+  await watchToastChanges(page);
+  let savedTaskId;
+  try {
+    await click(page, 'form[data-form="task"] button[type="submit"]');
+    await page.locator(".toast").filter({ hasText: "was saved, but its employee assignment was not updated" }).waitFor();
+    await waitForWorkspaceQuiescence(page, localSmokeApi);
+    const saved = localSmokeApi.getWorkspaceState().tasks.filter((task) => task.title === ids.taskTitle);
+    if (saved.length !== 1 || !saved[0].assignmentSyncPending || saved[0].id !== taskDraft.taskId) {
+      throw new Error("Partial task save did not retain exactly one recoverable task with the original retry identity");
+    }
+    savedTaskId = saved[0].id;
+    if ((await page.evaluate(() => window.__smokeToastChanges)).some((text) => /^Task assigned$/i.test(text))) {
+      throw new Error("Task assignment reported success before its employee metadata update acknowledged");
+    }
+  } finally { expectedApiFailures.delete(`PATCH ${assignmentPath}`); }
+  // Reload proves the retry affordance comes from persisted state, not a transient handler flag.
+  await reloadFromServer(page, localSmokeApi);
+  await go(page, "team");
+  const retrySelector = `[data-action="retry-task-assignment"][data-id="${savedTaskId}"]`;
+  await page.locator(retrySelector).waitFor();
+  await captureResponsiveEvidence(page, "task-assignment-retry", page.locator(retrySelector));
+  await acknowledgedMutation(page, "PATCH", assignmentPath, () => click(page, retrySelector),
+    (body) => body.grant?.assignedTaskIds?.includes(savedTaskId));
+  await page.locator(".toast").filter({ hasText: "Task assigned" }).waitFor();
   await expectBody(page, "photo task assigned", ids.taskTitle);
   await waitForWorkspaceQuiescence(page, localSmokeApi);
   const assignedTasks = localSmokeApi.getWorkspaceState().tasks.filter((task) => task.title === ids.taskTitle);
   if (assignedTasks.length !== 1 || assignedTasks[0].moduleKey !== "photos"
-    || assignedTasks[0].assigneeId !== assigneeValue || assignedTasks[0].relatedJob !== ids.jobId) {
+    || assignedTasks[0].assigneeId !== assigneeValue || assignedTasks[0].relatedJob !== ids.jobId
+    || assignedTasks[0].id !== savedTaskId || assignedTasks[0].assignmentSyncPending
+    || localSmokeApi.getWorkspaceState().files.filter((file) => file.sourceType === "taskAssignment" && file.sourceId === savedTaskId).length !== 1) {
     throw new Error(`Task retry did not persist exactly the requested photo assignment: ${JSON.stringify(assignedTasks)}`);
   }
+  results.workflowChecks.push({ label: "Task assignment partial-save retry", coverage: "UI/mock",
+    text: "workspace acknowledged, employee metadata rejected; no premature success; reload retained retry control; retry reused one task/support file and acknowledged the assignment" });
 
   await testManualTime(page, localSmokeApi);
   console.log("[smoke] manual time, failure recovery, and job summary verified");
@@ -1528,7 +1650,14 @@ async function runWorkflow(page, localSmokeApi) {
   await expectBody(page, "team shows employee", ids.employeeEmail);
   await expectBody(page, "team shows secure portal method", "verified Google account");
   await expectBody(page, "team shows assigned task", ids.taskTitle);
-  await expectBody(page, "photo evidence retained the pending employee task assignment", `1 assigned task | Jobs: ${ids.jobId}`);
+  const assignedEmployeeCard = page.locator(".team-card").filter({ hasText: ids.employeeEmail });
+  await assignedEmployeeCard.filter({ hasText: "1 assigned task" }).filter({ hasText: ids.jobId }).waitFor();
+  const employeeGrant = localSmokeApi.getAccessGrants().find((grant) => grant.email === ids.employeeEmail);
+  const assignedJob = localSmokeApi.getWorkspaceState().jobBoards.find((job) => job.jobId === ids.jobId);
+  if (!employeeGrant?.assignedTaskIds?.includes(linkedClockTaskId)
+    || !employeeGrant?.assignedJobIds?.some((id) => id === assignedJob.id || id === assignedJob.jobId)) {
+    throw new Error("Photo evidence lost the employee's canonical job or task assignment");
+  }
   await page.locator(".task-item").filter({ hasText: ids.taskTitle }).filter({ hasText: "Mark complete" }).waitFor({ state: "visible", timeout: 8000 });
   await go(page, "photos");
   const openAssignmentFile = page.locator(".file-card").filter({ hasText: ids.taskTitle }).filter({ hasText: "Task assignment" });
@@ -1544,6 +1673,56 @@ async function runWorkflow(page, localSmokeApi) {
   await fill(page, `form[data-form="community-comment"]:has(input[value="${postId}"]) input[name="body"]`, `Documentation confirmed for ${ids.jobId}`);
   await click(page, `form[data-form="community-comment"]:has(input[value="${postId}"]) button[type="submit"]`);
   await expectBody(page, "community comment published", `Documentation confirmed for ${ids.jobId}`);
+}
+
+async function verifyLinkedWorkflowGraph(page, api) {
+  await waitForWorkspaceQuiescence(page, api);
+  const graph = () => {
+    const workspace = api.getWorkspaceState();
+    const job = workspace.jobBoards?.find((item) => item.jobId === ids.jobId);
+    const task = workspace.tasks?.find((item) => item.title === ids.taskTitle);
+    const manual = workspace.timeEntries?.find((item) => item.task === ids.manualTask);
+    const clock = workspace.timeEntries?.find((item) => item.taskId === task?.id);
+    const deployment = workspace.equipmentDeployments?.find((item) => item.id === results.equipmentInvoiceVerified?.deploymentId);
+    const files = workspace.files || [];
+    const assignment = files.find((item) => item.sourceType === "taskAssignment" && item.sourceId === task?.id);
+    const labor = files.find((item) => item.sourceType === "timeEntry" && item.sourceId === manual?.id);
+    const support = files.find((item) => item.sourceType === "equipmentDeployment" && item.sourceId === deployment?.id);
+    const invoice = files.find((item) => item.id === deployment?.invoiceId);
+    if (![job, task, manual, clock, deployment, assignment, labor, support, invoice].every(Boolean)) {
+      throw new Error("Linked workflow lost a job, task, hours, equipment, or support-file record");
+    }
+    const jobRefs = new Set([job.id, job.jobId].filter(Boolean));
+    for (const [label, record] of Object.entries({ task, manual, clock, deployment, assignment, labor, support, invoice })) {
+      if (![record.jobId, record.relatedJob, record.job].some((ref) => jobRefs.has(ref))) {
+        throw new Error(`${label} does not reference the shared job identity: ${JSON.stringify(record)}`);
+      }
+    }
+    for (const [label, record] of Object.entries({ task, manual, deployment, assignment, labor, support, invoice })) {
+      if (String(record.contractorId || "") !== String(job.contractorId || "")) {
+        throw new Error(`${label} crossed employer scope in the shared workflow`);
+      }
+    }
+    if (task.assigneeEmail !== ids.employeeEmail || manual.workerEmail !== ids.employeeEmail
+      || assignment.workerEmail !== ids.employeeEmail || clock.taskId !== task.id
+      || manual.hours !== "1.50" || invoice.amount !== 200 || deployment.rentalDays !== 2) {
+      throw new Error("Shared workflow changed employee identity, net hours, or equipment billing totals");
+    }
+    return { jobId: job.id, jobReference: job.jobId, employer: job.contractorId,
+      taskId: task.id, manualTimeId: manual.id, clockTimeId: clock.id,
+      assignmentFileId: assignment.id, laborFileId: labor.id,
+      deploymentId: deployment.id, equipmentSupportId: support.id, invoiceId: invoice.id,
+      netOfficeHours: manual.hours, rentalDays: deployment.rentalDays, equipmentAmount: invoice.amount };
+  };
+  const before = graph();
+  await reloadFromServer(page, api);
+  await waitForWorkspaceQuiescence(page, api);
+  if (JSON.stringify(graph()) !== JSON.stringify(before)) throw new Error("Linked workflow identities changed after a cache-free reload");
+  results.linkedWorkflowGraph = before;
+  await go(page, "jobs");
+  await captureResponsiveEvidence(page, "job-linked-workflow", page.locator(`[data-job-operations="${ids.jobId}"]`));
+  results.workflowChecks.push({ label: "Job-task-hours-equipment graph", coverage: "UI/mock",
+    text: "one employer and job across assignment, office/GPS hours, returned equipment, support files and invoice; identities and totals survive cache-free reload" });
 }
 
 async function verifyGenericModuleConnectivity(page, moduleKeys) {
@@ -1838,10 +2017,9 @@ async function testEmployeeGoogleSwitch(page, localSmokeApi) {
 
 async function testUnauthenticatedGate(browser) {
   console.log("[smoke] starting unauthenticated gate verification");
-  let requestSubmitted = false;
-  const gateContext = await browser.newContext({
+  const gateContext = await smokeContext(browser, {
     viewport: { width: 390, height: 844 }
-  });
+  }, "unauthenticated-gate");
   const page = await gateContext.newPage();
   page.setDefaultTimeout(20000);
   await page.route("**/api/**", async (route) => {
@@ -1878,7 +2056,6 @@ async function testUnauthenticatedGate(browser) {
     }
     if (url.pathname === "/api/auth/session") return json(401, { success: false, message: "Authentication required." });
     if (url.pathname === "/api/access/trial-request" && request.method() === "POST") {
-      requestSubmitted = true;
       return json(201, { success: true, message: "Your 48-hour access request was sent for owner approval." });
     }
     return json(404, { success: false, message: "Smoke route not configured." });
@@ -1900,9 +2077,8 @@ async function testUnauthenticatedGate(browser) {
   actionCoverage.formsRendered.add("access-request");
   const disclosure = page.locator('details.auth-disclosure:has(form[data-form="access-request"])');
   if (await disclosure.count()) await disclosure.evaluate((element) => { element.open = true; });
-  await submitGenericForm(page, "access-request");
-  await expectBody(page, "trial request submitted", "48-hour access request");
-  if (!requestSubmitted) throw new Error("Trial request did not reach the protected access API");
+  await acknowledgedMutation(page, "POST", "/api/access/trial-request", () => submitGenericForm(page, "access-request"));
+  await expectBody(page, "trial request acknowledged", "Your 48-hour access request was sent for owner approval.");
   results.workflowChecks.push({ label: "Google login gate", text: "visible account chooser button and 48-hour request path" });
   console.log("[smoke] unauthenticated gate verified");
   await gateContext.close();
@@ -2010,7 +2186,7 @@ async function testEmergencyMonitor(page, localSmokeApi) {
 
 async function testUnavailableStorageWriteLock(browser) {
   console.log("[smoke] starting shared-storage write-lock verification");
-  const lockedContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const lockedContext = await smokeContext(browser, { viewport: { width: 1280, height: 800 } }, "storage-unavailable");
   const lockedApi = await installLocalSmokeApi(lockedContext, { adminConfigured: false });
   const lockedPage = await lockedContext.newPage();
   lockedPage.setDefaultTimeout(8000);
@@ -2027,6 +2203,241 @@ async function testUnavailableStorageWriteLock(browser) {
   }
   results.workflowChecks.push({ label: "Durable write lock", text: "browser-only operational writes are rejected when Firebase Admin is unavailable" });
   await lockedContext.close();
+}
+
+async function testTeamLifecycle(browser) {
+  const contractor = (suffix) => ({
+    uid: `contractor-${suffix}`, id: `contractor-${suffix}`, email: `contractor.${suffix}@example.com`,
+    displayName: `QA Contractor ${suffix}`, roleId: "contractor", contractorId: `employer-${suffix}`,
+    companyId: "default-company", franchiseIds: ["default-franchise"], status: "active", disabled: false,
+    visibleTabIds: ["contractorportal", "team", "jobs", "time", "photos", "equipment"],
+    visiblePageIds: ["contractorportal", "team", "jobs", "time", "photos", "equipment"]
+  });
+  const employers = [contractor("alpha"), contractor("beta")];
+  const context = await smokeContext(browser, { viewport: { width: 1440, height: 900 } }, "team-lifecycle");
+  const api = await installLocalSmokeApi(context, { fixtureUsers: employers, fixtureWorkspace: { jobBoards: [{
+    id: "job-team-beta", jobId: "J-TEAM-BETA", title: "Beta employer lifecycle job", companyId: "default-company",
+    contractorId: "employer-beta", employerUid: "contractor-beta", branchId: "default-franchise", gates: [], stage: "Field work"
+  }] } });
+  const page = await context.newPage();
+  page.setDefaultTimeout(15000);
+  const employeeEmail = "team.lifecycle@example.com";
+  const inviteSelector = 'form[data-form="employee-invitation"]';
+  const prepare = async (email) => {
+    await fill(page, `${inviteSelector} input[name="displayName"]`, "QA employer-bound employee");
+    await fill(page, `${inviteSelector} input[name="email"]`, email);
+    await select(page, `${inviteSelector} select[name="contractorId"]`, "employer-beta");
+    await fill(page, `${inviteSelector} input[name="assignedJobIds"]`, "job-team-beta");
+    await page.locator(`${inviteSelector} input[name="sendEmail"]`).uncheck();
+    for (const field of await page.locator(`${inviteSelector} input[name="visibleModuleKeys"]`).all()) {
+      await field.setChecked(["jobs", "time", "photos"].includes(await field.getAttribute("value")));
+    }
+  };
+  try {
+    await go(page, "team");
+    await waitForWorkspaceQuiescence(page, api);
+    await prepare(employeeEmail);
+    for (const field of await page.locator(`${inviteSelector} input[name="visibleModuleKeys"]`).all()) await field.uncheck();
+    await watchToastChanges(page);
+    expectedApiFailures.add("400 POST /api/employee-invitations");
+    try {
+      await click(page, `${inviteSelector} button[type="submit"]`);
+      await page.locator(".toast").filter({ hasText: /at least one module/i }).waitFor();
+      if (api.getAccessGrants().length || await page.locator(`${inviteSelector} input[name="email"]`).inputValue() !== employeeEmail) {
+        throw new Error("Empty module invitation created a profile or lost the recoverable draft");
+      }
+      if ((await page.evaluate(() => window.__smokeToastChanges)).some((text) => /invitation emailed|link created/i.test(text))) {
+        throw new Error("Rejected empty-module invitation announced success");
+      }
+      await captureResponsiveEvidence(page, "employee-empty-modules-rejected", page.locator(inviteSelector));
+    } finally { expectedApiFailures.delete("400 POST /api/employee-invitations"); }
+    await prepare(employeeEmail);
+    const draft = await formDraft(page, "employee-invitation");
+    const failureKey = "POST /api/employee-invitations";
+    const rejection = "Fixture invitation storage unavailable";
+    api.rejectNextApiMutation("POST", "/api/employee-invitations", rejection);
+    expectedApiFailures.add(failureKey);
+    await watchToastChanges(page);
+    try {
+      const response = page.waitForResponse((item) => new URL(item.url()).pathname === "/api/employee-invitations" && item.status() === 503);
+      await click(page, `${inviteSelector} button[type="submit"]`);
+      await response;
+      await page.locator(".toast").filter({ hasText: rejection }).waitFor();
+      if (api.getAccessGrants().length || JSON.stringify(await formDraft(page, "employee-invitation")) !== JSON.stringify(draft)) {
+        throw new Error("Rejected invitation created a phantom employee or lost its retry draft");
+      }
+      const toasts = await page.evaluate(() => window.__smokeToastChanges);
+      if (toasts.some((text) => /invitation emailed|link created/i.test(text))) throw new Error("Rejected invitation announced success");
+      await captureResponsiveEvidence(page, "employee-invitation-retry", page.locator(inviteSelector));
+    } finally { expectedApiFailures.delete(failureKey); }
+
+    const hold = api.holdNextApiMutation("POST", "/api/employee-invitations");
+    const saved = acknowledgedMutation(page, "POST", "/api/employee-invitations",
+      () => click(page, `${inviteSelector} button[type="submit"]`),
+      (body) => body.grant?.email === employeeEmail && body.grant?.employerUid === "contractor-beta"
+        && body.grant?.employerContractorId === "employer-beta");
+    saved.catch(() => {});
+    try {
+      await waitUntil("invitation acknowledgment held", () => hold.received);
+      if (await page.locator(".team-card").filter({ hasText: employeeEmail }).count()) {
+        throw new Error("Employee card appeared before the invitation acknowledgment");
+      }
+    } finally { hold.release(); }
+    const { grant } = await saved;
+    await page.locator(".team-card").filter({ hasText: employeeEmail }).filter({ hasText: "Invitation pending" }).waitFor();
+    if (api.getAccessGrants().filter((item) => item.email === employeeEmail).length !== 1
+      || JSON.stringify([...grant.visiblePageIds].sort()) !== JSON.stringify(["jobs", "photos", "time"])) {
+      throw new Error("Invitation retry duplicated the employee or changed the chosen module grants");
+    }
+    await click(page, `.team-card:has-text("${employeeEmail}") [data-action="open-pending-employee-manage"]`);
+    await fill(page, 'form[data-form="pending-employee-manage"] input[name="jobTitle"]', "Beta crew lead");
+    await acknowledgedMutation(page, "PATCH", `/api/employee-invitations/${grant.id}`,
+      () => click(page, 'form[data-form="pending-employee-manage"] button[type="submit"]'),
+      (body) => body.grant?.jobTitle === "Beta crew lead" && body.grant.employerUid === "contractor-beta");
+    await page.locator('form[data-form="pending-employee-manage"]').waitFor({ state: "detached" });
+    await waitForWorkspaceQuiescence(page, api);
+    api.cachePendingEmployee(grant.id);
+    await reloadFromServer(page, api);
+    await go(page, "team");
+    await captureResponsiveEvidence(page, "employee-pending", page.locator(".team-card").filter({ hasText: employeeEmail }));
+
+    const transferTitle = "QA pending-to-accepted photo ticket";
+    await select(page, 'form[data-form="task"] select[name="assigneeId"]', `invite-${grant.id}`);
+    await select(page, 'form[data-form="task"] select[name="moduleKey"]', "photos");
+    await fill(page, 'form[data-form="task"] input[name="title"]', transferTitle);
+    await fill(page, 'form[data-form="task"] input[name="relatedJob"]', "job-team-beta");
+    const transferPath = `/api/employee-invitations/${grant.id}`;
+    api.rejectNextApiMutation("PATCH", transferPath, "Fixture acceptance-window assignment failure");
+    expectedApiFailures.add(`PATCH ${transferPath}`);
+    try {
+      await click(page, 'form[data-form="task"] button[type="submit"]');
+      await page.locator(".toast").filter({ hasText: "was saved, but its employee assignment was not updated" }).waitFor();
+      await waitForWorkspaceQuiescence(page, api);
+    } finally { expectedApiFailures.delete(`PATCH ${transferPath}`); }
+    const transferTask = api.getWorkspaceState().tasks.find((task) => task.title === transferTitle);
+    const transferFile = api.getWorkspaceState().files.find((file) => file.sourceType === "taskAssignment" && file.sourceId === transferTask?.id);
+    if (!transferTask?.assignmentSyncPending || !transferFile || transferTask.assigneeId !== `invite-${grant.id}`) {
+      throw new Error("Acceptance-window fixture did not retain a pending task and support file");
+    }
+
+    // Google verification is intentionally outside this fixture; begin with its acknowledged session result.
+    const acceptedUser = api.simulateEmployeeAcceptance(grant.id);
+    await reloadFromServer(page, api);
+    await go(page, "team");
+    const accepted = page.locator(".team-layout > .panel > .team-grid > .team-card").filter({ hasText: employeeEmail });
+    await accepted.locator('[data-action="open-user-manage"]').waitFor();
+    if (await accepted.count() !== 1 || await accepted.locator('[data-action="open-pending-employee-manage"], [data-action="revoke-employee-invitation"]').count()) {
+      throw new Error("Accepted employee kept a duplicate pending identity or invitation controls");
+    }
+    if (api.getUsers().filter((user) => user.email.toLowerCase() === employeeEmail).length !== 1) {
+      throw new Error("Acceptance produced multiple canonical user records for one employee email");
+    }
+    if (!(await accepted.innerText()).includes("job-team-beta")) throw new Error("Acceptance lost the employer job assignment");
+    await acknowledgedMutation(page, "PATCH", `/api/employees/${acceptedUser.uid}/assignments`,
+      () => click(page, `[data-action="retry-task-assignment"][data-id="${transferTask.id}"]`),
+      (body) => body.user?.uid === acceptedUser.uid && body.user?.assignedTaskIds?.includes(transferTask.id));
+    await page.locator(".toast").filter({ hasText: "Task assigned" }).waitFor();
+    await waitForWorkspaceQuiescence(page, api);
+    const transferred = api.getWorkspaceState();
+    const tasks = transferred.tasks.filter((task) => task.title === transferTitle);
+    const files = transferred.files.filter((file) => file.sourceType === "taskAssignment" && file.sourceId === transferTask.id);
+    if (tasks.length !== 1 || tasks[0].id !== transferTask.id || tasks[0].assigneeId !== acceptedUser.uid
+      || tasks[0].assignmentSyncPending || tasks[0].contractorId !== "employer-beta"
+      || tasks[0].jobId !== "job-team-beta" || files.length !== 1 || files[0].id !== transferFile.id
+      || files[0].workerId !== acceptedUser.uid || files[0].workerEmail !== employeeEmail) {
+      throw new Error("Accepted-user assignment retry changed identities, duplicated records, or crossed employer/job scope");
+    }
+    await reloadFromServer(page, api);
+    await go(page, "team");
+    if (await page.locator(`[data-action="retry-task-assignment"][data-id="${transferTask.id}"]`).count()) {
+      throw new Error("Accepted-user retry still needs synchronization after cache-free reload");
+    }
+    await captureResponsiveEvidence(page, "employee-accepted", accepted);
+
+    const revokedEmail = "team.revoked@example.com";
+    await prepare(revokedEmail);
+    const revokedInvitation = await acknowledgedMutation(page, "POST", "/api/employee-invitations",
+      () => click(page, `${inviteSelector} button[type="submit"]`), (body) => body.grant?.email === revokedEmail);
+    await page.locator(".team-card").filter({ hasText: revokedEmail }).waitFor();
+    await waitForWorkspaceQuiescence(page, api);
+    api.cachePendingEmployee(revokedInvitation.grant.id);
+    await reloadFromServer(page, api);
+    await go(page, "team");
+    page.once("dialog", (dialog) => dialog.accept());
+    await acknowledgedMutation(page, "DELETE", `/api/employee-invitations/${revokedInvitation.grant.id}`,
+      () => click(page, `.team-card:has-text("${revokedEmail}") [data-action="revoke-employee-invitation"]`),
+      (body) => body.grant?.status === "revoked");
+    await page.locator(".team-card").filter({ hasText: revokedEmail }).waitFor({ state: "detached" });
+    await reloadFromServer(page, api);
+    await go(page, "team");
+    if (await page.locator(".team-card").filter({ hasText: revokedEmail }).count()
+      || (await page.locator('form[data-form="task"] select[name="assigneeId"]').innerText()).includes(revokedEmail)) {
+      throw new Error("Revoked cached invitation remained visible or assignable after reload");
+    }
+    await captureResponsiveEvidence(page, "employee-revoked", page.locator(inviteSelector));
+    results.workflowChecks.push({ label: "Employer-bound employee lifecycle", coverage: "UI/mock",
+      text: "failure retains draft; held acknowledgment; exactly one retry; selected employer and modules retained; pending edit; active grant + firebaseUid allows same-task/support retry as accepted user; revocation removes cached assignee after reload",
+      excluded: "Google invite redemption and backend authorization" });
+  } catch (error) {
+    results.teamLifecycleFailure = {
+      activity: api.getWorkspaceActivity(), users: api.getUsers(), grants: api.getAccessGrants(),
+      workspace: api.getWorkspaceState(),
+      ui: await page.evaluate(() => ({ url: location.href, toast: document.querySelector(".toast")?.textContent,
+        locks: [...document.querySelectorAll(".workspace-write-lock")].map((element) => element.textContent) }))
+    };
+    await captureResponsiveEvidence(page, "team-lifecycle-failure", page.locator("body")).catch(() => {});
+    throw error;
+  } finally { await context.close(); }
+
+  const contractorContext = await smokeContext(browser, { viewport: { width: 1440, height: 900 } }, "contractor-permissions");
+  const contractorApi = await installLocalSmokeApi(contractorContext, { principal: employers[0], fixtureUsers: [{
+    id: "worker-alpha", uid: "worker-alpha", roleId: "worker", email: "alpha.worker@example.com", displayName: "Alpha worker",
+    contractorId: "employer-alpha", employerContractorId: "employer-alpha", employerUid: employers[0].uid,
+    status: "active", visibleTabIds: ["jobs", "time"], visiblePageIds: ["jobs", "time"]
+  }], fixtureWorkspace: { jobBoards: [
+    { id: "alpha-job", jobId: "J-ALPHA", title: "Alpha employer job", contractorId: "employer-alpha", gates: [] },
+    { id: "beta-job", jobId: "J-BETA-PRIVATE", title: "Beta private employer job", contractorId: "employer-beta", gates: [] }
+  ] } });
+  const contractorPage = await contractorContext.newPage();
+  try {
+    await go(contractorPage, "contractorportal");
+    await waitForWorkspaceQuiescence(contractorPage, contractorApi);
+    const allowed = await sidebarModuleKeys(contractorPage);
+    for (const forbidden of ["globalindexes", "accessadmin", "payments"]) {
+      if (allowed.includes(forbidden)) throw new Error(`Contractor sidebar exposes ungranted module ${forbidden}`);
+      await contractorPage.goto(moduleUrl(forbidden), { waitUntil: "domcontentloaded" });
+      await contractorPage.waitForSelector(".app-shell");
+      const forbiddenHeading = smokeModuleDefinitions.find((module) => module.key === forbidden)?.label;
+      if ((await contractorPage.locator("h1").innerText()).trim() === forbiddenHeading) {
+        throw new Error(`Contractor deep-link opened ungranted module ${forbidden}`);
+      }
+    }
+    await go(contractorPage, "jobs");
+    await expectBody(contractorPage, "contractor sees own employer job", "Alpha employer job");
+    if ((await contractorPage.locator("body").innerText()).includes("Beta private employer job")) {
+      throw new Error("Contractor UI exposes another employer's fixture job");
+    }
+    await captureResponsiveEvidence(contractorPage, "contractor-jobs-scoped", contractorPage.locator("h1"));
+    await go(contractorPage, "team");
+    const jobOptions = await contractorPage.locator('#employee-job-options option, #task-job-options option')
+      .evaluateAll((options) => options.map((option) => ({ value: option.value, text: option.textContent })));
+    if (jobOptions.some((option) => /J-BETA-PRIVATE|Beta private employer job/.test(`${option.value} ${option.text}`))) {
+      throw new Error("Contractor invitation or task selector suggests another employer's job");
+    }
+    if (await contractorPage.locator(`${inviteSelector} select[name="contractorId"]`).count()
+      || await contractorPage.locator(`${inviteSelector} input[name="contractorId"]`).inputValue() !== "employer-alpha") {
+      throw new Error("Contractor invitation form does not lock the employer identity");
+    }
+    if (await contractorPage.locator('[data-action="open-user-manage"], [data-action="delete-user"], [data-action="reset-user-permissions"]').count()) {
+      throw new Error("Contractor with inviteWorkers only received administrator user controls");
+    }
+    await captureResponsiveEvidence(contractorPage, "contractor-team-scoped", contractorPage.locator(inviteSelector));
+    results.workflowChecks.push({ label: "Contractor permissions", coverage: "UI/mock",
+      text: "allowlisted navigation and hard deep-links; other-employer job excluded; invitation employer locked; admin controls absent" });
+  } catch (error) {
+    await captureResponsiveEvidence(contractorPage, "contractor-permissions-failure", contractorPage.locator("body")).catch(() => {});
+    throw error;
+  } finally { await contractorContext.close(); }
 }
 
 async function testEmployeePortal(browser) {
@@ -2077,8 +2488,16 @@ async function testEmployeePortal(browser) {
       community: "all"
     }
   };
-  let profileSaved = false;
-  let signoffPosted = false;
+  let profileAttempts = 0;
+  let profileReceived = false;
+  let releaseProfile;
+  const profileAcknowledgment = new Promise((resolve) => { releaseProfile = resolve; });
+  let signoffAttempts = 0;
+  const ticketSignoffs = [];
+  let employeeReadCount = 0;
+  let employeeWriteCount = 0;
+  let employeeRequestVersion = 0;
+  const employeeRequests = new Set();
   let employeeSessionActive = true;
   let employeeWorkspaceRevision = "employee-revision-0";
   let uploadedEmployeePhotoAsset = null;
@@ -2125,19 +2544,34 @@ async function testEmployeePortal(browser) {
       notes: "Complete through the GPS ticket workflow."
     }]
   };
-  const employeeContext = await browser.newContext({
+  const employeeContext = await smokeContext(browser, {
     viewport: { width: 390, height: 844 },
     geolocation: { latitude: 42.45, longitude: -73.245 },
     permissions: ["geolocation"]
+  }, "employee-portal");
+  employeeContext.on("request", (request) => {
+    if (!new URL(request.url()).pathname.startsWith("/api/")) return;
+    employeeRequests.add(request);
+    employeeRequestVersion += 1;
   });
-  await employeeContext.addInitScript(() => {
+  const finishEmployeeRequest = (request) => {
+    if (employeeRequests.delete(request)) employeeRequestVersion += 1;
+  };
+  employeeContext.on("requestfinished", finishEmployeeRequest);
+  employeeContext.on("requestfailed", finishEmployeeRequest);
+  const employeeApi = {
+    getWorkspaceReadCount: () => employeeReadCount,
+    getWorkspaceActivity: () => ({ inFlight: employeeRequests.size, requestVersion: employeeRequestVersion, writes: employeeWriteCount })
+  };
+  await employeeContext.addInitScript((expectedOrigin) => {
+    if (location.origin !== expectedOrigin) return;
     if (sessionStorage.getItem("employee-cache-seeded")) return;
     localStorage.setItem("brothers-os-workspace-v2", JSON.stringify({
       files: [{ id: "OWNER-ONLY-CACHED-FILE", title: "Owner-only cached revenue file", moduleKey: "payments" }],
       jobBoards: [{ id: "OWNER-ONLY-CACHED-JOB", jobId: "J-PRIVATE", title: "Owner-only cached job" }]
     }));
     sessionStorage.setItem("employee-cache-seeded", "1");
-  });
+  }, origin);
   await employeeContext.grantPermissions(["geolocation"], { origin });
   const page = await employeeContext.newPage();
   page.setDefaultTimeout(15000);
@@ -2217,11 +2651,12 @@ async function testEmployeePortal(browser) {
         businessData: [],
         accessRequests: [],
         accessGrants: [],
-        ticketSignoffs: [],
+        ticketSignoffs,
         communityPosts: []
       });
     }
     if (url.pathname === "/api/workspace-state" && method === "GET") {
+      employeeReadCount += 1;
       return json(200, {
         success: true,
         durable: true,
@@ -2238,7 +2673,7 @@ async function testEmployeePortal(browser) {
         return json(409, { success: false, message: "Employee smoke workspace revision conflict." });
       }
       workspaceState = payload.workspaceState || workspaceState;
-      employeeWorkspaceRevision = `employee-revision-${Date.now()}`;
+      employeeWorkspaceRevision = `employee-revision-${++employeeWriteCount}`;
       return json(200, {
         success: true,
         durable: true,
@@ -2264,7 +2699,10 @@ async function testEmployeePortal(browser) {
       return route.fulfill({ status: 200, contentType: "image/png", body: smokePng });
     }
     if (url.pathname === "/api/employee/profile" && method === "PATCH") {
-      profileSaved = true;
+      profileAttempts += 1;
+      if (profileAttempts === 1) return json(503, { success: false, message: "Fixture profile save unavailable" });
+      profileReceived = true;
+      await profileAcknowledgment;
       Object.assign(worker, request.postDataJSON() || {});
       return json(200, { success: true, user: worker });
     }
@@ -2276,12 +2714,10 @@ async function testEmployeePortal(browser) {
       if (!durablePhoto) {
         return json(409, { success: false, message: "Upload and save the required photo evidence before signing this ticket." });
       }
-      signoffPosted = true;
-      employeeWorkspaceRevision = `employee-signoff-revision-${Date.now()}`;
-      return json(201, {
-        success: true,
-        workspaceRevision: employeeWorkspaceRevision,
-        signoff: {
+      signoffAttempts += 1;
+      if (signoffAttempts === 1) return json(503, { success: false, message: "Fixture sign-off save unavailable" });
+      employeeWorkspaceRevision = `employee-signoff-revision-${signoffAttempts}`;
+      const signoff = {
           id: "SIGNOFF-SMOKE-1",
           taskId: payload.taskId,
           taskTitle: "Complete employee smoke ticket",
@@ -2296,8 +2732,18 @@ async function testEmployeePortal(browser) {
           gps: payload.gps,
           status: "signed",
           signedAt: new Date().toISOString()
-        },
-        task: { ...workspaceState.tasks[0], status: "Complete" }
+      };
+      ticketSignoffs.push(signoff);
+      const completedTask = workspaceState.tasks.find((task) => task.id === payload.taskId);
+      Object.assign(completedTask, { status: "Complete", ticketSignoffId: signoff.id });
+      workspaceState.files.filter((file) => file.sourceType === "taskAssignment" && file.taskId === payload.taskId)
+        .forEach((file) => { file.status = "Complete"; });
+      worker.assignedTaskIds = worker.assignedTaskIds.filter((id) => id !== payload.taskId);
+      return json(201, {
+        success: true,
+        workspaceRevision: employeeWorkspaceRevision,
+        signoff,
+        task: completedTask
       });
     }
     if (url.pathname === "/api/auth/session/logout" && method === "POST") {
@@ -2307,7 +2753,8 @@ async function testEmployeePortal(browser) {
     return json(404, { success: false, message: `Employee smoke route not configured: ${method} ${url.pathname}` });
   });
 
-  const employeeSmokeUrl = `${baseUrl}/?employee-smoke=${Date.now()}`;
+  try {
+  const employeeSmokeUrl = `${baseUrl}/?employee-smoke=${stamp}`;
   await page.goto(`${employeeSmokeUrl}#module/globalindexes`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector(".app-shell");
   const staleOwnerCacheRetained = await page.evaluate(() => {
@@ -2342,9 +2789,36 @@ async function testEmployeePortal(browser) {
   await page.waitForSelector('form[data-form="employee-profile"]');
   actionCoverage.formsRendered.add("employee-profile");
   actionCoverage.formsRendered.add("ticket-signoff");
+  await waitForWorkspaceQuiescence(page, employeeApi);
   await fill(page, 'form[data-form="employee-profile"] input[name="phone"]', "555-444-1212");
-  await click(page, 'form[data-form="employee-profile"] button[type="submit"]');
-  await waitUntil("employee profile save", () => profileSaved);
+  expectedApiFailures.add("PATCH /api/employee/profile");
+  try {
+    await click(page, 'form[data-form="employee-profile"] button[type="submit"]');
+    await page.locator(".toast").filter({ hasText: "Fixture profile save unavailable" }).waitFor();
+    if (worker.phone || await page.locator('form[data-form="employee-profile"] input[name="phone"]').inputValue() !== "555-444-1212") {
+      throw new Error("Rejected employee profile save changed persisted state or lost the draft");
+    }
+  } finally { expectedApiFailures.delete("PATCH /api/employee/profile"); }
+  await watchToastChanges(page);
+  const profileSave = acknowledgedMutation(page, "PATCH", "/api/employee/profile",
+    () => click(page, 'form[data-form="employee-profile"] button[type="submit"]'),
+    (body) => body.user?.phone === "555-444-1212");
+  profileSave.catch(() => {});
+  try {
+    await waitUntil("employee profile response held", () => profileReceived);
+    if ((await page.evaluate(() => window.__smokeToastChanges)).includes("Employee profile saved")) {
+      throw new Error("Employee profile success preceded the response acknowledgment");
+    }
+  } finally { releaseProfile(); }
+  await profileSave;
+  await page.locator(".toast").filter({ hasText: "Employee profile saved" }).waitFor();
+  await waitForWorkspaceQuiescence(page, employeeApi);
+  await reloadFromServer(page, employeeApi);
+  await go(page, "time");
+  if (await page.locator('form[data-form="employee-profile"] input[name="phone"]').inputValue() !== "555-444-1212") {
+    throw new Error("Acknowledged employee profile did not survive a cache-free reload");
+  }
+  await captureResponsiveEvidence(page, "employee-profile-saved", page.locator('form[data-form="employee-profile"]'));
 
   await go(page, "photos");
   await select(page, 'form[data-form="photo-evidence"] select[name="jobId"]', "J-EMP-1");
@@ -2359,10 +2833,30 @@ async function testEmployeePortal(browser) {
   await expectBody(page, "photo evidence keeps ticket open", "sign the ticket with GPS to complete it");
   await go(page, "time");
   await page.waitForSelector('form[data-form="ticket-signoff"]');
+  await fill(page, 'form[data-form="ticket-signoff"] input[name="typedSignature"]', worker.displayName);
   await page.locator('form[data-form="ticket-signoff"] input[name="attested"]').check();
-  await click(page, 'form[data-form="ticket-signoff"] button[type="submit"]');
-  await waitUntil("employee ticket sign-off", () => signoffPosted);
+  expectedApiFailures.add("POST /api/employee/ticket-signoffs");
+  try {
+    await click(page, 'form[data-form="ticket-signoff"] button[type="submit"]');
+    await page.locator(".toast").filter({ hasText: "Fixture sign-off save unavailable" }).waitFor();
+    if (ticketSignoffs.length || workspaceState.tasks[0].status !== "Open"
+      || !await page.locator('form[data-form="ticket-signoff"] input[name="attested"]').isChecked()) {
+      throw new Error("Rejected sign-off completed a task, duplicated evidence, or lost the retry attestation");
+    }
+    await captureResponsiveEvidence(page, "employee-signoff-retry", page.locator('form[data-form="ticket-signoff"]'));
+  } finally { expectedApiFailures.delete("POST /api/employee/ticket-signoffs"); }
+  await acknowledgedMutation(page, "POST", "/api/employee/ticket-signoffs",
+    () => click(page, 'form[data-form="ticket-signoff"] button[type="submit"]'),
+    (body) => body.signoff?.employerUid === worker.employerUid && body.signoff?.employeeUid === worker.uid
+      && body.signoff?.taskId === "TASK-EMP-1" && body.signoff?.jobId === "J-EMP-1"
+      && body.signoff?.gps?.latitude === 42.45 && body.signoff?.typedSignature === worker.displayName);
   await expectBody(page, "employee ticket completed", "No open assigned tickets");
+  await waitForWorkspaceQuiescence(page, employeeApi);
+  if (ticketSignoffs.length !== 1 || signoffAttempts !== 2) throw new Error("Sign-off retry was not exactly one acknowledged completion");
+  await reloadFromServer(page, employeeApi);
+  await go(page, "time");
+  await expectBody(page, "acknowledged sign-off survives reload", "No open assigned tickets");
+  await captureResponsiveEvidence(page, "employee-ticket-completed", page.locator('form[data-form="employee-profile"]'));
   const employeeLogoutResponsePromise = page.waitForResponse((response) => {
     return new URL(response.url()).pathname === "/api/auth/session/logout"
       && response.request().method() === "POST";
@@ -2373,9 +2867,15 @@ async function testEmployeePortal(browser) {
   await page.waitForSelector('button[data-action="firebase-google-login"]', { timeout: 20000 });
   await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
   await page.waitForSelector(".auth-gate", { timeout: 15000 });
-  results.workflowChecks.push({ label: "Employee portal", text: "restricted account, employer-bound task, GPS ticket sign-off" });
+  results.workflowChecks.push({ label: "Employee portal", coverage: "UI/mock", text: "restricted account; profile failure/retry and delayed acknowledgment; photo-backed employer-bound GPS ticket; failed sign-off retains draft; exactly one acknowledged completion survives cache-free reload" });
   console.log("[smoke] employee portal verified");
-  await employeeContext.close();
+  } catch (error) {
+    await captureResponsiveEvidence(page, "employee-portal-failure", page.locator("body")).catch(() => {});
+    throw error;
+  } finally {
+    releaseProfile();
+    await employeeContext.close();
+  }
 }
 
 const allOwnerActions = [
@@ -2387,8 +2887,8 @@ const allOwnerActions = [
   "postCommunityMessages", "moderateCommunityMessages", "editAssignedTasks", "editAllTasks"
 ];
 
-async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
-  let workspaceState = {};
+async function installLocalSmokeApi(context, { adminConfigured = true, principal = null, fixtureUsers = [], fixtureWorkspace = {} } = {}) {
+  let workspaceState = structuredClone(fixtureWorkspace);
   let workspaceWriteCount = 0;
   let workspaceReadCount = 0;
   let workspaceRejection = null;
@@ -2396,19 +2896,39 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
   let lastAcknowledgmentHold = null;
   let lastEquipmentWrite = null;
   const workspaceRequests = new Set();
+  const workspaceRequestDetails = new Map();
+  const workspaceTerminalEvents = [];
   let workspaceRequestVersion = 0;
+  let mutationControl = null;
+  let invitationSequence = 0;
   context.on("request", (request) => {
     const url = new URL(request.url());
     // Access-context refreshes also replace forms, so finish those before entering a new draft.
     if (url.origin !== origin || !url.pathname.startsWith("/api/")) return;
     workspaceRequests.add(request);
+    workspaceRequestDetails.set(request, { method: request.method(), url: request.url(), startedAt: Date.now(), status: null, responseFinished: false });
     workspaceRequestVersion += 1;
   });
-  const finishWorkspaceRequest = (request) => {
+  context.on("response", (response) => {
+    const detail = workspaceRequestDetails.get(response.request());
+    if (!detail) return;
+    detail.status = response.status();
+    response.finished().then((error) => {
+      detail.responseFinished = !error;
+      if (error) detail.responseError = String(error);
+    }).catch((error) => { detail.responseError = error.message; });
+  });
+  const finishWorkspaceRequest = (request, event) => {
+    const detail = workspaceRequestDetails.get(request);
+    if (detail) {
+      workspaceTerminalEvents.push({ ...detail, event, failure: request.failure()?.errorText || null });
+      if (workspaceTerminalEvents.length > 30) workspaceTerminalEvents.shift();
+      workspaceRequestDetails.delete(request);
+    }
     if (workspaceRequests.delete(request)) workspaceRequestVersion += 1;
   };
-  context.on("requestfinished", finishWorkspaceRequest);
-  context.on("requestfailed", finishWorkspaceRequest);
+  context.on("requestfinished", (request) => finishWorkspaceRequest(request, "requestfinished"));
+  context.on("requestfailed", (request) => finishWorkspaceRequest(request, "requestfailed"));
   let workspaceRevision = "owner-revision-0";
   let sessionActive = true;
   const emergencyIncidents = [];
@@ -2419,7 +2939,7 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
   wave.writeUInt32LE(8000, 24); wave.writeUInt32LE(16000, 28); wave.writeUInt16LE(2, 32);
   wave.writeUInt16LE(16, 34); wave.write("data", 36); wave.writeUInt32LE(16000, 40);
   await context.route("**/smoke-radio.wav", (route) => route.fulfill({ status: 200, contentType: "audio/wav", body: wave }));
-  const owner = {
+  const owner = principal || {
     id: "smoke-owner",
     uid: "smoke-owner",
     email: "david@brothersrestoration.org",
@@ -2430,13 +2950,14 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
     status: "active",
     disabled: false
   };
-  await context.addInitScript((workspaceIdentity) => {
+  await context.addInitScript(({ workspaceIdentity, expectedOrigin }) => {
+    if (location.origin !== expectedOrigin) return;
     if (sessionStorage.getItem("owner-workspace-identity-seeded")) return;
     const saved = JSON.parse(localStorage.getItem("brothers-os-workspace-v2") || "{}");
     localStorage.setItem("brothers-os-workspace-v2", JSON.stringify({ ...saved, workspaceIdentity }));
     sessionStorage.setItem("owner-workspace-identity-seeded", "1");
-  }, { uid: owner.uid, companyId: owner.companyId });
-  const users = [owner];
+  }, { workspaceIdentity: { uid: owner.uid, companyId: owner.companyId }, expectedOrigin: origin });
+  const users = [owner, ...structuredClone(fixtureUsers)];
   const accessGrants = [];
   const posts = [];
   const tabs = smokeModuleDefinitions.map((module, index) => ({
@@ -2504,6 +3025,13 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
       community: "all"
     }
   };
+  if (owner.roleId === "contractor") {
+    permissions.tabs = { mode: "allow", allowed: owner.visibleTabIds, hidden: [] };
+    permissions.pages = { mode: "allow", allowed: owner.visiblePageIds, hidden: [] };
+    permissions.actions = Object.fromEntries(allOwnerActions.map((action) => [action,
+      ["inviteWorkers", "uploadImages", "editAssignedTasks", "postCommunityMessages"].includes(action)]));
+    permissions.dataAccess = { ...permissions.dataAccess, company: "none", workers: "assigned", globalIndexes: "none", revenue: "none" };
+  }
   const sessionPayload = () => ({
     success: true,
     session: {
@@ -2512,8 +3040,10 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
       roleId: owner.roleId,
       companyId: owner.companyId,
       franchiseIds: owner.franchiseIds,
-      contractorId: "",
-      accessScope: "owner",
+      contractorId: owner.contractorId || "",
+      accessScope: owner.roleId === "contractor" ? "contractor_portal" : "owner",
+      visibleTabIds: owner.visibleTabIds,
+      visiblePageIds: owner.visiblePageIds,
       accessExpiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       permissions
     },
@@ -2526,7 +3056,7 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
       { id: "contractor", label: "Contractor", rank: 30 },
       { id: "worker", label: "Worker", rank: 10 }
     ],
-    permissions: [{ roleId: "super_admin", ...permissions }],
+    permissions: [{ roleId: owner.roleId, ...permissions }],
     tabs,
     pages,
     pageSections,
@@ -2554,6 +3084,15 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
       contentType: "application/json",
       body: JSON.stringify(body)
     });
+
+    if (url.origin !== origin) return route.abort("blockedbyclient");
+    if (mutationControl?.method === method && mutationControl?.path === url.pathname) {
+      const control = mutationControl;
+      mutationControl = null;
+      control.received = true;
+      if (control.message) return json(503, { success: false, message: control.message });
+      await control.ready;
+    }
 
     if (url.pathname === "/api/auth/config") {
       return json(200, {
@@ -2731,10 +3270,12 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
     }
     if (url.pathname === "/api/employee-invitations" && method === "POST") {
       const payload = request.postDataJSON() || {};
+      if (!payload.visibleModuleKeys?.length) return json(400, { success: false, message: "Select at least one module. Use Disable Account to remove access." });
       const employerKey = owner.email.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
       const contractorId = payload.contractorId || owner.contractorId || `employer-${employerKey}`;
+      const employer = users.find((user) => user.roleId === "contractor" && user.contractorId === contractorId) || owner;
       const grant = {
-        id: `employee-grant-${Date.now()}`,
+        id: `employee-grant-${++invitationSequence}`,
         email: payload.email,
         displayName: payload.displayName,
         roleId: "worker",
@@ -2742,8 +3283,8 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
         franchiseIds: payload.franchiseIds || [],
         contractorId,
         employerContractorId: contractorId,
-        employerUid: owner.uid,
-        employerEmail: owner.email,
+        employerUid: employer.uid,
+        employerEmail: employer.email,
         onboardingMode: "employee_link",
         status: "issued",
         phone: payload.phone || "",
@@ -2767,6 +3308,9 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
     if (/^\/api\/employee-invitations\/[^/]+$/.test(url.pathname) && method === "PATCH") {
       const grantId = decodeURIComponent(url.pathname.split("/").at(-1));
       const payload = request.postDataJSON() || {};
+      if (Array.isArray(payload.visibleModuleKeys) && !payload.visibleModuleKeys.length) {
+        return json(400, { success: false, message: "Select at least one module. Use Disable Account to remove access." });
+      }
       const index = accessGrants.findIndex((grant) => grant.id === grantId);
       if (index < 0) return json(404, { success: false, message: "Employee invitation not found." });
       accessGrants[index] = {
@@ -2933,6 +3477,35 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
   });
 
   return {
+    getUsers: () => structuredClone(users),
+    rejectNextApiMutation(method, path, message) {
+      if (mutationControl) throw new Error("An API mutation control is already armed");
+      mutationControl = { method, path, message };
+    },
+    holdNextApiMutation(method, path) {
+      if (mutationControl) throw new Error("An API mutation control is already armed");
+      let release;
+      const control = { method, path, received: false, ready: new Promise((resolve) => { release = resolve; }) };
+      mutationControl = control;
+      return { get received() { return control.received; }, release };
+    },
+    simulateEmployeeAcceptance(grantId) {
+      const grant = accessGrants.find((item) => item.id === grantId);
+      if (!grant || grant.status !== "issued") throw new Error("Acceptance fixture requires an issued invitation");
+      const uid = `accepted-${grantId}`;
+      Object.assign(grant, { status: "active", firebaseUid: uid });
+      const user = { ...structuredClone(grant), id: uid, uid, status: "active", employmentStatus: "active", disabled: false };
+      users.push(user);
+      return structuredClone(user);
+    },
+    cachePendingEmployee(grantId) {
+      const grant = accessGrants.find((item) => item.id === grantId);
+      workspaceState.teamMembers = [...(workspaceState.teamMembers || []), {
+        ...structuredClone(grant), id: `invite-${grantId}`, pendingGrantId: grantId,
+        name: grant.displayName, role: "worker", accountType: "worker", status: "Invitation pending"
+      }];
+      workspaceRevision = `owner-revision-fixture-${grantId}`;
+    },
     getWorkspaceState: () => structuredClone(workspaceState),
     getAccessGrants: () => structuredClone(accessGrants),
     getWorkspaceReadCount: () => workspaceReadCount,
@@ -2940,7 +3513,15 @@ async function installLocalSmokeApi(context, { adminConfigured = true } = {}) {
     getEmergencyIncidents: () => emergencyIncidents,
     enableTestRadio: () => { emergencySources = [{ id: "test-radio", label: "Test dispatch radio", area: "Local fixture only", streamUrl: `${origin}/smoke-radio.wav` }]; },
     getWorkspaceWriteCount: () => workspaceWriteCount,
-    getWorkspaceActivity: () => ({ inFlight: workspaceRequests.size, requestVersion: workspaceRequestVersion, writes: workspaceWriteCount }),
+    getWorkspaceActivity: () => ({ inFlight: workspaceRequests.size, requestVersion: workspaceRequestVersion, writes: workspaceWriteCount,
+      pendingRequests: [...workspaceRequests].map((request) => `${request.method()} ${request.url()}`).sort() }),
+    getWorkspaceRequestDiagnostics: () => ({
+      pending: [...workspaceRequests].map((request) => {
+        const detail = workspaceRequestDetails.get(request);
+        return { ...detail, ageMs: Date.now() - detail.startedAt };
+      }),
+      terminalEvents: structuredClone(workspaceTerminalEvents)
+    }),
     getEquipmentWriteDiagnostics: () => structuredClone({ lastAcknowledgmentHold, lastEquipmentWrite }),
     holdWorkspaceAcknowledgmentContaining(marker) {
       if (workspaceAcknowledgmentHold) throw new Error("A workspace acknowledgment is already held");
@@ -3027,9 +3608,17 @@ const developmentDiagnostics = [];
 const failedResponses = [];
 let failure;
 try {
+await verifyFreshLocalAssets();
 browserServer = await launchSmokeBrowser();
 browser = await chromium.connect(browserServer.wsEndpoint());
-const context = await browser.newContext({
+if (lateJourneysOnly) {
+  await testTeamLifecycle(browser);
+  await testEmployeePortal(browser);
+  if (consoleErrors.length || failedResponses.length) {
+    throw new Error(`Browser errors during late journeys: ${[...new Set([...consoleErrors, ...failedResponses])].join(" | ")}`);
+  }
+} else {
+const context = await smokeContext(browser, {
   viewport: { width: 1440, height: 900 },
   geolocation: { latitude: 42.45, longitude: -73.245 },
   permissions: ["geolocation"]
@@ -3038,37 +3627,12 @@ await context.grantPermissions(["geolocation"], { origin });
 localSmokeApi = await installLocalSmokeApi(context);
 page = await context.newPage();
 page.setDefaultTimeout(20000);
-page.on("console", (message) => {
-  if (message.type() !== "error") return;
-  const messageText = message.text();
-  if (expectedWorkspaceFailure && /Failed to load resource:.*503/.test(messageText)) return;
-  if (messageText.includes("status of 401 (Unauthorized)")) {
-    return;
-  }
-  const isLocalReactDevelopmentDiagnostic = ["127.0.0.1", "localhost"].includes(new URL(baseUrl).hostname)
-    && messageText.includes("React requires eval() in development mode")
-    && messageText.includes("React will never use eval() in production mode");
-  if (isLocalReactDevelopmentDiagnostic) {
-    developmentDiagnostics.push(messageText);
-    return;
-  }
-  consoleErrors.push(messageText);
-});
-page.on("pageerror", (error) => consoleErrors.push(error.message));
-  page.on("response", (response) => {
-    if (response.status() >= 400) {
-      const pathname = new URL(response.url()).pathname;
-      if (expectedWorkspaceFailure && response.status() === 503 && pathname === "/api/workspace-state"
-        && response.request().method() === "PUT" && response.request().postData()?.includes(expectedWorkspaceFailure)) return;
-      if (response.status() === 401 && pathname === "/api/auth/session") return;
-      failedResponses.push(`${response.request().method()} ${response.status()} ${response.url()}`);
-    }
-});
 
   await go(page, "daily");
   await waitUntil("initial durable workspace hydration", async () => localSmokeApi.getWorkspaceReadCount() > 0
     && localSmokeApi.getWorkspaceWriteCount() > 0 && await page.locator(".workspace-write-lock").count() === 0);
   await runWorkflow(page, localSmokeApi);
+  await verifyLinkedWorkflowGraph(page, localSmokeApi);
   console.log("[smoke] linked workflow complete");
   const moduleKeys = await safeModuleSweep(page);
   console.log("[smoke] module sweep complete");
@@ -3091,6 +3655,7 @@ page.on("pageerror", (error) => consoleErrors.push(error.message));
   console.log("[smoke] action matrix complete");
   await testUnauthenticatedGate(browser);
   await testUnavailableStorageWriteLock(browser);
+  await testTeamLifecycle(browser);
   await testEmployeePortal(browser);
   const allowedInteractiveActions = new Set(["firebase-google-login"]);
   const unexercisedActionTypes = staticActionTypes
@@ -3136,6 +3701,7 @@ page.on("pageerror", (error) => consoleErrors.push(error.message));
   if (consoleErrors.length || failedResponses.length) {
     throw new Error(`Browser errors during smoke: ${[...new Set([...consoleErrors, ...failedResponses])].join(" | ")}`);
   }
+}
 } catch (error) {
   failure = error;
   const diagnostics = await page?.evaluate((taskTitle) => ({
@@ -3185,8 +3751,8 @@ page.on("pageerror", (error) => consoleErrors.push(error.message));
   try { await closeOwnedBrowser(browser, browserServer); }
   catch (error) { failure = failure ? new AggregateError([failure, error], "Workflow and browser cleanup failed") : error; }
 }
-const report = { ok: !failure, ...results, error: failure?.stack, causes: failure?.errors?.map((error) => error.stack), consoleErrors, failedResponses, developmentDiagnostics };
+const report = { ok: !failure, ...results, error: failure?.stack, causes: failure?.errors?.map((error) => error.stack), consoleErrors, failedResponses, developmentDiagnostics, browserDiagnostics };
 fs.mkdirSync(new URL("../logs/", import.meta.url), { recursive: true });
-fs.writeFileSync(new URL("../logs/browser-workflow-smoke.json", import.meta.url), JSON.stringify(report, null, 2));
+fs.writeFileSync(new URL(lateJourneysOnly ? "../logs/browser-workflow-smoke-late.json" : "../logs/browser-workflow-smoke.json", import.meta.url), JSON.stringify(report, null, 2));
 console.log(JSON.stringify(report, null, 2));
 if (failure) throw failure;

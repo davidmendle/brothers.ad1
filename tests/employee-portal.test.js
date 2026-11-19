@@ -20,6 +20,7 @@ function createFakeFirestore(seed = {}) {
   };
   let transactionQueue = Promise.resolve();
   let beforeNextTransaction = null;
+  const committedTransactionWriteCounts = [];
   const snap = (id, data) => ({ id, exists: Boolean(data), data: () => data });
   const querySnap = (docs) => ({ docs, empty: docs.length === 0 });
   const docsFromCollection = (collectionMap) => Array.from(collectionMap.entries())
@@ -95,6 +96,7 @@ function createFakeFirestore(seed = {}) {
           }
         });
         for (const operation of operations) await operation();
+        committedTransactionWriteCounts.push(operations.length);
         return result;
       });
       transactionQueue = run.catch(() => undefined);
@@ -103,6 +105,7 @@ function createFakeFirestore(seed = {}) {
     setBeforeNextTransaction(callback) {
       beforeNextTransaction = callback;
     },
+    committedTransactionWriteCounts,
     dump(collectionName) {
       return Object.fromEntries(ensureCollection(collectionName).entries());
     }
@@ -465,6 +468,106 @@ function findActiveWorkspaceRecord(fakeDb, field, recordId) {
   ));
 }
 
+async function createPendingTaskAssignment(fixture) {
+  const invitation = await request(fixture.app)
+    .post("/api/employee-invitations")
+    .set("Cookie", ["brothers_os_session=contractor-session"])
+    .send({
+      displayName: "Invited Employee",
+      email: "employee@example.com",
+      assignedJobIds: ["J-9001"],
+      visibleModuleKeys: ["jobs", "photos", "time"],
+      sendEmail: false
+    });
+  expect(invitation.status, JSON.stringify(invitation.body)).toBe(201);
+  const grantId = invitation.body.grant.id;
+  const invitationUid = `invite-${grantId}`;
+  const initial = await request(fixture.app)
+    .get("/api/workspace-state")
+    .set("Cookie", ["brothers_os_session=contractor-session"]);
+  expect(initial.status).toBe(200);
+  const scope = {
+    companyId: "default-company",
+    franchiseId: "default-franchise",
+    contractorId: "contractor-alpha",
+    employerContractorId: "contractor-alpha",
+    employerUid: "contractor-uid",
+    employerEmail: "contractor@example.com"
+  };
+  const task = {
+    ...scope,
+    id: "TASK-PREACCEPT",
+    title: "Pre-acceptance inspection",
+    moduleKey: "jobs",
+    relatedJob: "J-9001",
+    assigneeId: invitationUid,
+    assigneeEmail: " EMPLOYEE@example.com ",
+    status: "Open",
+    assignmentSyncPending: false,
+    history: ["Assigned before invitation acceptance"],
+    photoEvidenceAssetIds: ["asset-existing-evidence"],
+    photoRecordIds: ["PHOTO-EXISTING-EVIDENCE"],
+    timeEntryIds: ["TIME-EXISTING-EVIDENCE"]
+  };
+  const file = {
+    ...scope,
+    id: "FILE-PREACCEPT",
+    title: task.title,
+    moduleKey: "jobs",
+    sourceType: "taskAssignment",
+    sourceId: task.id,
+    taskId: task.id,
+    relatedJob: task.relatedJob,
+    workerId: invitationUid,
+    workerEmail: "EMPLOYEE@example.com",
+    status: "Open",
+    history: ["Assignment file created"],
+    evidenceAssetIds: ["asset-existing-evidence"]
+  };
+  const saved = await request(fixture.app)
+    .put("/api/workspace-state")
+    .set("Cookie", ["brothers_os_session=contractor-session"])
+    .send({
+      baseRevision: initial.body.revision,
+      baseUpdatedAt: initial.body.updatedAt,
+      workspaceState: { tasks: [task], files: [file] }
+    });
+  expect(saved.status, JSON.stringify(saved.body)).toBe(200);
+  const assigned = await request(fixture.app)
+    .patch(`/api/employee-invitations/${grantId}`)
+    .set("Cookie", ["brothers_os_session=contractor-session"])
+    .send({ assignedJobIds: ["J-9001"], assignedTaskIds: [task.id] });
+  expect(assigned.status, JSON.stringify(assigned.body)).toBe(200);
+  const records = fixture.fakeDb.dump("osWorkspaceRecords");
+  const taskDocumentId = Object.keys(records).find((id) => records[id].recordId === task.id && !records[id].deletedAt);
+  const fileDocumentId = Object.keys(records).find((id) => records[id].recordId === file.id && !records[id].deletedAt);
+  expect(taskDocumentId).toBeTruthy();
+  expect(fileDocumentId).toBeTruthy();
+  return {
+    grantId, invitationUid, taskDocumentId, fileDocumentId,
+    task: records[taskDocumentId], file: records[fileDocumentId],
+    accessToken: decodeURIComponent(new URL(invitation.body.accessLink).hash.replace("#access/", "")),
+    staleWrite: {
+      baseRevision: saved.body.revision,
+      baseUpdatedAt: saved.body.updatedAt,
+      workspaceState: { tasks: [task], files: [file] }
+    }
+  };
+}
+
+function acceptPendingInvitation(fixture, pending) {
+  return request(fixture.app).post("/api/auth/session/login")
+    .send({ idToken: "verified-worker-token", accessToken: pending.accessToken });
+}
+
+function expectInvitationUnconsumed(fixture, pending) {
+  expect(fixture.fakeDb.dump("osAccessGrants")[pending.grantId]).toMatchObject({
+    status: "issued",
+    tokenHash: crypto.createHash("sha256").update(pending.accessToken).digest("hex")
+  });
+  expect(fixture.fakeDb.dump("osUsers")["worker-uid"]?.status).not.toBe("active");
+}
+
 function signoffEvidenceValues(signoff = {}) {
   const entries = [
     ...(Array.isArray(signoff.photoEvidence) ? signoff.photoEvidence : []),
@@ -527,6 +630,238 @@ afterEach(() => {
   vi.useRealTimers();
   delete process.env.RESEND_API_KEY;
   delete process.env.INVITE_FROM_EMAIL;
+});
+
+describe("employee invitation task identity migration", () => {
+  it("persists invitation assignments, activates canonical identities, reads and signs off without losing evidence links", async () => {
+    const fixture = createEmployeeTestApp();
+    const pending = await createPendingTaskAssignment(fixture);
+    const before = fixture.fakeDb.dump("osWorkspaceRecords");
+    const activated = await acceptPendingInvitation(fixture, pending);
+    expect(activated.status, JSON.stringify(activated.body)).toBe(200);
+    const after = fixture.fakeDb.dump("osWorkspaceRecords");
+    expect(Object.keys(after).sort()).toEqual(Object.keys(before).sort());
+    expect(after[pending.taskDocumentId]).toEqual({
+      ...pending.task,
+      data: { ...pending.task.data, assigneeId: "worker-uid" },
+      updatedAt: expect.any(String), updatedByUid: "worker-uid", updatedByEmail: "employee@example.com"
+    });
+    expect(after[pending.fileDocumentId]).toEqual({
+      ...pending.file,
+      data: { ...pending.file.data, workerId: "worker-uid" },
+      updatedAt: expect.any(String), updatedByUid: "worker-uid", updatedByEmail: "employee@example.com"
+    });
+    for (const id of Object.keys(before).filter((id) => ![pending.taskDocumentId, pending.fileDocumentId].includes(id))) {
+      expect(after[id]).toEqual(before[id]);
+    }
+    expect(fixture.fakeDb.dump("osAccessGrants")[pending.grantId]).toMatchObject({
+      status: "active", firebaseUid: "worker-uid", tokenHash: "", tokenConsumedAt: expect.any(String)
+    });
+    expect(fixture.fakeDb.committedTransactionWriteCounts.at(-1)).toBe(5);
+    const revisions = fixture.fakeDb.dump("osWorkspaceRevisions");
+    expect(Object.values(revisions)[0].revision).not.toBe(pending.staleWrite.baseRevision);
+
+    const staleSave = await request(fixture.app).put("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=contractor-session"]).send(pending.staleWrite);
+    expect(staleSave.status).toBe(409);
+    expect(fixture.fakeDb.dump("osWorkspaceRecords")).toEqual(after);
+
+    const committedCount = fixture.fakeDb.committedTransactionWriteCounts.length;
+    const replay = await acceptPendingInvitation(fixture, pending);
+    expect(replay.status).toBe(403);
+    expect(fixture.fakeDb.committedTransactionWriteCounts).toHaveLength(committedCount);
+    expect(fixture.fakeDb.dump("osWorkspaceRevisions")).toEqual(revisions);
+    expect(fixture.fakeDb.dump("osWorkspaceRecords")).toEqual(after);
+
+    fixture.setSessionIdentity(fixture.workerIdentity);
+    const workspace = await request(fixture.app).get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=worker-session"]);
+    expect(workspace.status).toBe(200);
+    expect(workspace.body.workspaceState.tasks).toContainEqual(expect.objectContaining({
+      id: pending.task.recordId, assigneeId: "worker-uid", history: pending.task.data.history,
+      photoEvidenceAssetIds: ["asset-existing-evidence"], timeEntryIds: ["TIME-EXISTING-EVIDENCE"]
+    }));
+    expect(workspace.body.workspaceState.files).toContainEqual(expect.objectContaining({
+      id: pending.file.recordId, workerId: "worker-uid", sourceId: pending.task.recordId,
+      taskId: pending.task.recordId, evidenceAssetIds: ["asset-existing-evidence"]
+    }));
+    const signoff = await request(fixture.app).post("/api/employee/ticket-signoffs")
+      .set("Cookie", ["brothers_os_session=worker-session"])
+      .send({
+        taskId: pending.task.recordId, typedSignature: "Employee Name", attested: true,
+        gps: { latitude: 42.4501, longitude: -73.2452, accuracy: 9 }
+      });
+    expect(signoff.status, JSON.stringify(signoff.body)).toBe(201);
+    expect(signoff.body.signoff).toMatchObject({
+      taskId: pending.task.recordId, employeeUid: "worker-uid", employerUid: "contractor-uid",
+      employerContractorId: "contractor-alpha", franchiseId: "default-franchise"
+    });
+    expect(fixture.fakeDb.dump("osWorkspaceRecords")[pending.taskDocumentId].data).toMatchObject({
+      id: pending.task.recordId, assigneeId: "worker-uid", status: "Complete", signedOffByUid: "worker-uid",
+      photoEvidenceAssetIds: ["asset-existing-evidence"], timeEntryIds: ["TIME-EXISTING-EVIDENCE"]
+    });
+  });
+
+  it("does not take over other company, employer, contractor, email, franchise or invitation records or unrelated files", async () => {
+    const fixture = createEmployeeTestApp();
+    const pending = await createPendingTaskAssignment(fixture);
+    const excluded = {};
+    const taskCases = [
+      ["outer-company", {}, { companyId: "foreign-company" }],
+      ["inner-company", { companyId: "foreign-company" }],
+      ["contractor", { contractorId: "contractor-beta" }],
+      ["employer-contractor", { employerContractorId: "contractor-beta" }],
+      ["employer-uid", { employerUid: "other-contractor-uid" }],
+      ["employer-email", { employerEmail: "other.contractor@example.com" }],
+      ["email", { assigneeEmail: "sibling@example.com" }],
+      ["invitation", { assigneeId: "invite-unrelated-grant" }],
+      ["franchise", { franchiseId: "foreign-franchise" }],
+      ["deleted", {}, { deletedAt: "2026-08-24T12:00:00.000Z" }]
+    ];
+    for (const [name, data, envelope = {}] of taskCases) {
+      const id = `EXCLUDED-TASK-${name}`;
+      excluded[id] = { ...pending.task, ...envelope, recordId: id, data: { ...pending.task.data, id, ...data } };
+    }
+    const fileCases = [
+      ["email", { workerEmail: "sibling@example.com" }],
+      ["worker", { workerId: "invite-unrelated-grant" }],
+      ["source", { sourceId: "TASK-OTHER", taskId: "TASK-OTHER" }],
+      ["task", { taskId: "TASK-OTHER" }],
+      ["type", { sourceType: "photoEvidence" }],
+      ["branch", { branchId: "unrelated-branch" }],
+      ["company", { companyId: "foreign-company" }],
+      ["contractor", { contractorId: "contractor-beta" }],
+      ["employer", { employerUid: "other-contractor-uid" }],
+      ["franchise", { franchiseId: "foreign-franchise" }]
+    ];
+    for (const [name, data] of fileCases) {
+      const id = `EXCLUDED-FILE-${name}`;
+      excluded[id] = { ...pending.file, recordId: id, data: { ...pending.file.data, id, ...data } };
+    }
+    for (const [id, record] of Object.entries(excluded)) {
+      await fixture.fakeDb.collection("osWorkspaceRecords").doc(id).set(record);
+    }
+    const response = await acceptPendingInvitation(fixture, pending);
+    expect(response.status).toBe(200);
+    for (const [id, record] of Object.entries(excluded)) {
+      expect(fixture.fakeDb.dump("osWorkspaceRecords")[id], id).toEqual(record);
+    }
+    expect(fixture.fakeDb.committedTransactionWriteCounts.at(-1)).toBe(5);
+    fixture.setSessionIdentity(fixture.workerIdentity);
+    const workspace = await request(fixture.app).get("/api/workspace-state")
+      .set("Cookie", ["brothers_os_session=worker-session"]);
+    expect(workspace.status).toBe(200);
+    expect(workspace.body.workspaceState.tasks.some((task) => task.id.startsWith("EXCLUDED-TASK-"))).toBe(false);
+    const deniedSignoff = await request(fixture.app).post("/api/employee/ticket-signoffs")
+      .set("Cookie", ["brothers_os_session=worker-session"])
+      .send({
+        taskId: "EXCLUDED-TASK-invitation", typedSignature: "Employee Name", attested: true,
+        gps: { latitude: 42.4501, longitude: -73.2452, accuracy: 9 }
+      });
+    expect(deniedSignoff.status).toBe(404);
+  });
+
+  it.each(["revision", "task candidate", "file candidate", "franchise grant"])("aborts on a concurrent %s change without consuming the invitation or partially migrating records", async (change) => {
+    const fixture = createEmployeeTestApp();
+    const pending = await createPendingTaskAssignment(fixture);
+    const committedCount = fixture.fakeDb.committedTransactionWriteCounts.length;
+    let concurrentRecords;
+    let concurrentRevisions;
+    fixture.fakeDb.setBeforeNextTransaction(async () => {
+      if (change === "revision") {
+        const revisionId = Object.keys(fixture.fakeDb.dump("osWorkspaceRevisions"))[0];
+        await fixture.fakeDb.collection("osWorkspaceRevisions").doc(revisionId)
+          .set({ revision: "concurrent-workspace-revision" }, { merge: true });
+        await fixture.fakeDb.collection("osWorkspaceRecords").doc("concurrent-task")
+          .set({ ...pending.task, recordId: "TASK-CONCURRENT", data: { ...pending.task.data, id: "TASK-CONCURRENT" } });
+      } else if (change.endsWith("candidate")) {
+        const fileChange = change === "file candidate";
+        await fixture.fakeDb.collection("osWorkspaceRecords").doc(fileChange ? pending.fileDocumentId : pending.taskDocumentId)
+          .set({ data: { ...(fileChange ? pending.file.data : pending.task.data), title: "Concurrent edit" } }, { merge: true });
+      } else {
+        await fixture.fakeDb.collection("osAccessGrants").doc(pending.grantId)
+          .set({ franchiseIds: ["different-franchise"] }, { merge: true });
+      }
+      concurrentRecords = fixture.fakeDb.dump("osWorkspaceRecords");
+      concurrentRevisions = fixture.fakeDb.dump("osWorkspaceRevisions");
+    });
+    const rejected = await acceptPendingInvitation(fixture, pending);
+    expect(rejected.status, JSON.stringify(rejected.body)).toBe(409);
+    expectInvitationUnconsumed(fixture, pending);
+    expect(fixture.fakeDb.dump("osWorkspaceRecords")).toEqual(concurrentRecords);
+    expect(fixture.fakeDb.dump("osWorkspaceRevisions")).toEqual(concurrentRevisions);
+    expect(fixture.fakeDb.committedTransactionWriteCounts).toHaveLength(committedCount);
+    if (change === "franchise grant") {
+      await fixture.fakeDb.collection("osAccessGrants").doc(pending.grantId)
+        .set({ franchiseIds: ["default-franchise"] }, { merge: true });
+    }
+    const retry = await acceptPendingInvitation(fixture, pending);
+    expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+    const records = fixture.fakeDb.dump("osWorkspaceRecords");
+    expect(records[pending.taskDocumentId].data.assigneeId).toBe("worker-uid");
+    expect(records[pending.fileDocumentId].data.workerId).toBe("worker-uid");
+    if (change === "revision") expect(records["concurrent-task"].data.assigneeId).toBe("worker-uid");
+    if (change === "task candidate") expect(records[pending.taskDocumentId].data.title).toBe("Concurrent edit");
+    if (change === "file candidate") expect(records[pending.fileDocumentId].data.title).toBe("Concurrent edit");
+  });
+
+  it.each([450, 451])("enforces the atomic %i-write boundary counting tasks, files, grant, user and revision", async (writeCount) => {
+    const fixture = createEmployeeTestApp();
+    const pending = await createPendingTaskAssignment(fixture);
+    for (let index = 2; index < writeCount - 3; index += 1) {
+      const template = index % 2 ? pending.file : pending.task;
+      const id = `LIMIT-${template.field}-${index}`;
+      await fixture.fakeDb.collection("osWorkspaceRecords").doc(id)
+        .set({ ...template, recordId: id, data: { ...template.data, id } });
+    }
+    const before = fixture.fakeDb.dump("osWorkspaceRecords");
+    const revisions = fixture.fakeDb.dump("osWorkspaceRevisions");
+    const committedCount = fixture.fakeDb.committedTransactionWriteCounts.length;
+    const response = await acceptPendingInvitation(fixture, pending);
+    if (writeCount === 450) {
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(fixture.fakeDb.committedTransactionWriteCounts.at(-1)).toBe(450);
+      const migrated = Object.values(fixture.fakeDb.dump("osWorkspaceRecords")).filter((record) =>
+        record.recordId.startsWith("LIMIT-") || [pending.task.recordId, pending.file.recordId].includes(record.recordId));
+      expect(migrated).toHaveLength(447);
+      expect(migrated.every((record) => (record.field === "tasks" ? record.data.assigneeId : record.data.workerId) === "worker-uid")).toBe(true);
+    } else {
+      expect(response.status).toBe(413);
+      expect(response.body.message).toMatch(/450-write atomic limit/);
+      expectInvitationUnconsumed(fixture, pending);
+      expect(fixture.fakeDb.dump("osWorkspaceRecords")).toEqual(before);
+      expect(fixture.fakeDb.dump("osWorkspaceRevisions")).toEqual(revisions);
+      expect(fixture.fakeDb.committedTransactionWriteCounts).toHaveLength(committedCount);
+    }
+  });
+
+  it("requires transaction support before consuming an employee invitation", async () => {
+    const fixture = createEmployeeTestApp();
+    const pending = await createPendingTaskAssignment(fixture);
+    const before = fixture.fakeDb.dump("osWorkspaceRecords");
+    const revisions = fixture.fakeDb.dump("osWorkspaceRevisions");
+    fixture.fakeDb.runTransaction = undefined;
+    const response = await acceptPendingInvitation(fixture, pending);
+    expect(response.status).toBe(503);
+    expectInvitationUnconsumed(fixture, pending);
+    expect(fixture.fakeDb.dump("osWorkspaceRecords")).toEqual(before);
+    expect(fixture.fakeDb.dump("osWorkspaceRevisions")).toEqual(revisions);
+  });
+
+  it("commits only one identity migration for concurrent acceptance requests", async () => {
+    const fixture = createEmployeeTestApp();
+    const pending = await createPendingTaskAssignment(fixture);
+    const committedCount = fixture.fakeDb.committedTransactionWriteCounts.length;
+    const responses = await Promise.all([
+      acceptPendingInvitation(fixture, pending), acceptPendingInvitation(fixture, pending)
+    ]);
+    expect(responses.some((response) => response.status === 200)).toBe(true);
+    expect(responses.every((response) => [200, 403].includes(response.status))).toBe(true);
+    expect(fixture.fakeDb.committedTransactionWriteCounts.slice(committedCount)).toEqual([5]);
+    expect(fixture.fakeDb.dump("osUsers")["worker-uid"].status).toBe("active");
+    expect(fixture.fakeDb.dump("osWorkspaceRecords")[pending.taskDocumentId].data.assigneeId).toBe("worker-uid");
+    expect(fixture.fakeDb.dump("osWorkspaceRecords")[pending.fileDocumentId].data.workerId).toBe("worker-uid");
+  });
 });
 
 describe("employee portal onboarding and ticket sign-off", () => {
@@ -1516,6 +1851,10 @@ describe("employee portal onboarding and ticket sign-off", () => {
       });
     expect(clockIn.status).toBe(200);
 
+    const clockStartedAt = findActiveWorkspaceRecord(fixture.fakeDb, "activeClockSessions", "CLOCK-VALID").data.start;
+    expect(clockStartedAt).toBe(clockIn.body.updatedAt);
+    expect(Date.parse(clockStartedAt)).toBeGreaterThan(Date.parse(initial.body.updatedAt));
+
     const overlap = await request(fixture.app)
       .put("/api/workspace-state")
       .set("Cookie", ["brothers_os_session=worker-session"])
@@ -1569,7 +1908,7 @@ describe("employee portal onboarding and ticket sign-off", () => {
     const storedTimeDocument = Object.values(fixture.fakeDb.dump("osWorkspaceRecords"))
       .find((record) => record.field === "timeEntries" && record.recordId === "CLOCK-VALID");
     expect(storedTimeDocument.data).toMatchObject({
-      start: "2026-08-24T12:00:00.000Z",
+      start: clockStartedAt,
       end: "2026-08-24T14:00:00.000Z",
       hours: "2.00",
       workerId: "worker-uid"

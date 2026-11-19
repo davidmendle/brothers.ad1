@@ -1,6 +1,29 @@
 # Brothers OS Workflow Verification
 
-Date: 2026-11-18. Repository: `davidmendle/brothers.ad1`. Production project: `brothers-ad`, Brothers Restoration Services.
+Date: 2026-11-19. Repository: `davidmendle/brothers.ad1`. Production project: `brothers-ad`, Brothers Restoration Services.
+
+## November 19 Refinement
+
+- Team, invitation, profile and access-management forms preserve drafts on rejected requests, including the exact selected checkboxes, radio options and multi-select values. Existing disabled controls remain disabled after completion.
+- Committed invitations remain visible when a subsequent directory refresh fails. The UI distinguishes the committed invitation from an ancillary workspace-file failure, so users are not told to recreate an already issued link.
+- Tasks and their support files persist before employee assignment updates. Partial assignment failures retain a pending-sync marker and a retry action that repairs the same task, including after reload; completion retries do not duplicate history.
+- Accepting an employee invitation atomically converts its matching task and assignment-file identities to the verified Firebase UID, activates the grant/user, and advances the workspace revision. Task/file IDs, history and evidence references remain intact. Cross-company, employer, email and explicit franchise mismatches are excluded. Conflicts and the 450-write limit abort activation without consuming the invitation.
+- A task retry can also resolve a pending invitation identity to an accepted employee using the exact active grant and matching account scope, without creating another task or evidence file.
+- Current server invitations take precedence over stale browser profiles. Revoked and superseded invitations cannot reappear from cached team members. Disabled and expired pending profiles are not assignable.
+- Team job suggestions use scoped visible jobs. Task assignment validates employer identity and unambiguous job references, and carries the canonical job ID into linked records.
+- Newly submitted empty module selections are rejected by both UI and managed-user/access-grant APIs, rather than accidentally reverting to role defaults. Legacy empty lists retain their documented default semantics; explicit deny-all permission overrides remain distinct. Disabling an account removes access.
+- Login and existing-session checks require `email_verified === true` in addition to the allowed provider and existing Firebase verification. Missing, false, null and nonboolean verification claims are rejected before account storage or cookie creation.
+- The Next script preload now uses the same CORS mode as its module fetch, eliminating a duplicate `/app.js` download without changing authentication or private-data caching.
+
+### Performance Evidence
+
+Three controlled cold-load comparisons against the same frozen asset snapshot reduced `/app.js` requests from two to one. Compressed JavaScript/CSS body bytes decreased from 334,343 to 187,257 (44.0%). This is fixture transfer evidence, not a production latency or throughput claim.
+
+Separate checks against the actual Next production build at 1440x900 and 390x844 confirmed one `/app.js` request per viewport, 147,745 encoded body bytes for that build, normal Next hydration, no page/hydration errors and no horizontal overflow. Authentication responses and Firebase SDK imports were locally stubbed; Google OAuth was not performed. The sign-in gate, shield logo and Google button were visually reviewed in both screenshots. Repeated shield requests remain observable with interception disabling normal HTTP caching.
+
+### Skill Review
+
+Applicable Vercel deployment/verification and skill-review guidance was used. The official Hugging Face `hf-cli` skill was downloaded for read-only review at commit `5291c2b9365e06b175dc04817610c778623f4836`, outside the checkout and auto-load directories. It was not installed or executed. Its mutable remote installer and external binaries remain outside that review; no models, paid jobs, or unrelated dependencies were added to the application.
 
 ## Repairs
 
@@ -19,10 +42,11 @@ Date: 2026-11-18. Repository: `davidmendle/brothers.ad1`. Production project: `b
 
 | Check | Result |
 | --- | --- |
-| Full unit/router suite | 576 tests passed across 23 files (`pnpm test`). |
+| Full unit/router suite | 684 tests passed across 27 files (`pnpm test`, November 19). A concurrent-browser run previously hit two cleanup timeouts; the subsequent standalone full run passed completely. |
 | Next.js production build | Passed (`pnpm build`, Next.js 16.4.6). Nonblocking mixed-module/Express static-analysis warnings remain; local blog rendering falls back when Firebase is absent. |
 | Real local API authentication | Unauthenticated `/api/workspace-state` and `/api/rbac/context` requests returned HTTP 401 with no workspace data. |
-| Browser workflow | Repeated successful runs against the local production build. The latest run, including the delayed-acknowledgment regression, covered 70 modules, 81 action types, 49 form types and 13 field controls; 43 screenshots were captured. No unexpected browser errors or failed responses were recorded. |
+| Prior browser workflow | The November 18 run covered 70 modules, 81 action types, 49 form types and 13 field controls; 43 screenshots were captured. The expanded November 19 run is recorded separately below when complete. |
+| Expanded browser workflow, local diagnostic | Reached 70 modules, 47 workbench submissions, 217 checks and 57 screenshots, with zero unexpected console/HTTP failures. Stopped at a team-lifecycle quiescence timeout; final coverage counters were not completed. The final production build passed, but the local preview restart was blocked by the execution policy, so a complete local rerun is not claimed. |
 | Rejected saves and mobile layout | Eight rejected-save checks retained drafts without false success. Linked workflows and reload checks passed. The mobile time clock fits a 390px viewport; its wide table scrolls internally. |
 | Delayed equipment acknowledgment | An accepted write was held before its response. Equipment inputs remained disabled until the fresh UI acknowledgment; the next rate edit retained the same invoice ID and updated two days at $100 to $200. |
 | Production HTTP | `https://brothers.ad/api/health` returned HTTP 402 with `X-Vercel-Error: DEPLOYMENT_DISABLED`. |
@@ -36,6 +60,8 @@ Coverage counts refer to distinct action/form/control types, not proof that ever
 ## Release Limits
 
 Production is not certified ready. Account activation, Google Cloud access, Firebase Admin read/write health, real owner sign-in, invited employee sign-in, denied unauthorized sign-in, and live persistence across separate devices still require verification. No passwords, authenticator seeds or service-account private keys belong in this repository or chat.
+
+The invitation-identity migration runs during acceptance. Already-activated production accounts have not been inspected or backfilled. Any old invitation-ID tasks on those accounts require an evidence-backed repair after database access is available; no live customer records were changed in these tests.
 
 Email invitation delivery requires a configured, verified provider. A generated link is not proof that email was delivered. Google login alone is not proof of enforced application-level two-factor authentication.
 
@@ -60,3 +86,6 @@ The first Ubuntu 24.04 run passed its 574 unit/router tests and production build
 - [fflate](https://github.com/101arrowz/fflate)
 - [Remaining glob advisory](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4)
 - [Remaining minimatch advisory](https://github.com/advisories/GHSA-g3hv-75wg-m249)
+- [Firebase ID token verification](https://firebase.google.com/docs/auth/admin/verify-id-tokens)
+- [CORS settings and same-origin credentials](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/crossorigin)
+- [Official Hugging Face skills catalog](https://huggingface.co/docs/hub/agents-skills)

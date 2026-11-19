@@ -18,7 +18,8 @@ export default function BrothersOsShell() {
         }}
       />
       <div id="app" suppressHydrationWarning />
-      <Script id="brothers-os-runtime" type="module" src="/app.js" strategy="afterInteractive" />
+      {/* Match the preload's CORS mode to the module fetch so /app.js transfers once. */}
+      <Script id="brothers-os-runtime" type="module" src="/app.js" crossOrigin="anonymous" strategy="afterInteractive" />
     </>
   );
 }

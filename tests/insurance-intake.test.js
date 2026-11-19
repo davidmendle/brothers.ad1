@@ -300,6 +300,56 @@ afterAll(() => {
   db.close();
 });
 
+describe("explicit module selection boundaries", () => {
+  it.each([
+    { visiblePageIds: [] }, { visibleTabIds: [] },
+    { visiblePageIds: [], visibleTabIds: ["jobs"] },
+    { visiblePageIds: ["jobs"], visibleTabIds: [] },
+    { visiblePageIds: " , " }, { visibleTabIds: null }
+  ])("rejects ambiguous empty visibility without changing the managed account: %j", async (selection) => {
+    const { app, fakeDb } = manualTimeRouterFixture();
+    const before = structuredClone(fakeDb.dump("osUsers")["contractor-uid"]);
+    const response = await request(app).patch("/api/rbac/users/contractor-uid")
+      .set("Cookie", "brothers_os_session=owner-uid").send(selection);
+    expect(response.status).toBe(400);
+    expect(response.body.message).toMatch(/Select at least one allowed module.*disable the account/);
+    expect(fakeDb.dump("osUsers")["contractor-uid"]).toEqual(before);
+    expect(Object.keys(fakeDb.dump("osAuditLogs"))).toHaveLength(0);
+  });
+
+  it.each(["/api/rbac/users", "/api/access/grants"])("rejects empty visibility before issuing a user or grant at %s", async (endpoint) => {
+    const { app, fakeDb } = manualTimeRouterFixture();
+    const beforeIds = Object.keys(fakeDb.dump("osUsers"));
+    const response = await request(app).post(endpoint).set("Cookie", "brothers_os_session=owner-uid")
+      .send({ email: "new-contractor@example.com", displayName: "New Contractor", roleId: "contractor",
+        contractorId: "new-contractor", visiblePageIds: [], visibleTabIds: [], sendEmail: false });
+    expect(response.status).toBe(400);
+    expect(response.body.message).toMatch(/Select at least one allowed module/);
+    expect(Object.keys(fakeDb.dump("osUsers"))).toEqual(beforeIds);
+    expect(Object.keys(fakeDb.dump("osAccessGrants"))).toHaveLength(0);
+  });
+
+  it("persists nonempty module restrictions on a managed contractor", async () => {
+    const { app, fakeDb } = manualTimeRouterFixture();
+    const response = await request(app).patch("/api/rbac/users/contractor-uid")
+      .set("Cookie", "brothers_os_session=owner-uid")
+      .send({ visiblePageIds: ["jobs"], visibleTabIds: ["jobs"] });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(fakeDb.dump("osUsers")["contractor-uid"]).toMatchObject({
+      visiblePageIds: ["jobs"], visibleTabIds: ["jobs"]
+    });
+  });
+
+  it("keeps legacy role-default access intact when visibility is not submitted", async () => {
+    const { app, fakeDb } = manualTimeRouterFixture();
+    const response = await request(app).patch("/api/rbac/users/contractor-uid")
+      .set("Cookie", "brothers_os_session=owner-uid").send({ phone: "555-0101" });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(fakeDb.dump("osUsers")["contractor-uid"].phone).toBe("555-0101");
+    expect(fakeDb.dump("osUsers")["contractor-uid"].visiblePageIds).toBeUndefined();
+  });
+});
+
 describe("manual time workspace router", () => {
   it.each(["owner-uid", "office-uid", "franchise-uid"])("persists authorized office time for %s with calculated hours and server audit", async (uid) => {
     const { write, read, entry } = manualTimeRouterFixture();

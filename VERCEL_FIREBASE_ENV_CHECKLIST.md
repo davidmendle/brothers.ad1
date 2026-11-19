@@ -67,7 +67,11 @@ SUPER_ADMIN_EMAILS=david@brothersrestoration.org
 BLOCKED_ADMIN_EMAILS=chaim@brothersrestoration.org,reznikchaim@gmail.com
 ```
 
-With `FIREBASE_OWNER_ONLY_LOGIN=true`, only emails listed in `FIREBASE_ALLOWED_LOGIN_EMAILS` can establish a hosted OS session. For this launch that means only `david@brothersrestoration.org` can log in. Emails in `BLOCKED_ADMIN_EMAILS` are denied even if an old Firebase Auth user, Firestore `admins` document, or OS user document still exists.
+Without Firebase Admin storage, the fallback permits only the verified owner identity, `david@brothersrestoration.org`; adding other emails to the allowlist does not grant them fallback access. Shared record editing remains locked in that mode.
+
+With Firebase Admin storage configured, contractors and employees can sign in through approved, email-bound invitations and the server-managed access records. Invitations do not make them super admins. The exact owner email (and `FIREBASE_OWNER_UID`, when configured) remains the only super-admin identity. Non-owner accounts must satisfy their stored status, scope, expiration and access-code checks. Emails in `BLOCKED_ADMIN_EMAILS` are denied even if an old Firebase Auth user or OS user record remains.
+
+The Google provider and an explicit `email_verified: true` claim are required on login and subsequent session checks. Google sign-in does not by itself demonstrate application-enforced two-factor authentication. Test real owner, invited contractor, invited employee, expired invitation and unauthorized-account journeys before declaring the launch ready.
 
 ## 4. Invite email delivery
 
@@ -104,7 +108,7 @@ In Vercel:
 1. Open the deployed project.
 2. Go to Settings, then Environment Variables.
 3. Add the variables above for Production.
-4. Add them for Preview and Development if those deployments should also work.
+4. Configure Preview and Development separately if needed. Do not expand the production identity trust or reuse production data access for untrusted preview branches.
 5. Set `OS_BASE_URL=https://brothers.ad`.
 6. Go to Settings, then Domains, and attach `brothers.ad` plus `www.brothers.ad`.
 7. Redeploy the latest deployment after saving the variables.
