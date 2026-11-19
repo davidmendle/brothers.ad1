@@ -71,6 +71,14 @@ Workspace limits remain explicit: 2,500 records per array, 3 MB per request and 
 
 ## Release Attempt
 
+### November 19
+
+The refinement code was pushed as commit `2fef8daa648025199b3ba4642a917057c1da3f13` to `fix/team-onboarding-20261119`. The work is not merged into `main`. Creating a draft pull request through the connected GitHub integration returned HTTP 403, `Resource not accessible by integration`; no alternate identity or permission bypass was attempted. The normal pull-request verification workflow has therefore not run for this refinement. Its browser gate must pass before promotion.
+
+Vercel's `brothers-ad` status check for this commit failed with an account-deployment-blocked link. At 2026-11-19 22:10 UTC, `https://brothers.ad/api/health` still returned HTTP 402 and `X-Vercel-Error: DEPLOYMENT_DISABLED`. No successful live release is claimed. The billing, Google Cloud reauthentication and Firebase Admin configuration checks above remain unresolved.
+
+### November 18
+
 The repairs were pushed to GitHub `main` as commit `389dbda3078bf4bc82820f0e1f137aba40e128d4`. A production deployment request for the verified `brothers-ad` project and Brothers Restoration Services team was rejected on 2026-11-18 with HTTP 402 `resource_creation_blocked`: Vercel reported the account suspended and required a valid payment method. No new production deployment was created. The custom domain still returned `DEPLOYMENT_DISABLED`.
 
 The first GitHub Actions run stopped during browser installation: `ubuntu-latest` selected Ubuntu 26.04, unsupported by the pinned Playwright 1.55.1. The workflow is now pinned to supported Ubuntu 24.04; application tests were not removed or weakened. Remote CI results are available in the repository's Actions history.
