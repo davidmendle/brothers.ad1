@@ -2,6 +2,14 @@
 
 Date: 2026-11-19. Repository: `davidmendle/brothers.ad1`. Production project: `brothers-ad`, Brothers Restoration Services.
 
+## November 20 Follow-up
+
+- Fresh focused verification passed: 266 tests across `employee-portal`, `team-durability-regression`, `verified-email-access` and `insurance-intake`, plus 19 `workflow-coverage-regression` tests. This is not a new full-suite or browser-run claim.
+- An independent agent reviewed the retained browser failure. Its app hash begins `5f407bed`, while the current application hash begins `b6964db7`. The historical report lacks the current failing-context diagnostics. Its outer `inFlight: 0` came from the separate owner context, not the failing team context. The precise timeout cause remains unproven; no timeout increase, weakened assertion or speculative application patch was made.
+- At 2026-11-20 06:45 UTC (01:45 EST), the production health URL again returned HTTP 402 `DEPLOYMENT_DISABLED`; Vercel project metadata reported `live: false`. The billing UI still showed **Suspended**, **Pro Plan Expired**, and **Reactivate Plan**. Updating a payment method has not resulted in an active deployment in the observed state.
+- Production environment-key inspection still showed no Firebase Admin/OIDC or invitation-email provider credentials. The Google Cloud project opened at **Verify it's you**. These account-owner steps were left open for the user; no passwords, codes or billing changes were submitted.
+- The published refinement branch remains separate from `main`, and no pull request was found for it. The earlier GitHub integration permission denial has not been shown to be resolved. No retry through an alternate identity, preview-server restart, merge or live promotion was attempted.
+
 ## November 19 Refinement
 
 - Team, invitation, profile and access-management forms preserve drafts on rejected requests, including the exact selected checkboxes, radio options and multi-select values. Existing disabled controls remain disabled after completion.
